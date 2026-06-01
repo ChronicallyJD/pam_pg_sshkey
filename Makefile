@@ -53,7 +53,8 @@ PAM_SRCS := $S/pam_pg_sshkey.c $S/challenge_store.c \
 PAM_OBJS := $(PAM_SRCS:.c=.o)
 
 TEST_BINS := $T/test_challenge_store $T/test_key_parser \
-             $T/test_sig_verify      $T/test_integration
+             $T/test_sig_verify      $T/test_integration \
+             $T/test_system
 
 .PHONY: all test check install install-conf uninstall clean
 
@@ -100,6 +101,9 @@ $T/test_sig_verify: $T/test_sig_verify.c $S/sig_verify.c $S/key_parser.c
 
 $T/test_integration: $T/test_integration.c \
                      $S/challenge_store.c $S/key_parser.c $S/sig_verify.c
+	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
+
+$T/test_system: $T/test_system.c
 	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
 
 # ── test / check ─────────────────────────────────────────────────────────────

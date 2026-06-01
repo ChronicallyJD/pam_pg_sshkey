@@ -55,11 +55,6 @@ int main(int argc, char *argv[])
         perror("mkdir");
         return 1;
     }
-    /* Ensure permissions are correct even if directory pre-existed */
-    if (chmod(dir, 01733) != 0) {
-        perror("chmod");
-        return 1;
-    }
 
     char hex[65];
     if (challenge_create(dir, hex, sizeof(hex)) != 0) {

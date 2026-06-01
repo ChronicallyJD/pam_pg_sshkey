@@ -1,0 +1,19 @@
+#%PAM-1.0
+#
+# /etc/pam.d/postgresql  — SSH-key auth for PostgreSQL
+#
+# Module options:
+#   authorized_keys_dir=<dir>   Root dir for per-user authorized_keys.
+#                               Files must be at <dir>/<username>/authorized_keys
+#                               Default: /etc/pg_sshkeys
+#
+#   challenge_dir=<dir>         Where challenge nonces are stored.
+#                               Default: /var/run/pg_sshkey
+#
+#   debug                       Enable verbose syslog output.
+
+auth    required    pam_pg_sshkey.so \
+            authorized_keys_dir=/etc/pg_sshkeys \
+            challenge_dir=/var/run/pg_sshkey
+
+account required    pam_permit.so

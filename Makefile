@@ -1,0 +1,140 @@
+# Makefile — pam_pg_sshkey
+#
+# Must be run from the project root (the directory containing this file).
+# If you invoke make from elsewhere, use:
+#   make -C /path/to/pam_pg_sshkey
+#
+# Targets:
+#   all            Build PAM module + helper tools (default)
+#   test / check   Build and run unit + integration tests
+#   install        Install files system-wide (run as root)
+#   install-conf   Install /etc/pam.d/postgresql
+#   uninstall      Remove installed files
+#   clean          Remove build artifacts
+#
+# Overridable variables:
+#   CC, CFLAGS, PAM_LIB_DIR, BIN_DIR, PAM_CONF_DIR, KEY_DIR, CHAL_DIR, DESTDIR
+
+# ── Locate the Makefile and enforce correct working directory ──────────────
+# $(abspath) + $(lastword) resolves the Makefile's real directory even when
+# invoked as "make -f ../Makefile" or from a symlink.
+MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
+# If make's CWD doesn't match the Makefile's directory, re-invoke with -C.
+ifneq ($(abspath .),$(MAKEFILE_DIR:/=))
+.PHONY: _redirect
+_redirect:
+	$(MAKE) -C "$(MAKEFILE_DIR)" $(MAKECMDGOALS)
+# Suppress all other rules so make doesn't try to build anything here.
+%:
+	@true
+else
+
+# ── Everything below runs only when CWD == project root ───────────────────
+
+CC      ?= gcc
+CFLAGS  ?= -Wall -Wextra -Wpedantic -O2
+
+CRYPTO_CFLAGS := $(shell pkg-config --cflags libcrypto 2>/dev/null)
+CRYPTO_LIBS   := $(shell pkg-config --libs   libcrypto 2>/dev/null || echo -lcrypto)
+PAM_CFLAGS    := -I/usr/include/security
+
+PAM_LIB_DIR  ?= /lib/$(shell $(CC) -dumpmachine)/security
+BIN_DIR      ?= /usr/local/bin
+PAM_CONF_DIR ?= /etc/pam.d
+KEY_DIR      ?= /etc/pg_sshkeys
+CHAL_DIR     ?= /var/run/pg_sshkey
+
+S := src
+T := tests
+
+PAM_SRCS := $S/pam_pg_sshkey.c $S/challenge_store.c \
+            $S/key_parser.c    $S/sig_verify.c
+PAM_OBJS := $(PAM_SRCS:.c=.o)
+
+TEST_BINS := $T/test_challenge_store $T/test_key_parser \
+             $T/test_sig_verify      $T/test_integration
+
+.PHONY: all test check install install-conf uninstall clean
+
+all: pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge
+
+# ── Compile .c → .o (static pattern rule — explicit, unambiguous) ──────────
+$(PAM_OBJS): $S/%.o: $S/%.c
+	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) $(PAM_CFLAGS) -fPIC -c -o $@ $<
+
+# ── PAM shared library ──────────────────────────────────────────────────────
+pam_pg_sshkey.so: $(PAM_OBJS)
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $^ $(CRYPTO_LIBS) -lpam
+
+# ── Standalone binaries (compiled directly from .c, no intermediate .o) ────
+pg_sshkey_sign: $S/pg_sshkey_sign.c
+	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -o $@ $< $(CRYPTO_LIBS)
+
+pg_sshkey_challenge: $S/pg_sshkey_challenge.c $S/challenge_store.c
+	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -o $@ $^ $(CRYPTO_LIBS)
+
+# ── Test binaries ───────────────────────────────────────────────────────────
+TFLAGS := $(CFLAGS) $(CRYPTO_CFLAGS) $(PAM_CFLAGS) \
+          -g -fsanitize=address,undefined -I$S -I$T
+TLIBS  := $(CRYPTO_LIBS)
+
+$T/test_challenge_store: $T/test_challenge_store.c $S/challenge_store.c
+	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
+
+$T/test_key_parser: $T/test_key_parser.c $S/key_parser.c $S/challenge_store.c
+	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
+
+$T/test_sig_verify: $T/test_sig_verify.c $S/sig_verify.c $S/key_parser.c
+	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
+
+$T/test_integration: $T/test_integration.c \
+                     $S/challenge_store.c $S/key_parser.c $S/sig_verify.c
+	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
+
+# ── test / check ─────────────────────────────────────────────────────────────
+test check: $(TEST_BINS)
+	@echo ""
+	@echo "=== test_challenge_store ==="; $T/test_challenge_store
+	@echo ""
+	@echo "=== test_key_parser ===";      $T/test_key_parser
+	@echo ""
+	@echo "=== test_sig_verify ===";      $T/test_sig_verify
+	@echo ""
+	@echo "=== test_integration ===";     $T/test_integration
+	@echo ""
+	@echo "All test suites complete."
+
+# ── Install ───────────────────────────────────────────────────────────────────
+install: all
+	install -d $(DESTDIR)$(PAM_LIB_DIR)
+	install -m 755 pam_pg_sshkey.so $(DESTDIR)$(PAM_LIB_DIR)/
+	install -d $(DESTDIR)$(BIN_DIR)
+	install -m 755 pg_sshkey_sign      $(DESTDIR)$(BIN_DIR)/
+	install -m 755 pg_sshkey_challenge $(DESTDIR)$(BIN_DIR)/
+	install -d -m 750 -o root     -g postgres $(DESTDIR)$(KEY_DIR)
+	install -d -m 750 -o postgres -g postgres $(DESTDIR)$(CHAL_DIR)
+
+install-conf:
+	@if [ -f $(PAM_CONF_DIR)/postgresql ]; then \
+	    echo "Backing up $(PAM_CONF_DIR)/postgresql → postgresql.bak"; \
+	    cp $(PAM_CONF_DIR)/postgresql $(PAM_CONF_DIR)/postgresql.bak; \
+	fi
+	install -m 644 config/pam.d/postgresql $(PAM_CONF_DIR)/postgresql
+	@echo ""
+	@echo "Remember to update pg_hba.conf:"
+	@echo "  host all all 0.0.0.0/0 pam pamservice=postgresql"
+
+# ── Uninstall ─────────────────────────────────────────────────────────────────
+uninstall:
+	rm -f $(DESTDIR)$(PAM_LIB_DIR)/pam_pg_sshkey.so
+	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_sign
+	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_challenge
+
+# ── Clean ─────────────────────────────────────────────────────────────────────
+clean:
+	rm -f $S/*.o
+	rm -f pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge
+	rm -f $(TEST_BINS)
+
+endif  # CWD guard

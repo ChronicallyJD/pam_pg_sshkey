@@ -10,6 +10,38 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.3] — 2026-06-01
+
+### Fixed
+
+- **`pg_sshkey_challenge` failed with `Permission denied` for non-postgres users.**
+
+  The challenge directory `/var/run/pg_sshkey` was installed with mode `0750`
+  owned by `postgres:postgres`, so only the `postgres` user could enter it.
+  Client users (e.g. `test`, `alice`) could not create nonce files, causing
+  `pg_sshkey_challenge` to fail with "Failed to create challenge" and producing
+  a malformed empty token.
+
+  Fixed by changing the challenge directory to mode **1733** (sticky-bit
+  world-write), matching the semantics of `/tmp`:
+  - Any user can create nonce files (`-wx` for group and other)
+  - Only the file's owner can delete their own nonce (sticky bit `t`)
+  - The `postgres` user (directory owner) can read and unlink any file
+
+  Nonce files are now created with mode **0644** (was `0600`) so the
+  `postgres`-owned PAM module can read files created by any client user.
+
+  `pg_sshkey_challenge` now also `chmod`s the directory to `1733` each time
+  it runs, self-correcting any wrong permissions left after a reboot or
+  manual misconfiguration.
+
+- **Challenge directory lost on reboot** — `/var/run` is a `tmpfs` that is
+  wiped at every boot. `make install` now installs
+  `/usr/lib/tmpfiles.d/pg_sshkey.conf` so systemd recreates the directory
+  with the correct owner and mode automatically at startup.
+
+---
+
 ## [1.0.2] — 2026-06-01
 
 ### Fixed

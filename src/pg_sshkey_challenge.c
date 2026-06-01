@@ -40,9 +40,24 @@ int main(int argc, char *argv[])
 
     const char *dir = argv[1];
 
-    /* Ensure directory exists */
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+    /*
+     * Ensure directory exists with sticky-bit world-write permissions
+     * (mode 1733 = rwx-wx-wxt) so that:
+     *   - Any user can create nonce files (w+x for group and other)
+     *   - Only the file's owner can delete it (sticky bit)
+     *   - The postgres user (PAM module) can read and delete any file (owner rwx)
+     *
+     * If the directory already exists we chmod it to the correct mode in
+     * case it was created with wrong permissions (e.g. after a reboot when
+     * /var/run is a tmpfs and the directory was recreated by a naive script).
+     */
+    if (mkdir(dir, 01733) != 0 && errno != EEXIST) {
         perror("mkdir");
+        return 1;
+    }
+    /* Ensure permissions are correct even if directory pre-existed */
+    if (chmod(dir, 01733) != 0) {
+        perror("chmod");
         return 1;
     }
 

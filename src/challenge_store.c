@@ -121,8 +121,15 @@ challenge_create(const char *dir, char *out_hex, size_t out_hex_size)
     char path[512];
     snprintf(path, sizeof(path), "%s/%s", dir, hex);
 
-    /* Write atomically (O_EXCL prevents overwrite) */
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    /*
+     * Write atomically (O_EXCL prevents overwrite).
+     *
+     * Use 0644 so the PostgreSQL backend (running as 'postgres') can read
+     * nonce files created by any client user.  The challenge directory uses
+     * the sticky bit (mode 1733) so only the creator of a file can delete
+     * it — preventing one user removing another's pending challenge.
+     */
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0)
         return -1;
 

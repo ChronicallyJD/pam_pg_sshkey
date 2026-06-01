@@ -112,8 +112,16 @@ install: all
 	install -d $(DESTDIR)$(BIN_DIR)
 	install -m 755 pg_sshkey_sign      $(DESTDIR)$(BIN_DIR)/
 	install -m 755 pg_sshkey_challenge $(DESTDIR)$(BIN_DIR)/
-	install -d -m 750 -o root     -g postgres $(DESTDIR)$(KEY_DIR)
-	install -d -m 750 -o postgres -g postgres $(DESTDIR)$(CHAL_DIR)
+	install -d -m 750 -o root -g postgres $(DESTDIR)$(KEY_DIR)
+	# Challenge dir: sticky-bit world-write so any user can create nonces
+	# but only the owner of each file can delete it.
+	# The postgres user (PAM module) is the owner of the directory so it
+	# can read and unlink any file inside regardless of sticky bit.
+	install -d -m 1733 -o postgres -g postgres $(DESTDIR)$(CHAL_DIR)
+	# Install tmpfiles.d config so systemd recreates the directory at boot
+	install -d $(DESTDIR)/usr/lib/tmpfiles.d
+	printf 'd /var/run/pg_sshkey 1733 postgres postgres -\n' > /tmp/pg_sshkey_tmpfiles
+	install -m 644 /tmp/pg_sshkey_tmpfiles $(DESTDIR)/usr/lib/tmpfiles.d/pg_sshkey.conf
 
 install-conf:
 	@if [ -f $(PAM_CONF_DIR)/postgresql ]; then \

@@ -614,13 +614,31 @@ A minimal Go/Python wrapper or Nginx + CGI is sufficient. The PAM module
 only cares about the nonce file being present in `challenge_dir` with a
 valid timestamp.
 
+### Challenge directory permissions
+
+The challenge directory `/var/run/pg_sshkey` uses mode **1733**
+(sticky-bit world-write):
+
+```
+drwx-wx-wxt  postgres postgres  /var/run/pg_sshkey
+```
+
+| Bit | Effect |
+|-----|--------|
+| `rwx` for owner (postgres) | PAM module can read and unlink any nonce file |
+| `-wx` for group and other  | Any user can create nonce files and enter the directory |
+| Sticky bit (`t`)           | Only the creator of a file can delete it — prevents one user removing another's pending challenge |
+
+Nonce files are created with mode **0644** so the `postgres`-owned PAM
+module can read them regardless of which user created them.
+
 ### Challenge directory lifecycle
 
 ```
-pg_sshkey_challenge     →  creates /var/run/pg_sshkey/<hex>
-[client signs, sends token]
-pam_sm_authenticate     →  loads  /var/run/pg_sshkey/<hex>
-                        →  deletes /var/run/pg_sshkey/<hex>
+pg_sshkey_challenge     →  client user creates /var/run/pg_sshkey/<hex> (mode 0644)
+[client signs, sends token as PGPASSWORD]
+pam_sm_authenticate     →  postgres reads  /var/run/pg_sshkey/<hex>
+                        →  postgres deletes /var/run/pg_sshkey/<hex>
 ```
 
 Nonces older than 60 seconds are automatically deleted on the next `load`
@@ -629,6 +647,23 @@ attempt. A cron job or systemd timer can additionally sweep stale files:
 ```bash
 # /etc/cron.d/pg_sshkey_cleanup
 */2 * * * * postgres find /var/run/pg_sshkey -maxdepth 1 -mmin +2 -delete
+```
+
+### Surviving reboots
+
+`/var/run` is a `tmpfs` on systemd systems — it is wiped at every boot.
+`make install` installs a `tmpfiles.d` configuration that instructs systemd
+to recreate the directory automatically:
+
+```
+# /usr/lib/tmpfiles.d/pg_sshkey.conf
+d /var/run/pg_sshkey 1733 postgres postgres -
+```
+
+To apply it immediately without rebooting:
+
+```bash
+sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/pg_sshkey.conf
 ```
 
 ---
@@ -687,8 +722,8 @@ Exit code 0 on success, 1 on error.
 | `/etc/pg_sshkeys/`                            | root:postgres | 0750  | Root of authorized_keys tree       |
 | `/etc/pg_sshkeys/<user>/`                     | root:postgres | 0750  | Per-user subdirectory              |
 | `/etc/pg_sshkeys/<user>/authorized_keys`      | root:postgres | 0640  | **Must not be group/world writable** |
-| `/var/run/pg_sshkey/`                         | postgres:postgres | 0750 | Nonce files live here            |
-| `/var/run/pg_sshkey/<hex>`                    | postgres:postgres | 0600 | Created by pg_sshkey_challenge   |
+| `/var/run/pg_sshkey/`                         | postgres:postgres | 1733 | Sticky world-write: any user creates, only owner deletes |
+| `/var/run/pg_sshkey/<hex>`                    | <client user>:*   | 0644 | Created by pg_sshkey_challenge; readable by postgres PAM module |
 
 ---
 

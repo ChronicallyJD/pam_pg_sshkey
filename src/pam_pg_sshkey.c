@@ -21,6 +21,29 @@
  * looks up the stored challenge, verifies the signature, then invalidates
  * the challenge so it cannot be replayed.
  *
+ * HOW POSTGRESQL PASSES THE PASSWORD TO PAM
+ * ==========================================
+ * PostgreSQL does NOT call pam_set_item(PAM_AUTHTOK) before invoking
+ * pam_authenticate().  Instead it stores the client password exclusively
+ * in appdata_ptr of the pam_conv struct, which it sets via
+ * pam_set_item(PAM_CONV).
+ *
+ * This means:
+ *   - pam_get_item(PAM_AUTHTOK) always returns NULL.
+ *   - pam_get_authtok() with any prompt (including NULL) falls through to
+ *     calling the conversation function, which triggers a second password
+ *     round-trip that the client does not expect, producing
+ *     "conversation failed" in the log.
+ *
+ * THE CORRECT APPROACH
+ * ====================
+ * We must retrieve the token by calling the PAM conversation function
+ * directly via pam_get_item(PAM_CONV), issuing exactly one
+ * PAM_PROMPT_ECHO_OFF message.  PostgreSQL's conversation function
+ * responds with appdata_ptr (the client's password) without any network
+ * round-trip.  We then cache the result with pam_set_item(PAM_AUTHTOK)
+ * so any stacked modules can use pam_get_authtok() normally.
+ *
  * Build:
  *   gcc -shared -fPIC -o pam_pg_sshkey.so pam_pg_sshkey.c challenge_store.c \
  *       key_parser.c sig_verify.c \
@@ -120,11 +143,71 @@ parse_token(const char *token,
     return 0;
 }
 
+/* ── get_token_via_conv ──────────────────────────────────────────────── */
+/*
+ * Retrieve the PAM token (client password) by calling the PAM conversation
+ * function directly.
+ *
+ * PostgreSQL stores the client password in appdata_ptr of the pam_conv
+ * struct; it never calls pam_set_item(PAM_AUTHTOK).  The only way to read
+ * it is to invoke the conversation function with PAM_PROMPT_ECHO_OFF, which
+ * PostgreSQL answers immediately from appdata_ptr without any network I/O.
+ *
+ * We cache the result via pam_set_item(PAM_AUTHTOK) so stacked modules can
+ * read it with pam_get_authtok() normally.
+ *
+ * Returns a malloc'd string on success (caller must NOT free — libpam owns
+ * it after pam_set_item), or NULL on failure.
+ */
+static const char *
+get_token_via_conv(pam_handle_t *pamh)
+{
+    /* Retrieve the conversation struct PostgreSQL registered */
+    const struct pam_conv *conv = NULL;
+    int rc = pam_get_item(pamh, PAM_CONV, (const void **)&conv);
+    if (rc != PAM_SUCCESS || !conv || !conv->conv)
+        return NULL;
+
+    /* Build a single PAM_PROMPT_ECHO_OFF message */
+    struct pam_message  msg  = { .msg_style = PAM_PROMPT_ECHO_OFF,
+                                 .msg       = "SSH-Key Token" };
+    const struct pam_message *msgp = &msg;
+    struct pam_response *resp = NULL;
+
+    rc = conv->conv(1, &msgp, &resp, conv->appdata_ptr);
+    if (rc != PAM_SUCCESS || !resp)
+        return NULL;
+
+    char *token = resp->resp;   /* heap-allocated by the conv function */
+    free(resp);                 /* free the pam_response array itself   */
+    resp = NULL;
+
+    if (!token || token[0] == '\0') {
+        free(token);
+        return NULL;
+    }
+
+    /*
+     * Cache in PAM_AUTHTOK so stacked modules (e.g. pam_permit) can read
+     * it without triggering another conversation.  pam_set_item() makes an
+     * internal copy, so we free our copy afterwards.
+     */
+    pam_set_item(pamh, PAM_AUTHTOK, token);
+    free(token);
+
+    /* Read back the cached copy (owned by libpam, do not free) */
+    const char *cached = NULL;
+    pam_get_item(pamh, PAM_AUTHTOK, (const void **)&cached);
+    return cached;
+}
+
 /* ── pam_sm_authenticate ─────────────────────────────────────────────── */
 PAM_EXTERN int
 pam_sm_authenticate(pam_handle_t *pamh, int flags,
                     int argc, const char **argv)
 {
+    (void)flags;
+
     mod_opts_t opts;
     parse_opts(&opts, argc, argv);
 
@@ -140,13 +223,23 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
         pam_syslog(pamh, LOG_DEBUG,
                    "pam_pg_sshkey: authenticating user '%s'", username);
 
-    /* ── 2. Get token (passed as PAM "password") ── */
-    const char *token = NULL;
-    rc = pam_get_authtok(pamh, PAM_AUTHTOK, &token, "SSH-Key Token: ");
-    if (rc != PAM_SUCCESS || !token || token[0] == '\0') {
+    /* ── 2. Get token via conversation function ── */
+    /*
+     * We do not use pam_get_authtok() here.  PostgreSQL never calls
+     * pam_set_item(PAM_AUTHTOK), so that function falls through to the
+     * conversation callback, which PostgreSQL's implementation handles by
+     * trying a second password round-trip — something the client does not
+     * expect.  That is the source of "conversation failed" log messages.
+     *
+     * Instead we call the conversation function directly once via
+     * get_token_via_conv(), which reads appdata_ptr (the client password)
+     * without any additional network I/O.
+     */
+    const char *token = get_token_via_conv(pamh);
+    if (!token || token[0] == '\0') {
         pam_syslog(pamh, LOG_ERR,
-                   "pam_pg_sshkey: failed to get auth token for '%s'",
-                   username);
+                   "pam_pg_sshkey: failed to get auth token for '%s' "
+                   "(client sent no password)", username);
         return PAM_AUTH_ERR;
     }
 

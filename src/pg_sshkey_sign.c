@@ -10,20 +10,16 @@
  * Prints to stdout:
  *   <challenge_hex>:<base64_signature>
  *
- * This string is used as the PostgreSQL "password".
+ * Key formats accepted:
+ *   - OpenSSH private key  (-----BEGIN OPENSSH PRIVATE KEY-----)
+ *     Ed25519 only; unencrypted only.  For passphrase-protected or RSA
+ *     OpenSSH keys, see the conversion notes in the error messages below.
+ *   - PKCS#8 PEM            (-----BEGIN PRIVATE KEY-----)
+ *   - Traditional PEM       (-----BEGIN EC/RSA/... PRIVATE KEY-----)
  *
- * Key types supported:
- *   - Ed25519  (ssh-ed25519)
- *   - RSA      (ssh-rsa / rsa-sha2-256)
- *
- * NOTE: This tool reads unencrypted private keys.  For production use,
- * integrate with ssh-agent via the SSH_AUTH_SOCK socket instead so the
- * private key never leaves the agent.  See pg_sshkey_sign_agent.c for
- * an ssh-agent-based implementation.
- *
- * Build (standalone, not part of the PAM .so):
- *   gcc -o pg_sshkey_sign pg_sshkey_sign.c \
- *       $(pkg-config --cflags --libs libcrypto)
+ * Key types signed:
+ *   - Ed25519  → Ed25519 signature (64 bytes)
+ *   - RSA      → RSASSA-PKCS1-v1_5 with SHA-256
  *
  * SPDX-License-Identifier: MIT
  */
@@ -31,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -41,6 +38,8 @@
 /* Domain prefix — must match sig_verify.c */
 static const unsigned char SIGN_PREFIX[]   = "pg-sshkey-v1";
 static const size_t        SIGN_PREFIX_LEN = 13; /* 12 chars + NUL */
+
+#define OPENSSH_MAGIC "openssh-key-v1"
 
 /* ── hex_to_bytes ─────────────────────────────────────────────────────── */
 static int
@@ -61,7 +60,7 @@ hex_to_bytes(const char *hex, unsigned char *out, size_t out_size,
     return 0;
 }
 
-/* ── base64_encode ────────────────────────────────────────────────────── */
+/* ── b64_encode ───────────────────────────────────────────────────────── */
 static char *
 b64_encode(const unsigned char *data, size_t len)
 {
@@ -69,13 +68,10 @@ b64_encode(const unsigned char *data, size_t len)
     BIO *bmem = BIO_new(BIO_s_mem());
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
     b64 = BIO_push(b64, bmem);
-
     BIO_write(b64, data, (int)len);
     BIO_flush(b64);
-
     BUF_MEM *bptr = NULL;
     BIO_get_mem_ptr(b64, &bptr);
-
     char *result = malloc(bptr->length + 1);
     if (result) {
         memcpy(result, bptr->data, bptr->length);
@@ -85,27 +81,290 @@ b64_encode(const unsigned char *data, size_t len)
     return result;
 }
 
-/* ── load_private_key ─────────────────────────────────────────────────── */
-static EVP_PKEY *
-load_private_key(const char *path)
+/* ── b64_decode_buf ───────────────────────────────────────────────────── */
+/* Decode base64 (with or without newlines) into a malloc'd buffer. */
+static unsigned char *
+b64_decode_buf(const char *b64_in, size_t in_len, size_t *out_len)
 {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        perror("fopen");
+    /* Strip newlines into a clean buffer */
+    char *clean = malloc(in_len + 1);
+    if (!clean) return NULL;
+    size_t clen = 0;
+    for (size_t i = 0; i < in_len; i++)
+        if (b64_in[i] != '\n' && b64_in[i] != '\r')
+            clean[clen++] = b64_in[i];
+    clean[clen] = '\0';
+
+    BIO *b64  = BIO_new(BIO_f_base64());
+    BIO *bmem = BIO_new_mem_buf(clean, (int)clen);
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    b64 = BIO_push(b64, bmem);
+
+    unsigned char *buf = malloc(clen);   /* decoded is always <= encoded */
+    if (!buf) { free(clean); BIO_free_all(b64); return NULL; }
+
+    int n = BIO_read(b64, buf, (int)clen);
+    BIO_free_all(b64);
+    free(clean);
+
+    if (n <= 0) { free(buf); return NULL; }
+    *out_len = (size_t)n;
+    return buf;
+}
+
+/* ── OpenSSH binary format helpers ───────────────────────────────────── */
+
+/* Read a big-endian uint32 from buf at *pos; advance *pos. */
+static int
+read_u32(const unsigned char *buf, size_t buflen, size_t *pos, uint32_t *val)
+{
+    if (*pos + 4 > buflen) return -1;
+    *val = ((uint32_t)buf[*pos]   << 24) |
+           ((uint32_t)buf[*pos+1] << 16) |
+           ((uint32_t)buf[*pos+2] <<  8) |
+           ((uint32_t)buf[*pos+3]);
+    *pos += 4;
+    return 0;
+}
+
+/* Read a length-prefixed string; set *str to pointer into buf, *slen to length. */
+static int
+read_string(const unsigned char *buf, size_t buflen, size_t *pos,
+            const unsigned char **str, size_t *slen)
+{
+    uint32_t len;
+    if (read_u32(buf, buflen, pos, &len) != 0) return -1;
+    if (*pos + len > buflen) return -1;
+    *str  = buf + *pos;
+    *slen = len;
+    *pos += len;
+    return 0;
+}
+
+/* ── load_openssh_ed25519 ─────────────────────────────────────────────── */
+/*
+ * Parse an unencrypted OpenSSH private key file containing an Ed25519 key.
+ *
+ * OpenSSH key format (PROTOCOL.key):
+ *
+ *   "openssh-key-v1\0"
+ *   string  ciphername     ("none" when unencrypted)
+ *   string  kdfname        ("none" when unencrypted)
+ *   string  kdfoptions
+ *   uint32  number_of_keys (we only handle 1)
+ *   string  publickey
+ *   string  private_section
+ *
+ * private_section (unencrypted):
+ *   uint32  check1
+ *   uint32  check2         (must equal check1)
+ *   string  keytype        ("ssh-ed25519")
+ *   string  pubkey         (32 bytes)
+ *   string  privkey        (64 bytes: 32-byte seed || 32-byte pubkey)
+ *   string  comment
+ *   bytes   padding
+ */
+static EVP_PKEY *
+load_openssh_ed25519(const unsigned char *der, size_t derlen)
+{
+    size_t pos = 0;
+
+    /* Magic + NUL */
+    size_t magic_len = strlen(OPENSSH_MAGIC) + 1;
+    if (derlen < magic_len || memcmp(der, OPENSSH_MAGIC, magic_len) != 0) {
+        fprintf(stderr, "Not an OpenSSH private key\n");
+        return NULL;
+    }
+    pos = magic_len;
+
+    /* ciphername */
+    const unsigned char *cipher; size_t cipher_len;
+    if (read_string(der, derlen, &pos, &cipher, &cipher_len) != 0) {
+        fprintf(stderr, "OpenSSH key: truncated at ciphername\n");
+        return NULL;
+    }
+    if (cipher_len != 4 || memcmp(cipher, "none", 4) != 0) {
+        /* Key is encrypted with a passphrase */
+        char name[64] = {0};
+        size_t n = cipher_len < 63 ? cipher_len : 63;
+        memcpy(name, cipher, n);
+        fprintf(stderr,
+            "Error: OpenSSH key is encrypted (cipher: %s).\n"
+            "\n"
+            "pg_sshkey_sign cannot unlock passphrase-protected OpenSSH keys.\n"
+            "Options:\n"
+            "  1. Remove the passphrase (creates an unencrypted copy):\n"
+            "       ssh-keygen -p -N '' -f <keyfile>\n"
+            "  2. Export to unencrypted PKCS#8 PEM (recommended — keeps\n"
+            "     original key intact):\n"
+            "       openssl pkey -in <keyfile> -out key.pem\n"
+            "     (OpenSSL will prompt for the passphrase once.)\n"
+            "  3. Use an ssh-agent integration instead of a key file.\n",
+            name);
         return NULL;
     }
 
-    EVP_PKEY *pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
+    /* kdfname */
+    const unsigned char *kdf; size_t kdf_len;
+    if (read_string(der, derlen, &pos, &kdf, &kdf_len) != 0) return NULL;
+
+    /* kdfoptions */
+    const unsigned char *kdfopts; size_t kdfopts_len;
+    if (read_string(der, derlen, &pos, &kdfopts, &kdfopts_len) != 0) return NULL;
+
+    /* number of keys */
+    uint32_t nkeys;
+    if (read_u32(der, derlen, &pos, &nkeys) != 0 || nkeys < 1) return NULL;
+
+    /* public key blob (skip) */
+    const unsigned char *pubblob; size_t pubblob_len;
+    if (read_string(der, derlen, &pos, &pubblob, &pubblob_len) != 0) return NULL;
+
+    /* private section */
+    const unsigned char *priv_section; size_t priv_len;
+    if (read_string(der, derlen, &pos, &priv_section, &priv_len) != 0) return NULL;
+
+    /* Parse private section */
+    size_t pp = 0;
+
+    uint32_t check1, check2;
+    if (read_u32(priv_section, priv_len, &pp, &check1) != 0) return NULL;
+    if (read_u32(priv_section, priv_len, &pp, &check2) != 0) return NULL;
+    if (check1 != check2) {
+        fprintf(stderr, "OpenSSH key: check values mismatch (corrupt or wrong passphrase)\n");
+        return NULL;
+    }
+
+    /* keytype */
+    const unsigned char *keytype; size_t keytype_len;
+    if (read_string(priv_section, priv_len, &pp, &keytype, &keytype_len) != 0) return NULL;
+
+    if (keytype_len != 11 || memcmp(keytype, "ssh-ed25519", 11) != 0) {
+        /* Not Ed25519 — tell user how to convert */
+        char kt[64] = {0};
+        size_t n = keytype_len < 63 ? keytype_len : 63;
+        memcpy(kt, keytype, n);
+        fprintf(stderr,
+            "Error: OpenSSH key type '%s' is not supported in OpenSSH format.\n"
+            "\n"
+            "Convert to PKCS#8 PEM first, then pass the .pem file:\n"
+            "  openssl pkey -in <keyfile> -out key.pem\n"
+            "\n"
+            "Supported key types in OpenSSH format: ssh-ed25519\n"
+            "Supported key types in PKCS#8 PEM format: Ed25519, RSA\n",
+            kt);
+        return NULL;
+    }
+
+    /* pubkey (32 bytes) — skip */
+    const unsigned char *pubkey; size_t pubkey_len;
+    if (read_string(priv_section, priv_len, &pp, &pubkey, &pubkey_len) != 0) return NULL;
+    if (pubkey_len != 32) {
+        fprintf(stderr, "OpenSSH Ed25519: unexpected pubkey length %zu\n", pubkey_len);
+        return NULL;
+    }
+
+    /* privkey: 64 bytes = 32-byte seed || 32-byte pubkey */
+    const unsigned char *privkey; size_t privkey_len;
+    if (read_string(priv_section, priv_len, &pp, &privkey, &privkey_len) != 0) return NULL;
+    if (privkey_len != 64) {
+        fprintf(stderr, "OpenSSH Ed25519: unexpected privkey length %zu\n", privkey_len);
+        return NULL;
+    }
+
+    /* The first 32 bytes of privkey are the seed (the actual secret) */
+    EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
+                                                    privkey, 32);
+    if (!pkey)
+        fprintf(stderr, "OpenSSH Ed25519: EVP_PKEY_new_raw_private_key failed\n");
+    return pkey;
+}
+
+/* ── load_private_key ─────────────────────────────────────────────────── */
+/*
+ * Load a private key from path.  Handles:
+ *   - OpenSSH format  (BEGIN OPENSSH PRIVATE KEY)
+ *   - PKCS#8 PEM      (BEGIN PRIVATE KEY)
+ *   - Traditional PEM (BEGIN RSA/EC/... PRIVATE KEY)
+ */
+static EVP_PKEY *
+load_private_key(const char *path)
+{
+    /* Read the whole file */
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return NULL; }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    rewind(f);
+    if (fsize <= 0 || fsize > 1024 * 1024) {
+        fprintf(stderr, "Key file too large or empty: %s\n", path);
+        fclose(f);
+        return NULL;
+    }
+
+    char *filebuf = malloc((size_t)fsize + 1);
+    if (!filebuf) { fclose(f); return NULL; }
+    size_t nread = fread(filebuf, 1, (size_t)fsize, f);
     fclose(f);
+    filebuf[nread] = '\0';
+
+    /* Detect OpenSSH format */
+    if (strstr(filebuf, "-----BEGIN OPENSSH PRIVATE KEY-----")) {
+        /* Extract the base64 body between the header/footer */
+        const char *start = strchr(filebuf, '\n');
+        if (!start) {
+            fprintf(stderr, "Malformed OpenSSH key file\n");
+            free(filebuf);
+            return NULL;
+        }
+        start++; /* skip newline after header */
+
+        const char *end = strstr(start, "-----END OPENSSH PRIVATE KEY-----");
+        if (!end) {
+            fprintf(stderr, "Missing OpenSSH key footer\n");
+            free(filebuf);
+            return NULL;
+        }
+
+        size_t b64_len = (size_t)(end - start);
+        size_t der_len = 0;
+        unsigned char *der = b64_decode_buf(start, b64_len, &der_len);
+        free(filebuf);
+
+        if (!der) {
+            fprintf(stderr, "Failed to base64-decode OpenSSH key\n");
+            return NULL;
+        }
+
+        EVP_PKEY *pkey = load_openssh_ed25519(der, der_len);
+        free(der);
+        return pkey;
+    }
+
+    /* Standard PEM — let OpenSSL handle it */
+    BIO *bio = BIO_new_mem_buf(filebuf, (int)nread);
+    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    free(filebuf);
 
     if (!pkey) {
-        fprintf(stderr, "Failed to load private key from %s\n", path);
+        fprintf(stderr,
+            "Failed to load private key from %s\n"
+            "Supported formats:\n"
+            "  -----BEGIN OPENSSH PRIVATE KEY-----  (Ed25519, unencrypted)\n"
+            "  -----BEGIN PRIVATE KEY-----           (PKCS#8, any type)\n"
+            "  -----BEGIN RSA PRIVATE KEY-----       (traditional RSA)\n"
+            "\n"
+            "To convert an OpenSSH key to PKCS#8 PEM:\n"
+            "  openssl pkey -in %s -out key.pem\n",
+            path, path);
         ERR_print_errors_fp(stderr);
     }
     return pkey;
 }
 
-/* ── sign ──────────────────────────────────────────────────────────────── */
+/* ── sign_message ─────────────────────────────────────────────────────── */
 static unsigned char *
 sign_message(EVP_PKEY *pkey,
              const unsigned char *msg, size_t msg_len,
@@ -114,13 +373,11 @@ sign_message(EVP_PKEY *pkey,
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
     if (!ctx) return NULL;
 
-    /* Choose digest: Ed25519 uses NULL digest (self-hashing).
-       RSA uses SHA-256.  OpenSSL auto-detects key type. */
     int key_type = EVP_PKEY_id(pkey);
     const EVP_MD *md = NULL;
     if (key_type == EVP_PKEY_RSA || key_type == EVP_PKEY_RSA2)
         md = EVP_sha256();
-    /* Ed25519: md remains NULL */
+    /* Ed25519: md stays NULL */
 
     if (EVP_DigestSignInit(ctx, NULL, md, NULL, pkey) != 1) {
         ERR_print_errors_fp(stderr);
@@ -128,7 +385,6 @@ sign_message(EVP_PKEY *pkey,
         return NULL;
     }
 
-    /* Determine required signature buffer size */
     size_t sig_len = 0;
     if (EVP_DigestSign(ctx, NULL, &sig_len, msg, msg_len) != 1) {
         ERR_print_errors_fp(stderr);
@@ -137,10 +393,7 @@ sign_message(EVP_PKEY *pkey,
     }
 
     unsigned char *sig = malloc(sig_len);
-    if (!sig) {
-        EVP_MD_CTX_free(ctx);
-        return NULL;
-    }
+    if (!sig) { EVP_MD_CTX_free(ctx); return NULL; }
 
     if (EVP_DigestSign(ctx, sig, &sig_len, msg, msg_len) != 1) {
         ERR_print_errors_fp(stderr);
@@ -154,19 +407,26 @@ sign_message(EVP_PKEY *pkey,
     return sig;
 }
 
-/* ── main ──────────────────────────────────────────────────────────────── */
+/* ── main ─────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[])
 {
     if (argc != 3) {
         fprintf(stderr,
-                "Usage: %s <challenge_hex> <private_key_path>\n", argv[0]);
-        fprintf(stderr,
-                "Output: <challenge_hex>:<base64_signature>  (to stdout)\n");
+                "Usage: %s <challenge_hex> <private_key_path>\n"
+                "\n"
+                "Output: <challenge_hex>:<base64_signature>  (to stdout)\n"
+                "\n"
+                "Accepted key formats:\n"
+                "  ~/.ssh/id_ed25519          OpenSSH Ed25519 (unencrypted)\n"
+                "  ~/.ssh/id_rsa              OpenSSH RSA — convert first:\n"
+                "                               openssl pkey -in ~/.ssh/id_rsa -out key.pem\n"
+                "  key.pem                    PKCS#8 or traditional PEM (any type)\n",
+                argv[0]);
         return 1;
     }
 
-    const char *challenge_hex  = argv[1];
-    const char *privkey_path   = argv[2];
+    const char *challenge_hex = argv[1];
+    const char *privkey_path  = argv[2];
 
     /* Decode challenge hex → bytes */
     unsigned char challenge_bytes[64];
@@ -187,7 +447,7 @@ int main(int argc, char *argv[])
     memcpy(msg + SIGN_PREFIX_LEN, challenge_bytes, challenge_len);
     size_t msg_len = SIGN_PREFIX_LEN + challenge_len;
 
-    /* Load private key */
+    /* Load private key (handles OpenSSH and PEM formats) */
     EVP_PKEY *pkey = load_private_key(privkey_path);
     if (!pkey)
         return 1;
@@ -205,15 +465,12 @@ int main(int argc, char *argv[])
     /* Base64-encode signature */
     char *sig_b64 = b64_encode(sig, sig_len);
     free(sig);
-
     if (!sig_b64) {
         fprintf(stderr, "Base64 encoding failed\n");
         return 1;
     }
 
-    /* Output PAM token */
     printf("%s:%s\n", challenge_hex, sig_b64);
     free(sig_b64);
-
     return 0;
 }

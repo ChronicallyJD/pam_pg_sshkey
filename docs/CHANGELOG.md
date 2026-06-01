@@ -10,6 +10,74 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.2] — 2026-06-01
+
+### Fixed
+
+- **`pg_sshkey_sign` failed with `DECODER routines: unsupported, Input type: PEM`
+  when given an OpenSSH private key file** (`-----BEGIN OPENSSH PRIVATE KEY-----`).
+
+  The tool previously called `PEM_read_PrivateKey()`, which only understands
+  PKCS#8 (`-----BEGIN PRIVATE KEY-----`) and traditional (`-----BEGIN RSA PRIVATE KEY-----`)
+  PEM formats. OpenSSH's own format — the default output of `ssh-keygen` since
+  OpenSSH 6.5 (2014) — uses a custom binary encoding that OpenSSL cannot decode
+  with standard PEM APIs, and `OSSL_DECODER` does not support it either.
+
+  `pg_sshkey_sign` now detects `-----BEGIN OPENSSH PRIVATE KEY-----` and parses
+  the format natively:
+  - Reads the binary structure (magic, cipher, kdf, public key blob, private section)
+  - Detects passphrase-protected keys (non-`none` cipher) and prints a clear error
+    with the commands needed to remove the passphrase or convert to PKCS#8 PEM
+  - For Ed25519 keys, extracts the 32-byte seed and loads it via
+    `EVP_PKEY_new_raw_private_key()`
+  - For non-Ed25519 OpenSSH format keys (e.g. `ssh-rsa`), prints a conversion
+    command (`openssl pkey -in <keyfile> -out key.pem`)
+
+  PKCS#8 PEM and traditional PEM formats continue to work as before.
+
+  **Key format support matrix after this fix:**
+
+  | Key file format               | Ed25519 | RSA  |
+  |-------------------------------|---------|------|
+  | OpenSSH (`BEGIN OPENSSH ...`) | ✓       | convert to PEM first |
+  | PKCS#8 PEM (`BEGIN PRIVATE KEY`) | ✓    | ✓    |
+  | Traditional PEM (`BEGIN RSA PRIVATE KEY`) | ✓ | ✓ |
+
+---
+
+## [1.0.1] — 2026-06-01
+
+### Fixed
+
+- **`conversation failed` / `failed to get auth token` on every login.**
+
+  The root cause was a misunderstanding of how PostgreSQL passes the client
+  password to PAM modules.
+
+  PostgreSQL does **not** call `pam_set_item(PAM_AUTHTOK)` before invoking
+  `pam_authenticate()`.  Instead it stores the client password exclusively
+  in `appdata_ptr` of the `pam_conv` struct.  As a result:
+
+  - `pam_get_item(PAM_AUTHTOK)` always returns `NULL`.
+  - `pam_get_authtok()` with any prompt (including `NULL`) falls through to
+    calling the conversation function, which PostgreSQL's implementation
+    handles by issuing a second `AUTH_REQ_PASSWORD` round-trip to the
+    client.  The client does not expect a second password challenge and the
+    exchange fails with "conversation failed".
+
+  The fix introduces `get_token_via_conv()`, which retrieves the token by
+  calling the PAM conversation function directly via `pam_get_item(PAM_CONV)`
+  and issuing exactly one `PAM_PROMPT_ECHO_OFF` message.  PostgreSQL's
+  conversation function answers immediately from `appdata_ptr` without any
+  network I/O.  The result is cached with `pam_set_item(PAM_AUTHTOK)` so
+  stacked PAM modules can read it normally.
+
+  The `(void)flags` suppression for the previously-warned unused `flags`
+  parameter in `pam_sm_authenticate` was also added, eliminating the
+  remaining compiler warning.
+
+---
+
 ## [1.0.0] — 2026-06-01
 
 Initial public release.

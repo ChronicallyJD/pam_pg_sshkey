@@ -64,12 +64,11 @@ Key properties:
 
 ### Supported operating systems
 
-| Distribution        | Minimum version | Notes                                         |
-|---------------------|-----------------|-----------------------------------------------|
-| Ubuntu              | 20.04 LTS       | Tested on 20.04, 22.04, 24.04                 |
-| Debian              | 11 (Bullseye)   | Tested on 11, 12                              |
-| RHEL / Rocky / Alma | 8.x             | Set `PAM_LIB_DIR=/lib64/security` at build    |
-| FreeBSD             | 13              | Use `gmake`; PAM module path differs          |
+| Distribution        | Minimum version | Notes                                              |
+|---------------------|-----------------|-----------------------------------------------------|
+| Ubuntu              | 22.04 LTS       | Tested on 22.04, 24.04; ships PostgreSQL 14–16      |
+| Debian              | 12 (Bookworm)   | Tested on 12; ships PostgreSQL 15                   |
+| RHEL / Rocky / Alma | 9.x             | Set `PAM_LIB_DIR=/lib64/security` at build          |
 
 ### Debian / Ubuntu build dependencies
 
@@ -152,15 +151,16 @@ sudo make install PAM_LIB_DIR=/lib64/security
 
 ### PostgreSQL requirement
 
-Any PostgreSQL version that supports `pam` authentication (all releases
-since 7.4). The PostgreSQL server binary must have been compiled with
-`--with-pam`. Binary packages from the official
-[PGDG apt repository](https://apt.postgresql.org) include PAM support by
-default. Verify with:
+PostgreSQL **14 or later** is required. Earlier versions are not supported.
+
+The PostgreSQL server binary must have been compiled with `--with-pam`.
+Binary packages from the official [PGDG apt repository](https://apt.postgresql.org)
+include PAM support by default. Verify with:
 
 ```bash
+psql --version               # must print 14.x or later
 pg_config --configure | grep -o '\-\-with-pam'
-# should print: --with-pam
+# must print: --with-pam
 ```
 
 ---
@@ -342,6 +342,17 @@ Add a line **before** any existing `password` or `md5` lines:
 host    all       all   0.0.0.0/0   pam     pamservice=postgresql
 ```
 
+The six columns are positional — `pam` is the METHOD and `pamservice=postgresql`
+is a space-separated OPTIONS value in the sixth column. They must not be
+merged. The common mistake that produces the log error
+`invalid authentication method "pamservice=postgresql"` is writing only
+five columns and letting PostgreSQL interpret the option as the method name:
+
+```
+# WRONG — pamservice=postgresql is parsed as the method, not an option
+host  all  all  0.0.0.0/0  pamservice=postgresql
+```
+
 To restrict to a specific database or subnet:
 
 ```
@@ -351,6 +362,20 @@ host    mydb      all   10.0.0.0/8  pam     pamservice=postgresql
 > **Note on `pamservice`:** The value `postgresql` tells `libpam` to look up
 > `/etc/pam.d/postgresql`. If you use a different filename, change this value
 > accordingly.
+
+#### Validate before reloading
+
+Check `pg_hba.conf` for errors without a reload:
+
+```sql
+-- Run as a superuser
+SELECT line_number, type, error
+FROM pg_hba_file_rules
+WHERE error IS NOT NULL;
+```
+
+An empty result means the file parsed cleanly. Any row with a non-null
+`error` shows the line number and the parse error.
 
 ### Step 2 — Create PostgreSQL users
 
@@ -367,9 +392,20 @@ No password is required (or wanted) for PAM-authenticated users.
 
 ### Step 3 — Reload PostgreSQL
 
+Reload (not restart) — `pg_hba.conf` is re-read on reload without dropping
+existing connections:
+
 ```bash
-sudo systemctl reload postgresql     # Debian/Ubuntu
-sudo systemctl reload postgresql-16  # RHEL (adjust version)
+# Debian/Ubuntu (PGDG packages use a version-specific unit name):
+sudo systemctl reload postgresql@14-main   # adjust major version as needed
+sudo systemctl reload postgresql@15-main
+sudo systemctl reload postgresql@16-main
+
+# RHEL/Fedora:
+sudo systemctl reload postgresql-14        # adjust major version as needed
+
+# From inside psql as a superuser (works on any platform):
+SELECT pg_reload_conf();
 ```
 
 ### Step 4 — Verify PAM is active
@@ -660,15 +696,15 @@ Exit code 0 on success, 1 on error.
 
 ### Syslog output
 
-All authentication events are logged to syslog facility `authpriv`. On
-systemd systems:
+All authentication events are logged to syslog facility `authpriv`:
 
 ```bash
+# Show PAM auth events from the last 10 minutes
 journalctl -t postgresql --since "10 minutes ago"
-```
 
-On syslogd systems, check `/var/log/auth.log` (Debian) or
-`/var/log/secure` (RHEL).
+# Or filter to just pam_pg_sshkey messages
+journalctl -t postgresql --since "10 minutes ago" | grep pam_pg_sshkey
+```
 
 ### Common log messages
 
@@ -689,12 +725,68 @@ Add `debug` to the PAM configuration:
 auth required pam_pg_sshkey.so ... debug
 ```
 
-Then reload PostgreSQL (`systemctl reload postgresql`) and attempt a
+Then reload PostgreSQL (`systemctl reload postgresql@16-main` or equivalent) and attempt a
 connection. Debug logs include the challenge hex, key type tried, and
 authorized_keys path used.
 
 **Remove `debug` after diagnosis** — it logs the challenge hex which, while
 not a private key, adds unnecessary noise.
+
+### `conversation failed` / `failed to get auth token`
+
+```
+pam_pg_sshkey(postgresql:auth): conversation failed
+pam_pg_sshkey(postgresql:auth): pam_pg_sshkey: failed to get auth token for 'user'
+```
+
+This means the PAM module triggered a second password round-trip to the
+client, which the client does not expect and drops.
+
+PostgreSQL does **not** call `pam_set_item(PAM_AUTHTOK)` before invoking
+`pam_authenticate()`. It stores the client password only in `appdata_ptr`
+of the `pam_conv` struct. Any call to `pam_get_authtok()` — even with a
+`NULL` prompt — falls through to the conversation function when
+`PAM_AUTHTOK` is unset, which causes PostgreSQL to send a second
+`AUTH_REQ_PASSWORD` to the client. The client ignores it and the exchange
+fails.
+
+Version 1.0.1 fixes this by calling the conversation function directly
+via `pam_get_item(PAM_CONV)` with a single `PAM_PROMPT_ECHO_OFF` message,
+which PostgreSQL answers immediately from `appdata_ptr`. Upgrade to 1.0.1.
+
+If you see this with 1.0.1 or later, the client sent an empty password.
+Confirm the token is being passed:
+
+```bash
+echo "$TOKEN" | grep -Eo '^[0-9a-f]{64}:[A-Za-z0-9+/=]+$' \
+  && echo "Token format OK" || echo "Token is empty or malformed"
+```
+
+### `invalid authentication method "pamservice=postgresql"`
+
+This log error means PostgreSQL parsed `pamservice=postgresql` as the
+authentication method name rather than as an option to the `pam` method.
+The `pg_hba.conf` line has a column count or formatting problem.
+
+**Wrong** — only five columns; `pamservice=postgresql` lands in the METHOD slot:
+```
+host  all  all  0.0.0.0/0  pamservice=postgresql
+```
+
+**Correct** — six columns; `pam` is the method, `pamservice=postgresql` is the option:
+```
+host    all    all    0.0.0.0/0    pam    pamservice=postgresql
+```
+
+After correcting the line, validate and reload:
+
+```bash
+# Validate — must return zero rows
+psql -U postgres -c "SELECT line_number, error FROM pg_hba_file_rules WHERE error IS NOT NULL;"
+
+# Reload without dropping connections (adjust unit name for your version/platform)
+sudo systemctl reload postgresql@16-main
+```
 
 ### Authentication fails immediately
 
@@ -738,7 +830,7 @@ sudo make uninstall
 sudo mv /etc/pam.d/postgresql.bak /etc/pam.d/postgresql
 
 # Revert pg_hba.conf to the previous auth method, then:
-sudo systemctl reload postgresql
+sudo systemctl reload postgresql@16-main   # adjust version as needed
 ```
 
 ---

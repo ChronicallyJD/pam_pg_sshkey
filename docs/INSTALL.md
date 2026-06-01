@@ -497,15 +497,40 @@ ssh-rsa AAAA...     alice@desktop
 
 ### Adding a user's key
 
+Use `pg_sshkey_addkey` (installed by `make install`, must run as root).
+It creates the directory, writes the key, and enforces correct ownership
+and permissions automatically:
+
 ```bash
-PGUSER=alice
-sudo mkdir -p /etc/pg_sshkeys/$PGUSER
-sudo tee /etc/pg_sshkeys/$PGUSER/authorized_keys << 'EOF'
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop
-EOF
-sudo chown root:postgres /etc/pg_sshkeys/$PGUSER/authorized_keys
-sudo chmod 640 /etc/pg_sshkeys/$PGUSER/authorized_keys
+# From a .pub file
+sudo pg_sshkey_addkey alice ~/.ssh/id_ed25519.pub
+
+# From stdin (e.g. extracting the public key from a private key)
+ssh-keygen -y -f ~/.ssh/id_ed25519 | sudo pg_sshkey_addkey alice -
+
+# Append a second key without replacing the first
+sudo pg_sshkey_addkey --append alice ~/.ssh/id_rsa.pub
+
+# List current keys
+sudo pg_sshkey_addkey --list alice
+
+# Remove all keys
+sudo pg_sshkey_addkey --remove alice
 ```
+
+The file is always written as `root:postgres 0640`:
+
+```
+-rw-r----- root postgres /etc/pg_sshkeys/alice/authorized_keys
+```
+
+This ownership is required: the PAM module runs as the `postgres` OS user
+and must be able to read the file. If the file is owned by the database
+user (`alice:alice 0600`), the `postgres` process cannot read it and
+authentication fails with a permission error in the log.
+
+**Do not create the file manually** — it is easy to get the ownership
+wrong. Always use `pg_sshkey_addkey`.
 
 ### Accepted key types
 
@@ -531,71 +556,87 @@ group or other (`g+w` or `o+w`). Correct permissions:
 
 ## 9. Client Setup
 
-### Prerequisites
+### pg_sshkey_connect — the required entry point
 
-The client needs `pg_sshkey_challenge` (to get a nonce from the server) and
-`pg_sshkey_sign` (to sign it). In a typical deployment the challenge is
-fetched by a sidecar service and handed to the client, but for testing you
-can use SSH to call the server helper directly.
-
-### Manual connection (step by step)
+`pg_sshkey_connect` is installed by `make install` and is the only supported
+way to connect. It generates a challenge nonce, signs it with your SSH key,
+and passes the signed token to `psql` as `PGPASSWORD` — all atomically.
 
 ```bash
-# 1. Get a challenge from the server
-CHALLENGE=$(ssh dbserver pg_sshkey_challenge /var/run/pg_sshkey)
-echo "Challenge: $CHALLENGE"
-
-# 2. Sign it with your SSH private key
-TOKEN=$(pg_sshkey_sign "$CHALLENGE" ~/.ssh/id_ed25519)
-echo "Token: $TOKEN"
-
-# 3. Connect to PostgreSQL
-PGPASSWORD="$TOKEN" psql -h dbserver -U alice -d mydb
+pg_sshkey_connect                            # connect as $USER to $USER db
+pg_sshkey_connect mydb                       # specific database
+pg_sshkey_connect -U alice mydb              # specific user
+pg_sshkey_connect -i ~/.ssh/pg_key mydb      # specific key file
+pg_sshkey_connect -h dbserver -U alice mydb  # remote host
+pg_sshkey_connect -v mydb                    # verbose: show each step
+pg_sshkey_connect -U alice -- -c "SELECT 1"  # pass flags through to psql
 ```
 
-### Wrapper script
+Full option reference:
+
+```
+pg_sshkey_connect [OPTIONS] [DBNAME]
+
+  -U, --username USER     PostgreSQL username        (default: $USER)
+  -h, --host HOST         PostgreSQL host            (default: local socket)
+  -p, --port PORT         PostgreSQL port            (default: 5432)
+  -d, --dbname DBNAME     Database name              (default: username)
+  -i, --identity FILE     SSH private key            (default: ~/.ssh/id_ed25519)
+  -c, --challenge-dir DIR Challenge directory        (default: /var/run/pg_sshkey)
+  -v, --verbose           Print each step to stderr
+  --                      Remaining args passed to psql
+```
+
+### Why you cannot use psql directly
+
+When PostgreSQL sends `AUTH_REQ_PASSWORD` to the client, `libpq` checks
+whether a password is already available (`PGPASSWORD` or `.pgpass`). If
+none is set, **libpq immediately disconnects** without sending a password
+packet — it does not prompt interactively. The PAM module receives a NULL
+from `recv_password_packet()` and logs:
+
+```
+pam_pg_sshkey: failed to get auth token for 'user' (client sent no password)
+```
+
+The token must be pre-computed and exported in `PGPASSWORD` before `psql`
+opens the connection. `pg_sshkey_connect` does this automatically.
+
+### Key format support
+
+| Key file                          | Works directly | Notes                        |
+|-----------------------------------|----------------|------------------------------|
+| `~/.ssh/id_ed25519` (OpenSSH)     | ✓              | Default; most common         |
+| `~/.ssh/id_rsa` (OpenSSH RSA)     | ✗              | Convert to PEM first         |
+| `key.pem` (PKCS#8 or traditional) | ✓              | Ed25519 and RSA              |
+
+Convert an OpenSSH RSA key to PEM:
+
+```bash
+openssl pkey -in ~/.ssh/id_rsa -out ~/.ssh/id_rsa.pem
+pg_sshkey_connect -U alice -i ~/.ssh/id_rsa.pem mydb
+```
+
+### Using from scripts and applications
+
+Each token is single-use and expires in 60 seconds. Scripts must generate
+a fresh token per connection:
 
 ```bash
 #!/usr/bin/env bash
-# pg_ssh_connect — fetch challenge, sign, connect
-set -euo pipefail
-DB_HOST="${1:?Usage: $0 host user [db] [key]}"
-DB_USER="${2:?}"
-DB_NAME="${3:-$DB_USER}"
-KEY="${4:-$HOME/.ssh/id_ed25519}"
+# Example: run a query non-interactively
+pg_sshkey_connect -U alice mydb -- -c "SELECT count(*) FROM orders"
+```
 
-CHALLENGE=$(ssh "$DB_HOST" pg_sshkey_challenge /var/run/pg_sshkey)
-TOKEN=$(pg_sshkey_sign "$CHALLENGE" "$KEY")
+For applications that use `libpq` directly, generate the token and set it
+in the connection string before connecting:
+
+```bash
+# Generate token (call from application startup before connecting)
+CHALLENGE=$(pg_sshkey_challenge /var/run/pg_sshkey)
+TOKEN=$(pg_sshkey_sign "$CHALLENGE" ~/.ssh/id_ed25519)
+# Pass as password= in the connection string or PGPASSWORD env var
 export PGPASSWORD="$TOKEN"
-exec psql -h "$DB_HOST" -U "$DB_USER" "$DB_NAME"
-```
-
-Save as `pg_ssh_connect`, `chmod +x`, and call:
-
-```bash
-pg_ssh_connect dbserver alice mydb
-```
-
-### pgpass alternative
-
-`pg_sshkey_sign` can be called in a shell profile or `.pgpass` substitute
-script.  Since tokens are single-use and time-limited, they cannot be cached;
-each `psql` invocation needs a fresh token.
-
-### libpq connection strings
-
-```bash
-psql "host=dbserver user=alice password=$TOKEN dbname=mydb sslmode=require"
-```
-
-Or using environment variables:
-
-```bash
-export PGHOST=dbserver
-export PGUSER=alice
-export PGPASSWORD="$TOKEN"
-export PGSSLMODE=require
-psql mydb
 ```
 
 ---
@@ -767,6 +808,36 @@ authorized_keys path used.
 **Remove `debug` after diagnosis** — it logs the challenge hex which, while
 not a private key, adds unnecessary noise.
 
+### `failed to get auth token (client sent no password)`
+
+```
+pam_pg_sshkey: failed to get auth token for 'user' (client sent no password)
+```
+
+The client connected without a pre-set `PGPASSWORD`. When PostgreSQL sent
+`AUTH_REQ_PASSWORD`, `libpq` found no password available and **immediately
+disconnected** without sending a password packet.
+
+This happens when you run `psql` directly instead of `pg_sshkey_connect`:
+
+```bash
+# Wrong — psql has no password to send
+psql -U alice mydb
+
+# Wrong — PGPASSWORD is empty because pg_sshkey_challenge failed
+PGPASSWORD="$TOKEN" psql -U alice mydb   # if $TOKEN is blank
+
+# Correct — pg_sshkey_connect handles everything
+pg_sshkey_connect -U alice mydb
+```
+
+If `pg_sshkey_connect` itself produces this error, the challenge creation
+failed silently. Run with `-v` to see each step:
+
+```bash
+pg_sshkey_connect -v -U alice mydb
+```
+
 ### `conversation failed` / `failed to get auth token`
 
 ```
@@ -795,6 +866,33 @@ Confirm the token is being passed:
 ```bash
 echo "$TOKEN" | grep -Eo '^[0-9a-f]{64}:[A-Za-z0-9+/=]+$' \
   && echo "Token format OK" || echo "Token is empty or malformed"
+```
+
+### `cannot read authorized_keys (permission denied)`
+
+```
+pam_pg_sshkey: cannot read authorized_keys for 'alice'
+  (permission denied — file must be owned root:postgres mode 0640,
+   got uid=1001 gid=1001 mode=0600)
+pam_pg_sshkey: fix with: chown root:postgres ... && chmod 640 ...
+```
+
+The `authorized_keys` file is not readable by the `postgres` OS user that
+runs the PAM module. The most common cause is creating the file manually
+as the database user, which makes it `<user>:<user> 0600`.
+
+Fix with `pg_sshkey_addkey`, which always enforces correct permissions:
+
+```bash
+# Re-deploy the key with correct ownership
+sudo pg_sshkey_addkey alice ~/.ssh/id_ed25519.pub
+
+# Or fix permissions on an existing file manually
+sudo chown root:postgres /etc/pg_sshkeys/alice/authorized_keys
+sudo chmod 640 /etc/pg_sshkeys/alice/authorized_keys
+
+# Verify the postgres user can now read it
+sudo -u postgres cat /etc/pg_sshkeys/alice/authorized_keys
 ```
 
 ### `invalid authentication method "pamservice=postgresql"`

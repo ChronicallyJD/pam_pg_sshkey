@@ -142,57 +142,42 @@ ssh-rsa AAAA... alice@desktop
 
 ## Connecting as a user
 
-### Step 1 — Get a challenge from the server
+Use `pg_sshkey_connect` — the included wrapper that handles the full
+challenge-sign-connect flow in one command:
 
 ```bash
-# On the PostgreSQL server (or via a sidecar service):
-CHALLENGE=$(pg_sshkey_challenge /var/run/pg_sshkey)
-echo "Challenge: $CHALLENGE"
+pg_sshkey_connect                          # connect as $USER to $USER db
+pg_sshkey_connect mydb                     # connect to a specific database
+pg_sshkey_connect -U alice mydb            # connect as alice
+pg_sshkey_connect -i ~/.ssh/pg_key mydb    # use a specific key file
+pg_sshkey_connect -h dbserver -U alice mydb  # remote host
 ```
 
-### Step 2 — Sign it on the client
+**You must use `pg_sshkey_connect` (or manually set `PGPASSWORD` to a signed
+token) every time you connect.** Running `psql` directly will fail: when
+PostgreSQL sends the password challenge, `libpq` immediately disconnects if
+no password is pre-loaded, before the PAM module can do anything.
 
-```bash
-# On the client machine:
-TOKEN=$(pg_sshkey_sign "$CHALLENGE" ~/.ssh/id_ed25519)
-echo "Token: $TOKEN"
+### What pg_sshkey_connect does
+
+```
+1. pg_sshkey_challenge /var/run/pg_sshkey  → 64-char hex nonce
+2. pg_sshkey_sign <nonce> <key>            → nonce:base64_signature
+3. PGPASSWORD=<token> psql ...             → authenticated session
 ```
 
-### Step 3 — Connect to PostgreSQL
+### Key format support
 
+| Key file                         | Works directly |
+|----------------------------------|----------------|
+| `~/.ssh/id_ed25519` (OpenSSH)    | ✓              |
+| `~/.ssh/id_rsa` (OpenSSH)        | Convert first  |
+| `key.pem` (PKCS#8 or traditional)| ✓              |
+
+To convert an OpenSSH RSA key to PEM:
 ```bash
-psql "host=dbserver user=alice password=$TOKEN dbname=mydb"
-```
-
-Or set `PGPASSWORD`:
-
-```bash
-export PGPASSWORD="$TOKEN"
-psql -h dbserver -U alice mydb
-```
-
----
-
-## Wrapper script (client-side convenience)
-
-```bash
-#!/usr/bin/env bash
-# pg_ssh_connect.sh — fetch challenge, sign, and connect
-
-set -euo pipefail
-
-DB_HOST="${1:?Usage: $0 host user [dbname]}"
-DB_USER="${2:?}"
-DB_NAME="${3:-$DB_USER}"
-KEY="${4:-$HOME/.ssh/id_ed25519}"
-
-# Fetch challenge from server (requires SSH access or a challenge API)
-CHALLENGE=$(ssh "$DB_HOST" pg_sshkey_challenge /var/run/pg_sshkey)
-
-TOKEN=$(pg_sshkey_sign "$CHALLENGE" "$KEY")
-
-export PGPASSWORD="$TOKEN"
-psql -h "$DB_HOST" -U "$DB_USER" "$DB_NAME"
+openssl pkey -in ~/.ssh/id_rsa -out ~/.ssh/id_rsa.pem
+pg_sshkey_connect -U alice -i ~/.ssh/id_rsa.pem mydb
 ```
 
 ---

@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# pg_sshkey_addkey — add or replace a user's authorized public key for
+# PostgreSQL SSH-key authentication.
+#
+# Must be run as root.  Sets ownership and permissions correctly so the
+# PAM module (running as 'postgres') can read the file.
+#
+# Usage:
+#   pg_sshkey_addkey <pg_username> <public_key_file_or_->
+#
+# The public key can be:
+#   - A path to a .pub file:    pg_sshkey_addkey alice ~/.ssh/id_ed25519.pub
+#   - A literal key string:     pg_sshkey_addkey alice "ssh-ed25519 AAAA..."
+#   - stdin (use -):            cat id_ed25519.pub | pg_sshkey_addkey alice -
+#
+# Options:
+#   -d, --keys-dir DIR    Key directory root (default: /etc/pg_sshkeys)
+#   -a, --append          Append to existing keys instead of replacing
+#   --list                List current keys for the user
+#   --remove              Remove all keys for the user
+#
+# SPDX-License-Identifier: MIT
+
+set -euo pipefail
+
+KEYS_DIR="/etc/pg_sshkeys"
+APPEND=0
+LIST=0
+REMOVE=0
+PG_USER=""
+KEY_SRC=""
+
+usage() {
+    cat >&2 << 'USAGE'
+Usage: pg_sshkey_addkey [OPTIONS] <pg_username> [<pubkey_file_or_->]
+
+Add a public key for PostgreSQL SSH-key authentication (run as root).
+
+Arguments:
+  pg_username           PostgreSQL username to authorize
+  pubkey_file_or_-      Path to a .pub file, or - to read from stdin.
+                        May also be a literal "ssh-ed25519 AAAA..." string.
+
+Options:
+  -d, --keys-dir DIR    Key directory root    (default: /etc/pg_sshkeys)
+  -a, --append          Append to existing file instead of replacing
+      --list            List current authorized keys for the user
+      --remove          Remove the user's authorized_keys file
+
+Required permissions:
+  The authorized_keys file must be owned root:postgres mode 0640.
+  This script enforces those permissions automatically.
+
+Examples:
+  pg_sshkey_addkey alice ~/.ssh/id_ed25519.pub
+  pg_sshkey_addkey -a alice ~/.ssh/id_rsa.pub
+  ssh-keygen -y -f ~/.ssh/id_ed25519 | pg_sshkey_addkey alice -
+  pg_sshkey_addkey --list alice
+USAGE
+    exit 1
+}
+
+die()  { echo "pg_sshkey_addkey: error: $*" >&2; exit 1; }
+info() { echo "pg_sshkey_addkey: $*"; }
+
+# ── argument parsing ──────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--keys-dir)  KEYS_DIR="$2"; shift 2 ;;
+        -a|--append)    APPEND=1;      shift ;;
+        --list)         LIST=1;        shift ;;
+        --remove)       REMOVE=1;      shift ;;
+        --help)         usage ;;
+        -*)             die "Unknown option: $1" ;;
+        *)
+            if [[ -z "$PG_USER" ]]; then
+                PG_USER="$1"
+            elif [[ -z "$KEY_SRC" ]]; then
+                KEY_SRC="$1"
+            else
+                die "Unexpected argument: $1"
+            fi
+            shift ;;
+    esac
+done
+
+[[ -z "$PG_USER" ]] && usage
+
+# ── must run as root ──────────────────────────────────────────────────────────
+if [[ "$EUID" -ne 0 ]]; then
+    die "Must be run as root.
+  sudo pg_sshkey_addkey $PG_USER ${KEY_SRC:-}"
+fi
+
+# ── validate pg_username (no path traversal) ──────────────────────────────────
+if ! [[ "$PG_USER" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.@-]*$ ]]; then
+    die "Invalid PostgreSQL username: '$PG_USER'"
+fi
+
+USER_DIR="$KEYS_DIR/$PG_USER"
+AK_FILE="$USER_DIR/authorized_keys"
+
+# ── ensure root keys directory exists with correct permissions ────────────────
+if [[ ! -d "$KEYS_DIR" ]]; then
+    install -d -m 750 -o root -g postgres "$KEYS_DIR"
+    info "created $KEYS_DIR"
+fi
+# Always enforce correct permissions on the root directory
+chown root:postgres "$KEYS_DIR"
+chmod 750 "$KEYS_DIR"
+
+# ── --list ────────────────────────────────────────────────────────────────────
+if [[ "$LIST" -eq 1 ]]; then
+    if [[ ! -f "$AK_FILE" ]]; then
+        echo "No authorized keys for '$PG_USER'"
+        exit 0
+    fi
+    echo "Authorized keys for '$PG_USER' ($AK_FILE):"
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        type=$(echo "$line" | awk '{print $1}')
+        comment=$(echo "$line" | awk '{print $3}')
+        fp=$(echo "$line" | ssh-keygen -l -f /dev/stdin 2>/dev/null \
+             | awk '{print $2, $4}' || echo "(fingerprint unavailable)")
+        echo "  $type  $fp  $comment"
+    done < "$AK_FILE"
+    exit 0
+fi
+
+# ── --remove ──────────────────────────────────────────────────────────────────
+if [[ "$REMOVE" -eq 1 ]]; then
+    if [[ -f "$AK_FILE" ]]; then
+        rm -f "$AK_FILE"
+        info "removed $AK_FILE"
+    else
+        info "no authorized_keys for '$PG_USER' — nothing to remove"
+    fi
+    # Remove directory if empty
+    rmdir "$USER_DIR" 2>/dev/null && info "removed $USER_DIR" || true
+    exit 0
+fi
+
+# ── read public key material ──────────────────────────────────────────────────
+[[ -z "$KEY_SRC" ]] && usage
+
+KEY_DATA=""
+
+if [[ "$KEY_SRC" == "-" ]]; then
+    KEY_DATA=$(cat)
+elif [[ -f "$KEY_SRC" ]]; then
+    KEY_DATA=$(cat "$KEY_SRC")
+elif [[ "$KEY_SRC" == ssh-* || "$KEY_SRC" == ecdsa-* ]]; then
+    # Literal key string passed directly
+    KEY_DATA="$KEY_SRC"
+else
+    die "Key source not found: $KEY_SRC
+Provide a .pub file path, a literal 'ssh-ed25519 AAAA...' string, or - for stdin."
+fi
+
+[[ -z "$KEY_DATA" ]] && die "No key data provided"
+
+# ── validate key format ───────────────────────────────────────────────────────
+VALID_TYPES="ssh-ed25519 ssh-rsa rsa-sha2-256 rsa-sha2-512"
+KEY_TYPE=$(echo "$KEY_DATA" | awk 'NR==1{print $1}')
+
+# Strip unsupported types with a warning
+FILTERED=""
+while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    ltype=$(echo "$line" | awk '{print $1}')
+    if echo "$VALID_TYPES" | grep -qw "$ltype"; then
+        FILTERED="${FILTERED}${line}"$'\n'
+    else
+        echo "pg_sshkey_addkey: warning: skipping unsupported key type '$ltype'" >&2
+        echo "  Supported types: $VALID_TYPES" >&2
+    fi
+done <<< "$KEY_DATA"
+
+[[ -z "$FILTERED" ]] && die "No supported key types found in input.
+Supported: $VALID_TYPES"
+
+# ── create/update authorized_keys ────────────────────────────────────────────
+install -d -m 750 -o root -g postgres "$USER_DIR"
+
+if [[ "$APPEND" -eq 1 && -f "$AK_FILE" ]]; then
+    printf '%s' "$FILTERED" >> "$AK_FILE"
+    info "appended key(s) to $AK_FILE"
+else
+    printf '%s' "$FILTERED" > "$AK_FILE"
+    info "wrote $AK_FILE"
+fi
+
+# Always enforce correct ownership and permissions
+chown root:postgres "$AK_FILE"
+chmod 640 "$AK_FILE"
+info "set $AK_FILE → root:postgres 0640"
+
+# ── confirm ───────────────────────────────────────────────────────────────────
+KEY_COUNT=$(grep -c "^ssh-\|^rsa-\|^ecdsa-" "$AK_FILE" 2>/dev/null || echo 0)
+info "user '$PG_USER' now has $KEY_COUNT authorized key(s)"
+info ""
+info "Verify the postgres user can read it:"
+info "  sudo -u postgres cat $AK_FILE"

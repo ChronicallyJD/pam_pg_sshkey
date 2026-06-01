@@ -10,6 +10,75 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.5] — 2026-06-01
+
+### Added
+
+- **`pg_sshkey_addkey`** — key management script (installed to `$BIN_DIR`,
+  must be run as root).
+
+  Creates the per-user directory, writes the public key, and enforces
+  `root:postgres 0640` ownership on both the directory and the file.
+  This is the only supported way to deploy keys — doing it manually
+  produces `<user>:<user> 0600` files that the `postgres`-owned PAM
+  module cannot read.
+
+  ```
+  sudo pg_sshkey_addkey alice ~/.ssh/id_ed25519.pub
+  sudo pg_sshkey_addkey --append alice ~/.ssh/id_rsa.pub
+  sudo pg_sshkey_addkey --list alice
+  sudo pg_sshkey_addkey --remove alice
+  ```
+
+### Fixed
+
+- **PAM module silently failed for non-superusers** when their
+  `authorized_keys` file was owned by the OS user (`alice:alice 0600`)
+  rather than `root:postgres 0640`. The `postgres` process running the
+  PAM module could `stat()` the file (world-execute on the parent
+  directory was sufficient) but could not `open()` it. The module
+  logged `no valid keys` with no indication of the real cause.
+
+  Fixed by adding an explicit `access(R_OK)` check after `stat()`.
+  When the file is unreadable the module now logs the actual uid, gid,
+  and mode of the file and prints the exact `chown`/`chmod` commands
+  needed to fix it.
+
+---
+
+## [1.0.4] — 2026-06-01
+
+### Added
+
+- **`pg_sshkey_connect` — client entry point script** (`src/pg_sshkey_connect`,
+  installed to `$BIN_DIR/pg_sshkey_connect`).
+
+  Previously, users had to manually run `pg_sshkey_challenge`, `pg_sshkey_sign`,
+  and set `PGPASSWORD` before every `psql` invocation. Running `psql` directly
+  always failed because `libpq` immediately disconnects when `AUTH_REQ_PASSWORD`
+  arrives with no password pre-set, before the PAM module can do anything —
+  producing `failed to get auth token (client sent no password)` in the log.
+
+  `pg_sshkey_connect` wraps the full flow atomically:
+  1. Runs `pg_sshkey_challenge` to obtain a nonce
+  2. Runs `pg_sshkey_sign` to produce a signed token
+  3. Validates the token format before attempting a connection
+  4. Exports `PGPASSWORD=<token>` and `exec`s `psql`
+
+  Options mirror `psql`: `-U`, `-h`, `-p`, `-d`, `-i` (key file),
+  `-c` (challenge dir), `-v` (verbose), and `--` to pass remaining
+  arguments directly to `psql`.
+
+  `make install` now installs `pg_sshkey_connect` alongside the other binaries.
+
+### Fixed
+
+- **`failed to get auth token (client sent no password)`** — documented the
+  root cause (libpq disconnects on `AUTH_REQ_PASSWORD` with no password set)
+  and added a dedicated troubleshooting entry to `INSTALL.md`.
+
+---
+
 ## [1.0.3] — 2026-06-01
 
 ### Fixed

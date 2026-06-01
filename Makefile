@@ -57,7 +57,17 @@ TEST_BINS := $T/test_challenge_store $T/test_key_parser \
 
 .PHONY: all test check install install-conf uninstall clean
 
-all: pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge
+all: pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge pg_sshkey_connect pg_sshkey_addkey
+
+# ── Connect wrapper script ───────────────────────────────────────────────────
+pg_sshkey_connect: $S/pg_sshkey_connect
+	cp $S/pg_sshkey_connect pg_sshkey_connect
+	chmod +x pg_sshkey_connect
+
+# ── Key management script ────────────────────────────────────────────────────
+pg_sshkey_addkey: $S/pg_sshkey_addkey
+	cp $S/pg_sshkey_addkey pg_sshkey_addkey
+	chmod +x pg_sshkey_addkey
 
 # ── Compile .c → .o (static pattern rule — explicit, unambiguous) ──────────
 $(PAM_OBJS): $S/%.o: $S/%.c
@@ -112,6 +122,8 @@ install: all
 	install -d $(DESTDIR)$(BIN_DIR)
 	install -m 755 pg_sshkey_sign      $(DESTDIR)$(BIN_DIR)/
 	install -m 755 pg_sshkey_challenge $(DESTDIR)$(BIN_DIR)/
+	install -m 755 pg_sshkey_connect   $(DESTDIR)$(BIN_DIR)/
+	install -m 755 pg_sshkey_addkey    $(DESTDIR)$(BIN_DIR)/
 	install -d -m 750 -o root -g postgres $(DESTDIR)$(KEY_DIR)
 	# Challenge dir: sticky-bit world-write so any user can create nonces
 	# but only the owner of each file can delete it.
@@ -138,11 +150,13 @@ uninstall:
 	rm -f $(DESTDIR)$(PAM_LIB_DIR)/pam_pg_sshkey.so
 	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_sign
 	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_challenge
+	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_connect
+	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_addkey
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
 	rm -f $S/*.o
-	rm -f pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge
+	rm -f pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge pg_sshkey_connect pg_sshkey_addkey
 	rm -f $(TEST_BINS)
 
 endif  # CWD guard

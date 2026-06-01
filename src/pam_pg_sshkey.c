@@ -294,14 +294,41 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
         pam_syslog(pamh, LOG_DEBUG,
                    "pam_pg_sshkey: authorized_keys path: %s", authkeys_path);
 
-    /* Verify file exists and has safe permissions */
+    /* ── 6a. Verify file exists ── */
     struct stat st;
     if (stat(authkeys_path, &st) != 0) {
         pam_syslog(pamh, LOG_WARNING,
-                   "pam_pg_sshkey: no authorized_keys for '%s': %s",
-                   username, strerror(errno));
+                   "pam_pg_sshkey: no authorized_keys for '%s': %s "
+                   "(create it with: pg_sshkey_addkey %s <pubkey>)",
+                   username, strerror(errno), username);
         return PAM_AUTH_ERR;
     }
+
+    /* ── 6b. Check this process can actually read the file ── */
+    /*
+     * stat() succeeds even when the file is unreadable, because the PAM
+     * process (running as 'postgres') can stat() a file by name as long as
+     * it has execute permission on the parent directory.  An explicit
+     * access(R_OK) check catches the common misconfiguration where the file
+     * is 0600 owned by the OS user rather than root:postgres 0640.
+     */
+    if (access(authkeys_path, R_OK) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: cannot read authorized_keys for '%s' "
+                   "(permission denied — file must be owned root:postgres "
+                   "mode 0640, got uid=%d gid=%d mode=%04o): %s",
+                   username,
+                   (int)st.st_uid, (int)st.st_gid,
+                   (unsigned)(st.st_mode & 07777),
+                   strerror(errno));
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: fix with: "
+                   "chown root:postgres %s && chmod 640 %s",
+                   authkeys_path, authkeys_path);
+        return PAM_AUTH_ERR;
+    }
+
+    /* ── 6c. Refuse world/group-writable files ── */
     if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
         pam_syslog(pamh, LOG_ERR,
                    "pam_pg_sshkey: authorized_keys for '%s' is world/group"
@@ -314,7 +341,9 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
     int nkeys = parse_authorized_keys(authkeys_path, &keys);
     if (nkeys <= 0) {
         pam_syslog(pamh, LOG_WARNING,
-                   "pam_pg_sshkey: no valid keys in '%s'", authkeys_path);
+                   "pam_pg_sshkey: no valid keys in '%s' "
+                   "(file is empty or contains no supported key types)",
+                   authkeys_path);
         return PAM_AUTH_ERR;
     }
 

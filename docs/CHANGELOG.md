@@ -6,6 +6,77 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [1.0.8] — 2026-06-01
+
+### Added
+
+- **`pam_pg_sshkey.py`** — Python module for authenticating to PostgreSQL
+  with pam_pg_sshkey from application code, without shell wrappers or
+  external processes.
+
+  Designed for replication subscribers and any application using `psycopg2`
+  directly.  Everything is done in-process using Python's `cryptography`
+  library — no subprocess calls, no shell, no `pg_sshkey_connect`.
+
+  Core API:
+
+  ```python
+  from pam_pg_sshkey import get_token, connect, connect_replication
+
+  # Low-level: get the signed token and use it yourself
+  token = get_token(key_path="~/.ssh/id_ed25519")
+  conn  = psycopg2.connect(host="publisher", user="replicator",
+                           dbname="mydb", password=token)
+
+  # High-level convenience wrapper
+  conn = connect(user="alice", dbname="mydb", host="dbserver")
+
+  # Replication subscriber connection
+  conn = connect_replication(user="replicator", host="publisher.example.com",
+                             dbname="mydb")
+  ```
+
+  Supported key formats:
+  - OpenSSH format (`BEGIN OPENSSH PRIVATE KEY`) — Ed25519 and RSA,
+    with or without passphrase
+  - PKCS#8 PEM (`BEGIN PRIVATE KEY`) — Ed25519 and RSA
+  - Traditional PEM (`BEGIN RSA PRIVATE KEY`) — RSA
+
+  Requirements: `pip install psycopg2-binary cryptography`
+  For passphrase-protected OpenSSH keys: also `pip install bcrypt`
+
+- **`tests/test_python_module.py`** — 32 unit tests for `pam_pg_sshkey.py`
+  covering sign prefix correctness, key loading (all formats, with/without
+  passphrase), challenge creation (file mode, uniqueness, atomicity), signing
+  (Ed25519 and RSA, cross-verified against public key), `get_token()` end-to-end,
+  and API guards.
+
+---
+
+## [1.0.7] — 2026-06-01
+
+### Added
+
+- **`pg_sshkey_query`** — Python utility script for connecting to PostgreSQL
+  with SSH-key authentication and running a query.
+
+  Replicates the token-generation flow of `pg_sshkey_connect` in Python,
+  then uses `psycopg2` to open the connection with the signed token as the
+  password.  The token is computed before `psycopg2.connect()` is called
+  and passed as `password=`, so libpq holds it ready to send the instant
+  `AUTH_REQ_PASSWORD` arrives.
+
+  ```
+  pg_sshkey_query                        # SELECT 1 as $USER
+  pg_sshkey_query -U alice -d mydb       # specific user and database
+  pg_sshkey_query -q "SELECT version()"  # custom query
+  pg_sshkey_query -v                     # verbose: show each step
+  ```
+
+  Requires `psycopg2-binary` (`pip install psycopg2-binary`).
+
+---
+
 ## [1.0.6] — 2026-06-01
 
 ### Fixed

@@ -32,6 +32,11 @@ done when its check goes red with the fix removed.
 - When one instance of a claim turns out false, grep for the same phrasing
   everywhere before calling it fixed (the SHA-512 digest table lived in four
   files).
+- **Verify a commit series with every check, not just `make test`.** Check each
+  commit out in a worktree and run `make test && tests/test_make_test.sh`.
+  The 1.1.0 release commits were verified with `make test` alone, and the
+  commit titled "Stop tracking build outputs" had re-added them (a `git add
+  -u` on files `make test` had just rebuilt). CI caught it after the push.
 
 ## Documentation rules
 

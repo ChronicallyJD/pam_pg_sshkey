@@ -1,0 +1,23 @@
+# Build outputs (Makefile: all)
+/pam_pg_sshkey.so
+/pg_sshkey_sign
+/pg_sshkey_challenge
+/pg_sshkey_connect
+/pg_sshkey_addkey
+/pg_sshkey_query
+src/*.o
+
+# Test binaries (Makefile: test)
+tests/test_challenge_store
+tests/test_key_parser
+tests/test_sig_verify
+tests/test_integration
+tests/test_system
+tests/test_pam_module
+
+# Python
+__pycache__/
+*.pyc
+
+# e2e scratch
+tests/e2e/.state/

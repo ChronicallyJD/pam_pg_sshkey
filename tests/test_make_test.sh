@@ -27,6 +27,8 @@ check "make -n test invokes tests/test_pam_module" \
     grep -q 'tests/test_pam_module' <<<"$dry"
 check "make -n test invokes tests/test_pg_sshkey_query.py" \
     grep -q 'tests/test_pg_sshkey_query.py' <<<"$dry"
+check "make -n test invokes tests/test_docs.sh" \
+    grep -q 'tests/test_docs.sh' <<<"$dry"
 
 echo "=== artifact hygiene ==="
 check "no ELF binaries tracked in git" bash -c '! git ls-files -z | xargs -0 file -b 2>/dev/null | grep -q "^ELF"'

@@ -143,6 +143,8 @@ test check: all $(TEST_BINS)
 	@echo ""
 	@echo "=== test_pg_sshkey_query ===";  $(PYTHON) $T/test_pg_sshkey_query.py
 	@echo ""
+	@echo "=== test_docs ===";            $T/test_docs.sh
+	@echo ""
 	@echo "All test suites complete."
 
 # ── e2e: real PostgreSQL in a dedicated incus container ───────────────────

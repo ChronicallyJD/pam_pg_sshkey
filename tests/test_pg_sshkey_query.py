@@ -38,7 +38,10 @@ def run(script, *args, env_extra=None, path=NO_TOOLS_PATH):
 class TestErrorHandling(unittest.TestCase):
 
     def test_missing_helper_is_a_clean_error(self):
-        r = run(SCRIPT_SRC, "-U", "alice")
+        # Supply a key file so the run gets past the key check and reaches
+        # the helper lookup regardless of whether ~/.ssh/id_ed25519 exists.
+        with tempfile.NamedTemporaryFile() as key:
+            r = run(SCRIPT_SRC, "-U", "alice", "-i", key.name)
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("error:", r.stderr)

@@ -10,6 +10,11 @@ family. All files are self-contained SVG with no external fonts or images.
 | `pam_pg_sshkey-logo.svg` | Horizontal lockup (mark plus wordmark) for light backgrounds |
 | `pam_pg_sshkey-logo-dark.svg` | Horizontal lockup for dark backgrounds |
 | `pam_pg_sshkey-mark.svg` | Mark only, for favicons and avatars; holds its shape down to 16 px |
+| `pam_pg_sshkey-logo.png`, `pam_pg_sshkey-logo-dark.png` | The two lockups as transparent PNG, 1260 by 240 px |
+| `pam_pg_sshkey-mark-{16,32,64,128,256,512}.png` | The mark as transparent PNG at common icon sizes |
+
+The PNG files are rendered from the SVG files with `cairosvg`; regenerate them
+after changing an SVG (see below) rather than editing them.
 
 ## Palette
 
@@ -34,8 +39,14 @@ of installed fonts, convert its text to paths in a vector editor.
 </picture>
 ```
 
-## Rendering a PNG
+## Regenerating the PNG files
 
 ```sh
-python3 -c "import cairosvg; cairosvg.svg2png(url='logo/pam_pg_sshkey-mark.svg', write_to='mark-256.png', output_width=256)"
+python3 - <<'PY'
+import cairosvg
+cairosvg.svg2png(url='logo/pam_pg_sshkey-logo.svg', write_to='logo/pam_pg_sshkey-logo.png', output_width=1260)
+cairosvg.svg2png(url='logo/pam_pg_sshkey-logo-dark.svg', write_to='logo/pam_pg_sshkey-logo-dark.png', output_width=1260)
+for w in (16, 32, 64, 128, 256, 512):
+    cairosvg.svg2png(url='logo/pam_pg_sshkey-mark.svg', write_to=f'logo/pam_pg_sshkey-mark-{w}.png', output_width=w)
+PY
 ```

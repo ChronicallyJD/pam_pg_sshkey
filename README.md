@@ -4,18 +4,48 @@
   <source media="(prefers-color-scheme: dark)" srcset="logo/pam_pg_sshkey-logo-dark.svg">
   <img src="logo/pam_pg_sshkey-logo.svg" alt="pam_pg_sshkey" width="420">
 </picture>
+<p></p>
+<p><strong>Your SSH key is your PostgreSQL password.</strong></p>
+
+<a href="docs/installation.md"><img src="badges/postgresql.svg" alt="PostgreSQL 16 and 18 tested"></a>
+<a href="LICENSE"><img src="badges/license.svg" alt="License: MIT"></a>
+<a href="CHANGELOG.md"><img src="badges/version.svg" alt="Version 1.1.0"></a>
+<a href="docs/security.md"><img src="badges/tokens.svg" alt="Tokens: single use, 60 seconds"></a>
+<a href="https://github.com/ChronicallyJD/pam_pg_sshkey/actions/workflows/test.yml"><img src="https://github.com/ChronicallyJD/pam_pg_sshkey/actions/workflows/test.yml/badge.svg" alt="CI status"></a>
+
+<p><strong><a href="docs/index.md">Read the documentation</a></strong></p>
 
 </div>
 
-A PAM module that lets PostgreSQL authenticate database users with SSH
-public keys instead of passwords. The server stores public keys in OpenSSH
-`authorized_keys` files; the client proves possession of the private key by
-signing a one-time challenge. Private keys never leave the client.
+pam_pg_sshkey is a PAM module that lets PostgreSQL authenticate database
+users with the SSH keys they already have. The server stores public keys in
+OpenSSH `authorized_keys` files; the client proves possession of the private
+key by signing a one-time challenge. No password is stored on the server, in
+the application, or in a connection string.
 
-pam_pg_sshkey is written in C against libpam and OpenSSL, and ships a Python
-module for applications and replication clients. It is licensed under the
-[MIT License](LICENSE). The current version is 1.1.0, recorded in
+It is written in C against libpam and OpenSSL, ships a Python module for
+applications and replication clients, and is licensed under the
+[MIT License](LICENSE). The current version is 1.1.0; see
 [CHANGELOG.md](CHANGELOG.md).
+
+## Why pam_pg_sshkey
+
+- **Nothing secret on the server.** A compromised key tree reveals public
+  keys only. There is no password hash to crack and no shared secret to
+  rotate.
+- **Every token is single use.** A captured token is refused on reuse and
+  expires 60 seconds after it was made, so it is worthless to an observer.
+- **Works from anywhere, with nothing to set up per login.** The client
+  issues its own challenge; a laptop on the local socket and a replication
+  subscriber in another region follow the same two steps.
+- **Uses what you already run.** Keys come from `ssh-keygen`, registration is
+  an `authorized_keys` file, and any libpq client works: `psql` through
+  `pg_sshkey_connect`, psycopg2 through `pam_pg_sshkey.py`, or your own code
+  with a 13-byte prefix and one signature.
+- **Proven, not promised.** Every release runs the production module through
+  libpam exactly as PostgreSQL does, and logs real OS users in against
+  PostgreSQL 18 on Ubuntu and PostgreSQL 16 on Rocky Linux. See
+  [Testing](docs/testing.md).
 
 ## How it works
 
@@ -103,5 +133,6 @@ src/
 config/pam.d/postgresql     PAM service file installed by make install-conf
 tests/                      unit, libpam-seam, system and end-to-end tests
 docs/                       documentation
-logo/                       logo and mark (SVG), see logo/README.md
+logo/                       logo and mark (SVG and PNG), see logo/README.md
+badges/                     README badges
 ```

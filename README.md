@@ -1,4 +1,11 @@
-# pam_pg_sshkey
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="logo/pam_pg_sshkey-logo-dark.svg">
+  <img src="logo/pam_pg_sshkey-logo.svg" alt="pam_pg_sshkey" width="420">
+</picture>
+
+</div>
 
 A PAM module that lets PostgreSQL authenticate database users with SSH
 public keys instead of passwords. The server stores public keys in OpenSSH
@@ -96,4 +103,5 @@ src/
 config/pam.d/postgresql     PAM service file installed by make install-conf
 tests/                      unit, libpam-seam, system and end-to-end tests
 docs/                       documentation
+logo/                       logo and mark (SVG), see logo/README.md
 ```

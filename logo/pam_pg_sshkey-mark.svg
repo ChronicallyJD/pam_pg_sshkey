@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="pam_pg_sshkey">
+  <defs>
+    <linearGradient id="key" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B8DEF"/>
+      <stop offset="1" stop-color="#2B5FD0"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7B733"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <!-- bow -->
+  <circle cx="15" cy="24" r="8.5" fill="none" stroke="url(#key)" stroke-width="6"/>
+  <!-- shaft -->
+  <rect x="22" y="21" width="22" height="6" rx="3" fill="url(#key)"/>
+  <!-- bit: two amber teeth -->
+  <rect x="31" y="26" width="5" height="9" rx="2" fill="url(#accent)"/>
+  <rect x="39" y="26" width="5" height="12" rx="2" fill="url(#accent)"/>
+</svg>

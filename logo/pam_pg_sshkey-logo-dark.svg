@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 80" width="420" height="80" role="img" aria-label="pam_pg_sshkey">
+  <defs>
+    <linearGradient id="key" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7AA2F7"/>
+      <stop offset="1" stop-color="#3B6FE0"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7B733"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <!-- mark: bow, shaft, two amber teeth -->
+  <g transform="translate(8,12) scale(1.15)">
+    <circle cx="15" cy="24" r="8.5" fill="none" stroke="url(#key)" stroke-width="6"/>
+    <rect x="22" y="21" width="22" height="6" rx="3" fill="url(#key)"/>
+    <rect x="31" y="26" width="5" height="9" rx="2" fill="url(#accent)"/>
+    <rect x="39" y="26" width="5" height="12" rx="2" fill="url(#accent)"/>
+  </g>
+  <g font-family="'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+    <text x="78" y="46" font-size="32" font-weight="700" fill="#F2F4F8">
+      <tspan>pam_</tspan><tspan fill="#7AA2F7">pg</tspan><tspan>_sshkey</tspan>
+    </text>
+    <text x="80" y="64" font-size="12.5" letter-spacing="0.5" fill="#9AA4B8">SSH key authentication for PostgreSQL</text>
+  </g>
+</svg>

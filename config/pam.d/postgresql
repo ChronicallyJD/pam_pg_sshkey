@@ -1,6 +1,6 @@
 #%PAM-1.0
 #
-# /etc/pam.d/postgresql  — SSH-key auth for PostgreSQL
+# /etc/pam.d/postgresql , SSH-key auth for PostgreSQL
 #
 # Module options:
 #   authorized_keys_dir=<dir>   Root dir for per-user authorized_keys.

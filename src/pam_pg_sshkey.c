@@ -76,6 +76,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <pwd.h>
+#include <time.h>
 
 #include "challenge_store.h"
 #include "key_parser.h"
@@ -143,6 +144,66 @@ parse_token(const char *token,
     return 0;
 }
 
+/* ── v2 token parsing ────────────────────────────────────────────────── */
+/*
+ * v2 token: "<unix_ts>:<nonce_hex64>:<base64_signature>"
+ * Signed message: "pg-sshkey-v2\0" || "<unix_ts>:<nonce_hex64>"
+ *
+ * The client issues its own challenge; the server bounds the timestamp and
+ * records each nonce on first use.  Returns 0 on success, -1 on format error.
+ * head receives "<unix_ts>:<nonce_hex64>" (what was signed).
+ */
+static const unsigned char SIGN_PREFIX_V2[]   = "pg-sshkey-v2";
+static const size_t        SIGN_PREFIX_V2_LEN = 13;
+
+static int
+count_colons(const char *s)
+{
+    int n = 0;
+    for (; *s; s++) if (*s == ':') n++;
+    return n;
+}
+
+static int
+parse_token_v2(const char *token,
+               long *ts, char nonce_hex[65],
+               char *head, size_t head_size,
+               char *sig_b64, size_t sig_size)
+{
+    const char *c1 = strchr(token, ':');
+    if (!c1 || c1 == token || (size_t)(c1 - token) > 19)
+        return -1;
+    for (const char *p = token; p < c1; p++)
+        if (*p < '0' || *p > '9') return -1;
+
+    const char *c2 = strchr(c1 + 1, ':');
+    if (!c2 || c2 - (c1 + 1) != 64)
+        return -1;
+    for (const char *p = c1 + 1; p < c2; p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')))
+            return -1;                        /* canonical lowercase only */
+
+    size_t head_len = (size_t)(c2 - token);
+    if (head_len >= head_size)
+        return -1;
+    memcpy(head, token, head_len);
+    head[head_len] = '\0';
+    memcpy(nonce_hex, c1 + 1, 64);
+    nonce_hex[64] = '\0';
+
+    char *end = NULL;
+    errno = 0;
+    *ts = strtol(token, &end, 10);
+    if (errno != 0 || end != c1)
+        return -1;
+
+    size_t sig_len = strlen(c2 + 1);
+    if (sig_len == 0 || sig_len >= sig_size)
+        return -1;
+    memcpy(sig_b64, c2 + 1, sig_len + 1);
+    return 0;
+}
+
 /* ── get_token_via_conv ──────────────────────────────────────────────── */
 /*
  * Retrieve the PAM token (client password) by calling the PAM conversation
@@ -156,7 +217,7 @@ parse_token(const char *token,
  * We cache the result via pam_set_item(PAM_AUTHTOK) so stacked modules can
  * read it with pam_get_authtok() normally.
  *
- * Returns a malloc'd string on success (caller must NOT free — libpam owns
+ * Returns a malloc'd string on success (caller must NOT free, libpam owns
  * it after pam_set_item), or NULL on failure.
  */
 static const char *
@@ -201,6 +262,154 @@ get_token_via_conv(pam_handle_t *pamh)
     return cached;
 }
 
+/* ── authorized_keys loading (shared by v1 and v2) ───────────────────── */
+/*
+ * Locate, permission-check and parse <authkeys_dir>/<user>/authorized_keys.
+ * Logs the reason and returns NULL on any failure.
+ */
+static key_list_t *
+load_user_keys(pam_handle_t *pamh, const mod_opts_t *opts, const char *username)
+{
+    char authkeys_path[MAX_PATH_LEN];
+    snprintf(authkeys_path, sizeof(authkeys_path),
+             "%s/%s/authorized_keys", opts->authkeys_dir, username);
+
+    if (opts->debug)
+        pam_syslog(pamh, LOG_DEBUG,
+                   "pam_pg_sshkey: authorized_keys path: %s", authkeys_path);
+
+    struct stat st;
+    if (stat(authkeys_path, &st) != 0) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: no authorized_keys for '%s': %s "
+                   "(create it with: pg_sshkey_addkey %s <pubkey>)",
+                   username, strerror(errno), username);
+        return NULL;
+    }
+    if (access(authkeys_path, R_OK) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: cannot read authorized_keys for '%s' "
+                   "(permission denied, file must be owned root:postgres "
+                   "mode 0640, got uid=%d gid=%d mode=%04o): %s",
+                   username, (int)st.st_uid, (int)st.st_gid,
+                   (unsigned)(st.st_mode & 07777), strerror(errno));
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: fix with: chown root:postgres %s && chmod 640 %s",
+                   authkeys_path, authkeys_path);
+        return NULL;
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: authorized_keys for '%s' is world/group"
+                   " writable, refusing", username);
+        return NULL;
+    }
+
+    key_list_t *keys = NULL;
+    int nkeys = parse_authorized_keys(authkeys_path, &keys);
+    if (nkeys <= 0) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: no valid keys in '%s' "
+                   "(file is empty or contains no supported key types)",
+                   authkeys_path);
+        return NULL;
+    }
+    return keys;
+}
+
+/* ── v2 authentication ───────────────────────────────────────────────── */
+static int
+authenticate_v2(pam_handle_t *pamh, const mod_opts_t *opts,
+                const char *username, const char *token)
+{
+    long ts = 0;
+    char nonce_hex[65], head[96], sig_b64[MAX_TOKEN_LEN];
+
+    if (parse_token_v2(token, &ts, nonce_hex, head, sizeof(head),
+                       sig_b64, sizeof(sig_b64)) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: malformed token for '%s'", username);
+        return PAM_AUTH_ERR;
+    }
+
+    /* ── timestamp window: ±CHALLENGE_TTL_SECS around now ── */
+    long now = (long)time(NULL);
+    if (ts < now - CHALLENGE_TTL_SECS || ts > now + CHALLENGE_TTL_SECS) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: token timestamp for '%s' is %ld s from "
+                   "server time (limit %d), expired or clock skew",
+                   username, ts - now, CHALLENGE_TTL_SECS);
+        return PAM_AUTH_ERR;
+    }
+
+    unsigned char sig_bytes[1024];
+    size_t        sig_len = 0;
+    if (b64_decode(sig_b64, sig_bytes, sizeof(sig_bytes), &sig_len) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: base64 decode failed for '%s'", username);
+        return PAM_AUTH_ERR;
+    }
+
+    /* ── signed message: prefix || "<ts>:<nonce>" ── */
+    unsigned char msg[128];
+    size_t head_len = strlen(head);
+    memcpy(msg, SIGN_PREFIX_V2, SIGN_PREFIX_V2_LEN);
+    memcpy(msg + SIGN_PREFIX_V2_LEN, head, head_len);
+    size_t msg_len = SIGN_PREFIX_V2_LEN + head_len;
+
+    key_list_t *keys = load_user_keys(pamh, opts, username);
+    if (!keys)
+        return PAM_AUTH_ERR;
+
+    const key_list_t *matched = NULL;
+    for (const key_list_t *k = keys; k != NULL; k = k->next) {
+        if (opts->debug)
+            pam_syslog(pamh, LOG_DEBUG,
+                       "pam_pg_sshkey: trying key type=%s comment=%s",
+                       k->key_type, k->comment ? k->comment : "(none)");
+        if (verify_signature_raw(k, msg, msg_len, sig_bytes, sig_len) == 0) {
+            matched = k;
+            break;
+        }
+    }
+
+    if (!matched) {
+        free_key_list(keys);
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: authentication failed for '%s'", username);
+        return PAM_AUTH_ERR;
+    }
+
+    /*
+     * ── record the nonce: first use wins, atomically ──
+     * Done after verification so unauthenticated garbage creates no files.
+     * Sweep first so the directory cannot grow without bound.
+     */
+    challenge_sweep(opts->challenge_dir, CHALLENGE_SWEEP_MAX);
+    int mrc = challenge_mark(opts->challenge_dir, nonce_hex);
+    if (mrc == 1) {
+        free_key_list(keys);
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: replayed token for '%s' (nonce already used)",
+                   username);
+        return PAM_AUTH_ERR;
+    }
+    if (mrc != 0) {
+        free_key_list(keys);
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: could not record nonce in %s: %s, refusing "
+                   "(directory must exist and be writable by the postgres user)",
+                   opts->challenge_dir, strerror(errno));
+        return PAM_AUTH_ERR;
+    }
+
+    pam_syslog(pamh, LOG_INFO,
+               "pam_pg_sshkey: user '%s' authenticated with key %s",
+               username, matched->comment ? matched->comment : matched->key_type);
+    free_key_list(keys);
+    return PAM_SUCCESS;
+}
+
 /* ── pam_sm_authenticate ─────────────────────────────────────────────── */
 PAM_EXTERN int
 pam_sm_authenticate(pam_handle_t *pamh, int flags,
@@ -228,7 +437,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
      * We do not use pam_get_authtok() here.  PostgreSQL never calls
      * pam_set_item(PAM_AUTHTOK), so that function falls through to the
      * conversation callback, which PostgreSQL's implementation handles by
-     * trying a second password round-trip — something the client does not
+     * trying a second password round-trip, something the client does not
      * expect.  That is the source of "conversation failed" log messages.
      *
      * Instead we call the conversation function directly once via
@@ -243,7 +452,14 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
         return PAM_AUTH_ERR;
     }
 
-    /* ── 3. Parse token into challenge + signature ── */
+    /* ── 3. Dispatch on token version ── */
+    /*
+     * v1  "<nonce_hex>:<sig>"        one colon , server-issued nonce file
+     * v2  "<ts>:<nonce_hex>:<sig>"   two colons, client-issued challenge
+     */
+    if (count_colons(token) == 2)
+        return authenticate_v2(pamh, &opts, username, token);
+
     char challenge_hex[256];
     char sig_b64[MAX_TOKEN_LEN];
 
@@ -259,6 +475,20 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
                    "pam_pg_sshkey: challenge=%s", challenge_hex);
 
     /* ── 4. Retrieve & validate challenge from store ── */
+    /*
+     * First, opportunistically remove stale nonces.  Every connection
+     * attempt creates one and only a successful login consumes it; we run
+     * as the directory owner, so we are the only party that can clean up
+     * after other users.  Bounded work per call.
+     */
+    {
+        int swept = challenge_sweep(opts.challenge_dir, CHALLENGE_SWEEP_MAX);
+        if (opts.debug && swept > 0)
+            pam_syslog(pamh, LOG_DEBUG,
+                       "pam_pg_sshkey: swept %d stale challenge(s) from %s",
+                       swept, opts.challenge_dir);
+    }
+
     unsigned char challenge_bytes[32];
     size_t        challenge_len = 0;
 
@@ -272,8 +502,20 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
         return PAM_AUTH_ERR;
     }
 
-    /* Invalidate challenge immediately (prevent replay) */
-    challenge_delete(opts.challenge_dir, challenge_hex);
+    /*
+     * Invalidate the challenge immediately (prevent replay).  If it cannot
+     * be removed, replay protection is void, so fail closed.  The usual cause
+     * is a challenge_dir not owned by the postgres user: with the sticky bit
+     * (mode 1733) only the file owner or the directory owner may unlink.
+     */
+    if (challenge_delete(opts.challenge_dir, challenge_hex) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: could not delete challenge %s in %s: %s "
+                   "- refusing (challenge_dir must be owned by the postgres "
+                   "user, mode 1733)",
+                   challenge_hex, opts.challenge_dir, strerror(errno));
+        return PAM_AUTH_ERR;
+    }
 
     /* ── 5. Decode base64 signature ── */
     unsigned char sig_bytes[1024];
@@ -315,7 +557,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
     if (access(authkeys_path, R_OK) != 0) {
         pam_syslog(pamh, LOG_ERR,
                    "pam_pg_sshkey: cannot read authorized_keys for '%s' "
-                   "(permission denied — file must be owned root:postgres "
+                   "(permission denied, file must be owned root:postgres "
                    "mode 0640, got uid=%d gid=%d mode=%04o): %s",
                    username,
                    (int)st.st_uid, (int)st.st_gid,
@@ -332,7 +574,7 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
     if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
         pam_syslog(pamh, LOG_ERR,
                    "pam_pg_sshkey: authorized_keys for '%s' is world/group"
-                   " writable — refusing", username);
+                   " writable, refusing", username);
         return PAM_AUTH_ERR;
     }
 

@@ -1,5 +1,5 @@
 /*
- * test_sig_verify.c — unit tests for sig_verify.c
+ * test_sig_verify.c, unit tests for sig_verify.c
  *
  * Ed25519 and RSA: valid, wrong key, tampered, wrong challenge,
  * digest mismatch, NULL inputs, unknown key type.
@@ -119,10 +119,12 @@ static void test_rsa_sha256_valid(void) {
     free(sig); EVP_PKEY_free(sk);
 }
 
-static void test_rsa_sha512_valid(void) {
+/* The rsa-sha2-512 key-type word is accepted as an alias: it names the same
+   RSA key, and every shipped signer produces PKCS#1 v1.5 / SHA-256. */
+static void test_rsa_sha512_label_verifies_sha256_sig(void) {
     EVP_PKEY *sk=gen_rsa2048();
     unsigned char *sig=NULL; size_t slen=0;
-    ASSERT_EQ(do_sign(sk,EVP_sha512(),CHAL,sizeof(CHAL),&sig,&slen),0);
+    ASSERT_EQ(do_sign(sk,EVP_sha256(),CHAL,sizeof(CHAL),&sig,&slen),0);
     key_list_t e=make_entry(sk,"rsa-sha2-512");
     ASSERT_EQ(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
     free(sig); EVP_PKEY_free(sk);
@@ -146,13 +148,16 @@ static void test_rsa_wrong_key(void) {
     free(sig); EVP_PKEY_free(sk); EVP_PKEY_free(other);
 }
 
-static void test_rsa_sha256_sig_as_sha512_fails(void) {
+/* A SHA-512 signature is not accepted under any label, no signer emits one. */
+static void test_rsa_sha512_sig_rejected_under_any_label(void) {
     EVP_PKEY *sk=gen_rsa2048();
     unsigned char *sig=NULL; size_t slen=0;
-    do_sign(sk,EVP_sha256(),CHAL,sizeof(CHAL),&sig,&slen);
-    /* claim sha512 but sig was sha256 */
-    key_list_t e=make_entry(sk,"rsa-sha2-512");
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    do_sign(sk,EVP_sha512(),CHAL,sizeof(CHAL),&sig,&slen);
+    const char *labels[]={"rsa-sha2-512","rsa-sha2-256","ssh-rsa"};
+    for (size_t i=0;i<3;i++) {
+        key_list_t e=make_entry(sk,labels[i]);
+        ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    }
     free(sig); EVP_PKEY_free(sk);
 }
 
@@ -208,10 +213,10 @@ int main(void) {
     RUN(test_ed25519_wrong_challenge);
     RUN(test_ed25519_truncated_sig);
     RUN(test_rsa_sha256_valid);
-    RUN(test_rsa_sha512_valid);
+    RUN(test_rsa_sha512_label_verifies_sha256_sig);
     RUN(test_ssh_rsa_alias_sha256);
     RUN(test_rsa_wrong_key);
-    RUN(test_rsa_sha256_sig_as_sha512_fails);
+    RUN(test_rsa_sha512_sig_rejected_under_any_label);
     RUN(test_null_entry);
     RUN(test_null_pkey);
     RUN(test_null_challenge);

@@ -6,15 +6,16 @@ Connect to a PostgreSQL database using SSH-key authentication
 (pam_pg_sshkey) and run a query.
 
 This script replicates the token-generation flow of pg_sshkey_connect
-in pure Python, then uses psycopg2 to open the connection with the
-signed token as the password.
+(v2 by default: the token carries its own timestamp and nonce, nothing is
+created on the server first), then uses psycopg2 to open the connection
+with the signed token as the password.
 
 WHY THE TOKEN MUST BE PRE-COMPUTED
 ====================================
 PostgreSQL sends AUTH_REQ_PASSWORD immediately when the connection opens.
 libpq (and therefore psycopg2) checks for a pre-loaded password at that
 exact moment. If no password is available, libpq disconnects immediately
-with "fe_sendauth: no password supplied" — before any user code runs.
+with "fe_sendauth: no password supplied", before any user code runs.
 
 This means:
   - The token (challenge hex + base64 signature) must be computed BEFORE
@@ -30,7 +31,8 @@ Usage:
   -p, --port PORT         Port                       (default: 5432)
   -d, --dbname DBNAME     Database name              (default: username)
   -i, --identity FILE     SSH private key            (default: ~/.ssh/id_ed25519)
-  -c, --challenge-dir DIR Challenge nonce directory  (default: /var/run/pg_sshkey)
+      --v1                Legacy token (server-issued nonce file)
+  -c, --challenge-dir DIR (--v1) Challenge nonce dir  (default: /var/run/pg_sshkey)
   -q, --query SQL         Query to run               (default: SELECT 1)
   -v, --verbose           Print each step to stderr
 
@@ -42,13 +44,38 @@ Requirements:
 SPDX-License-Identifier: MIT
 """
 
+from __future__ import annotations
+
 import argparse
 import base64
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+
+# ── Helper binaries ───────────────────────────────────────────────────────────
+
+def _find_tool(name: str) -> str:
+    """
+    Locate pg_sshkey_challenge / pg_sshkey_sign: on PATH first, otherwise
+    beside this script (the build directory layout), like pg_sshkey_connect.
+    Raises RuntimeError with install guidance if neither works.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    local = Path(__file__).resolve().parent / name
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    raise RuntimeError(
+        f"{name} not found in PATH or beside {Path(__file__).name}.\n"
+        f"Install pam_pg_sshkey (sudo make install) or add its build "
+        f"directory to PATH."
+    )
 
 
 # ── Token generation ──────────────────────────────────────────────────────────
@@ -63,7 +90,7 @@ def generate_challenge(challenge_dir: str, verbose: bool) -> str:
         print(f"[pg_sshkey_query] generating challenge in {challenge_dir}", file=sys.stderr)
 
     result = subprocess.run(
-        ["pg_sshkey_challenge", challenge_dir],
+        [_find_tool("pg_sshkey_challenge"), challenge_dir],
         capture_output=True,
         text=True,
     )
@@ -92,10 +119,13 @@ def generate_challenge(challenge_dir: str, verbose: bool) -> str:
     return challenge
 
 
-def sign_challenge(challenge: str, key_path: str, verbose: bool) -> str:
+def sign_challenge(challenge: str | None, key_path: str, verbose: bool) -> str:
     """
     Run pg_sshkey_sign to produce a signed token.
-    Returns the token string "<challenge_hex>:<base64_signature>".
+
+    challenge=None (v2, default): pg_sshkey_sign issues its own timestamp and
+    nonce, "<ts>:<nonce_hex>:<sig>"; nothing exists on the server first.
+    challenge="<hex>" (v1): sign a server-issued nonce, "<hex>:<sig>".
     Raises RuntimeError on failure.
     """
     if verbose:
@@ -110,8 +140,9 @@ def sign_challenge(challenge: str, key_path: str, verbose: bool) -> str:
             f"  sudo pg_sshkey_addkey <username> {key_path}.pub"
         )
 
+    argv = [_find_tool("pg_sshkey_sign")] + ([challenge] if challenge else []) + [key_path]
     result = subprocess.run(
-        ["pg_sshkey_sign", challenge, key_path],
+        argv,
         capture_output=True,
         text=True,
     )
@@ -129,15 +160,15 @@ def sign_challenge(challenge: str, key_path: str, verbose: bool) -> str:
 
     token = result.stdout.strip()
 
-    # Validate token format: <64hex>:<base64>
-    parts = token.split(":", 1)
-    if (len(parts) != 2
-            or len(parts[0]) != 64
-            or not all(c in "0123456789abcdef" for c in parts[0])
-            or len(parts[1]) < 4):
+    # Validate token shape: v2 "<ts>:<64hex>:<b64>" or v1 "<64hex>:<b64>"
+    shape = (r"^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]{4,}=*$" if challenge is None
+             else r"^[0-9a-f]{64}:[A-Za-z0-9+/]{4,}=*$")
+    if not re.match(shape, token):
         raise RuntimeError(
             f"pg_sshkey_sign produced invalid token: {token!r}\n"
-            f"Expected format: <64 hex chars>:<base64 signature>"
+            f"Expected format: "
+            + ("<unix_ts>:<64 hex chars>:<base64 signature>" if challenge is None
+               else "<64 hex chars>:<base64 signature>")
         )
 
     if verbose:
@@ -179,7 +210,7 @@ def connect_and_query(
     conn_params = {
         "user":     username,
         "dbname":   dbname,
-        "password": token,   # pre-computed signed token — libpq sends on AUTH_REQ_PASSWORD
+        "password": token,   # pre-computed signed token, libpq sends on AUTH_REQ_PASSWORD
         "port":     port,
         "connect_timeout": 10,
     }
@@ -202,7 +233,7 @@ def connect_and_query(
             hint = (
                 "\nThis should not happen with pg_sshkey_query.\n"
                 "It means the token was not passed to psycopg2.connect().\n"
-                "This is a bug — please report it."
+                "This is a bug, please report it."
             )
         elif "PAM authentication failed" in msg:
             hint = (
@@ -236,6 +267,8 @@ def connect_and_query(
             rows = cur.fetchall()
         else:
             rows = []
+    except psycopg2.Error as e:
+        raise RuntimeError(f"Query failed: {str(e).strip()}") from None
     finally:
         cur.close()
         conn.close()
@@ -265,6 +298,15 @@ def print_results(rows: list[tuple], query: str) -> None:
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
+
+def _port(value: str) -> int:
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid port {value!r} (check -p/--port or $PGPORT)"
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -299,10 +341,10 @@ examples:
     )
     parser.add_argument(
         "-p", "--port",
-        type=int,
-        default=int(os.environ.get("PGPORT", "5432")),
+        type=_port,
+        default=os.environ.get("PGPORT", "5432"),
         metavar="PORT",
-        help="PostgreSQL port (default: 5432)",
+        help="PostgreSQL port (default: $PGPORT or 5432)",
     )
     parser.add_argument(
         "--help", action="help",
@@ -316,15 +358,20 @@ examples:
     )
     parser.add_argument(
         "-i", "--identity",
-        default=str(Path.home() / ".ssh" / "id_ed25519"),
+        default=None,
         metavar="FILE",
         help="SSH private key file (default: ~/.ssh/id_ed25519)",
+    )
+    parser.add_argument(
+        "--v1",
+        action="store_true",
+        help="Legacy token: create a nonce in the server's challenge dir first",
     )
     parser.add_argument(
         "-c", "--challenge-dir",
         default="/var/run/pg_sshkey",
         metavar="DIR",
-        help="Challenge nonce directory (default: /var/run/pg_sshkey)",
+        help="(--v1 only) Challenge nonce directory (default: /var/run/pg_sshkey)",
     )
     parser.add_argument(
         "-q", "--query",
@@ -354,8 +401,14 @@ examples:
 def main() -> int:
     args = parse_args()
 
-    # Resolve database name: -d flag > positional > username
-    dbname = args.dbname or args.dbname_positional or args.username
+    # Resolve like psql: -d flag > positional > $PGDATABASE > username
+    dbname = (args.dbname or args.dbname_positional
+              or os.environ.get("PGDATABASE") or args.username)
+    try:
+        identity = args.identity or str(Path.home() / ".ssh" / "id_ed25519")
+    except RuntimeError:
+        print("error: no -i/--identity given and HOME is unset.", file=sys.stderr)
+        return 1
     if not args.username:
         print(
             "error: no username specified. Use -U or set PGUSER.",
@@ -367,16 +420,17 @@ def main() -> int:
         print(f"[pg_sshkey_query] username:      {args.username}", file=sys.stderr)
         print(f"[pg_sshkey_query] database:      {dbname}", file=sys.stderr)
         print(f"[pg_sshkey_query] host:          {args.host or '<local socket>'}", file=sys.stderr)
-        print(f"[pg_sshkey_query] key:           {args.identity}", file=sys.stderr)
+        print(f"[pg_sshkey_query] key:           {identity}", file=sys.stderr)
         print(f"[pg_sshkey_query] challenge dir: {args.challenge_dir}", file=sys.stderr)
         print(f"[pg_sshkey_query] query:         {args.query}", file=sys.stderr)
 
     try:
-        # Step 1: generate challenge nonce
-        challenge = generate_challenge(args.challenge_dir, args.verbose)
+        # Step 1 (--v1 only): create the nonce in the SERVER's challenge dir.
+        # v2 tokens carry their own timestamp + nonce, so there is nothing to do.
+        challenge = generate_challenge(args.challenge_dir, args.verbose) if args.v1 else None
 
-        # Step 2: sign the challenge with the SSH private key
-        token = sign_challenge(challenge, args.identity, args.verbose)
+        # Step 2: sign (v2: pg_sshkey_sign issues the challenge itself)
+        token = sign_challenge(challenge, identity, args.verbose)
 
         # Step 3: connect and run the query
         # The token is passed as password= BEFORE the connection opens.

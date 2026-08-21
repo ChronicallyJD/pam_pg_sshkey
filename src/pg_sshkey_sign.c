@@ -27,17 +27,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <ctype.h>
 
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/err.h>
 
-/* Domain prefix — must match sig_verify.c */
+/* Domain prefix, must match sig_verify.c */
 static const unsigned char SIGN_PREFIX[]   = "pg-sshkey-v1";
 static const size_t        SIGN_PREFIX_LEN = 13; /* 12 chars + NUL */
+
+/*
+ * v2 (default): the client issues its own challenge.
+ *   token   = "<unix_ts>:<nonce_hex64>:<base64_sig>"
+ *   message = "pg-sshkey-v2\0" || "<unix_ts>:<nonce_hex64>"   (ASCII)
+ * The server checks |now - ts| <= 60 s, verifies the signature, then
+ * records the nonce so it can never be accepted again.  No server-side
+ * step happens before the connection, so remote clients need nothing.
+ */
+static const unsigned char SIGN_PREFIX_V2[]   = "pg-sshkey-v2";
+static const size_t        SIGN_PREFIX_V2_LEN = 13;
 
 #define OPENSSH_MAGIC "openssh-key-v1"
 
@@ -195,7 +208,7 @@ load_openssh_ed25519(const unsigned char *der, size_t derlen)
             "Options:\n"
             "  1. Remove the passphrase (creates an unencrypted copy):\n"
             "       ssh-keygen -p -N '' -f <keyfile>\n"
-            "  2. Export to unencrypted PKCS#8 PEM (recommended — keeps\n"
+            "  2. Export to unencrypted PKCS#8 PEM (recommended, keeps\n"
             "     original key intact):\n"
             "       openssl pkey -in <keyfile> -out key.pem\n"
             "     (OpenSSL will prompt for the passphrase once.)\n"
@@ -240,7 +253,7 @@ load_openssh_ed25519(const unsigned char *der, size_t derlen)
     if (read_string(priv_section, priv_len, &pp, &keytype, &keytype_len) != 0) return NULL;
 
     if (keytype_len != 11 || memcmp(keytype, "ssh-ed25519", 11) != 0) {
-        /* Not Ed25519 — tell user how to convert */
+        /* Not Ed25519, tell user how to convert */
         char kt[64] = {0};
         size_t n = keytype_len < 63 ? keytype_len : 63;
         memcpy(kt, keytype, n);
@@ -256,7 +269,7 @@ load_openssh_ed25519(const unsigned char *der, size_t derlen)
         return NULL;
     }
 
-    /* pubkey (32 bytes) — skip */
+    /* pubkey (32 bytes), skip */
     const unsigned char *pubkey; size_t pubkey_len;
     if (read_string(priv_section, priv_len, &pp, &pubkey, &pubkey_len) != 0) return NULL;
     if (pubkey_len != 32) {
@@ -342,7 +355,7 @@ load_private_key(const char *path)
         return pkey;
     }
 
-    /* Standard PEM — let OpenSSL handle it */
+    /* Standard PEM, let OpenSSL handle it */
     BIO *bio = BIO_new_mem_buf(filebuf, (int)nread);
     EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
     BIO_free(bio);
@@ -407,70 +420,138 @@ sign_message(EVP_PKEY *pkey,
     return sig;
 }
 
-/* ── main ─────────────────────────────────────────────────────────────── */
-int main(int argc, char *argv[])
+/* ── helpers for main ─────────────────────────────────────────────────── */
+static void
+usage(const char *argv0)
 {
-    if (argc != 3) {
-        fprintf(stderr,
-                "Usage: %s <challenge_hex> <private_key_path>\n"
-                "\n"
-                "Output: <challenge_hex>:<base64_signature>  (to stdout)\n"
-                "\n"
-                "Accepted key formats:\n"
-                "  ~/.ssh/id_ed25519          OpenSSH Ed25519 (unencrypted)\n"
-                "  ~/.ssh/id_rsa              OpenSSH RSA — convert first:\n"
-                "                               openssl pkey -in ~/.ssh/id_rsa -out key.pem\n"
-                "  key.pem                    PKCS#8 or traditional PEM (any type)\n",
-                argv[0]);
-        return 1;
-    }
+    fprintf(stderr,
+        "Usage: %s [--at <unix_ts>] [--nonce <hex64>] <private_key_path>\n"
+        "       %s <challenge_hex> <private_key_path>        (v1, legacy)\n"
+        "\n"
+        "Default (v2): prints <unix_ts>:<nonce_hex>:<base64_signature>.\n"
+        "  The challenge is issued by this client; nothing is needed on the\n"
+        "  server beforehand.  --at and --nonce override the timestamp and\n"
+        "  nonce (for tests / clock experiments only).\n"
+        "v1: prints <challenge_hex>:<base64_signature> for a nonce created\n"
+        "  on the server by pg_sshkey_challenge.\n"
+        "\n"
+        "Accepted key formats:\n"
+        "  ~/.ssh/id_ed25519          OpenSSH Ed25519 (unencrypted)\n"
+        "  ~/.ssh/id_rsa              OpenSSH RSA, convert first:\n"
+        "                               openssl pkey -in ~/.ssh/id_rsa -out key.pem\n"
+        "  key.pem                    PKCS#8 or traditional PEM (any type)\n",
+        argv0, argv0);
+}
 
-    const char *challenge_hex = argv[1];
-    const char *privkey_path  = argv[2];
+static int
+is_hex64_lower(const char *s)
+{
+    size_t n = 0;
+    for (; s[n]; n++)
+        if (!((s[n] >= '0' && s[n] <= '9') || (s[n] >= 'a' && s[n] <= 'f')))
+            return 0;
+    return n == 64;
+}
 
-    /* Decode challenge hex → bytes */
-    unsigned char challenge_bytes[64];
-    size_t        challenge_len = 0;
-    if (hex_to_bytes(challenge_hex, challenge_bytes, sizeof(challenge_bytes),
-                     &challenge_len) != 0) {
-        fprintf(stderr, "Invalid challenge hex\n");
-        return 1;
-    }
-
-    /* Build signed message: prefix || challenge */
-    unsigned char msg[512];
-    if (SIGN_PREFIX_LEN + challenge_len > sizeof(msg)) {
-        fprintf(stderr, "Challenge too long\n");
-        return 1;
-    }
-    memcpy(msg, SIGN_PREFIX, SIGN_PREFIX_LEN);
-    memcpy(msg + SIGN_PREFIX_LEN, challenge_bytes, challenge_len);
-    size_t msg_len = SIGN_PREFIX_LEN + challenge_len;
-
-    /* Load private key (handles OpenSSH and PEM formats) */
+/* sign msg with the key at path; print "<head>:<b64sig>\n"; 0 on success */
+static int
+sign_and_print(const char *privkey_path, const unsigned char *msg, size_t msg_len,
+               const char *head)
+{
     EVP_PKEY *pkey = load_private_key(privkey_path);
     if (!pkey)
         return 1;
 
-    /* Sign */
     size_t sig_len = 0;
     unsigned char *sig = sign_message(pkey, msg, msg_len, &sig_len);
     EVP_PKEY_free(pkey);
-
     if (!sig) {
         fprintf(stderr, "Signing failed\n");
         return 1;
     }
 
-    /* Base64-encode signature */
     char *sig_b64 = b64_encode(sig, sig_len);
     free(sig);
     if (!sig_b64) {
         fprintf(stderr, "Base64 encoding failed\n");
         return 1;
     }
-
-    printf("%s:%s\n", challenge_hex, sig_b64);
+    printf("%s:%s\n", head, sig_b64);
     free(sig_b64);
     return 0;
+}
+
+/* ── main ─────────────────────────────────────────────────────────────── */
+int main(int argc, char *argv[])
+{
+    long        at         = -1;
+    const char *nonce_opt  = NULL;
+    const char *positional[2] = { NULL, NULL };
+    int         npos       = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--at") == 0 && i + 1 < argc) {
+            char *end; at = strtol(argv[++i], &end, 10);
+            if (*end || at < 0) { fprintf(stderr, "Invalid --at timestamp\n"); return 1; }
+        } else if (strcmp(argv[i], "--nonce") == 0 && i + 1 < argc) {
+            nonce_opt = argv[++i];
+            if (!is_hex64_lower(nonce_opt)) { fprintf(stderr, "--nonce must be 64 lowercase hex chars\n"); return 1; }
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]); return 1;
+        } else if (argv[i][0] == '-' && argv[i][1] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return 1;
+        } else if (npos < 2) {
+            positional[npos++] = argv[i];
+        } else {
+            usage(argv[0]); return 1;
+        }
+    }
+
+    if (npos == 2) {
+        /* ── v1: sign a server-issued challenge ── */
+        if (at >= 0 || nonce_opt) { fprintf(stderr, "--at/--nonce apply to v2 only\n"); return 1; }
+        const char *challenge_hex = positional[0];
+        const char *privkey_path  = positional[1];
+
+        unsigned char challenge_bytes[64];
+        size_t        challenge_len = 0;
+        if (hex_to_bytes(challenge_hex, challenge_bytes, sizeof(challenge_bytes),
+                         &challenge_len) != 0) {
+            fprintf(stderr, "Invalid challenge hex\n");
+            return 1;
+        }
+        unsigned char msg[512];
+        if (SIGN_PREFIX_LEN + challenge_len > sizeof(msg)) {
+            fprintf(stderr, "Challenge too long\n");
+            return 1;
+        }
+        memcpy(msg, SIGN_PREFIX, SIGN_PREFIX_LEN);
+        memcpy(msg + SIGN_PREFIX_LEN, challenge_bytes, challenge_len);
+        return sign_and_print(privkey_path, msg, SIGN_PREFIX_LEN + challenge_len,
+                              challenge_hex);
+    }
+
+    if (npos != 1) { usage(argv[0]); return 1; }
+
+    /* ── v2: issue our own challenge ── */
+    const char *privkey_path = positional[0];
+    char nonce_hex[65];
+    if (nonce_opt) {
+        memcpy(nonce_hex, nonce_opt, 65);
+    } else {
+        unsigned char raw[32];
+        if (RAND_bytes(raw, sizeof(raw)) != 1) { fprintf(stderr, "RAND_bytes failed\n"); return 1; }
+        for (int i = 0; i < 32; i++) sprintf(nonce_hex + 2 * i, "%02x", raw[i]);
+        nonce_hex[64] = '\0';
+    }
+    long ts = (at >= 0) ? at : (long)time(NULL);
+
+    char head[96];
+    snprintf(head, sizeof(head), "%ld:%s", ts, nonce_hex);
+
+    unsigned char msg[128];
+    size_t head_len = strlen(head);
+    memcpy(msg, SIGN_PREFIX_V2, SIGN_PREFIX_V2_LEN);
+    memcpy(msg + SIGN_PREFIX_V2_LEN, head, head_len);
+    return sign_and_print(privkey_path, msg, SIGN_PREFIX_V2_LEN + head_len, head);
 }

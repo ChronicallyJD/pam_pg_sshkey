@@ -1,5 +1,5 @@
 /*
- * test_key_parser.c — unit tests for key_parser.c
+ * test_key_parser.c, unit tests for key_parser.c
  *
  * Covers: b64_decode, parse_authorized_keys, free_key_list.
  * Keys are generated ephemerally via OpenSSL (no static private key material).

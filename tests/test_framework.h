@@ -1,5 +1,5 @@
 /*
- * test_framework.h — minimal C test framework (C99-compatible)
+ * test_framework.h, minimal C test framework (C99-compatible)
  *
  * Usage in each test file:
  *   Define a test function:   static void test_foo(void) { ASSERT_EQ(a, b); }

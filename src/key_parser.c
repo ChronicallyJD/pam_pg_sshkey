@@ -116,12 +116,23 @@ decode_rsa_key(const unsigned char *data, size_t len)
     EVP_PKEY *pkey = NULL;
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
-    /* OpenSSL 3.x — use EVP_PKEY_fromdata, no deprecated RSA_* needed */
+    /*
+     * OpenSSL 3.x, use EVP_PKEY_fromdata, no deprecated RSA_* needed.
+     * OSSL_PARAM_construct_BN() takes the integer in NATIVE byte order
+     * (little-endian on x86), not the big-endian form BN_bn2bin() writes,
+     * so use BN_bn2nativepad().  n_buf holds keys up to 8192 bits.
+     */
     unsigned char n_buf[1024], e_buf[64];
-    int n_sz = BN_bn2bin(n, n_buf);
-    int e_sz = BN_bn2bin(e, e_buf);
+    int n_sz = BN_num_bytes(n);
+    int e_sz = BN_num_bytes(e);
+    if (n_sz <= 0 || e_sz <= 0 ||
+        n_sz > (int)sizeof(n_buf) || e_sz > (int)sizeof(e_buf) ||
+        BN_bn2nativepad(n, n_buf, n_sz) != n_sz ||
+        BN_bn2nativepad(e, e_buf, e_sz) != e_sz) {
+        BN_free(n); BN_free(e);
+        return NULL;
+    }
     BN_free(n); BN_free(e);
-    if (n_sz <= 0 || e_sz <= 0) return NULL;
 
     OSSL_PARAM params[3];
     params[0] = OSSL_PARAM_construct_BN("n", n_buf, (size_t)n_sz);
@@ -202,7 +213,7 @@ parse_authorized_keys(const char *path, key_list_t **out)
             continue;
 
         /* Skip option lines starting with known option keywords or quotes
-           (basic; a full parser is complex — for security-critical use
+           (basic; a full parser is complex, for security-critical use
            consider rejecting any lines with leading non-alpha chars) */
         if (line[0] == '"' || line[0] == '!')
             continue;

@@ -1,5 +1,5 @@
 /*
- * test_integration.c — end-to-end flow tests
+ * test_integration.c, end-to-end flow tests
  *
  * Exercises: challenge_create → sign → parse_authorized_keys → verify_signature
  *

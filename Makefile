@@ -1,4 +1,4 @@
-# Makefile — pam_pg_sshkey
+# Makefile, pam_pg_sshkey
 #
 # Must be run from the project root (the directory containing this file).
 # If you invoke make from elsewhere, use:
@@ -34,12 +34,15 @@ else
 
 CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -Wpedantic -O2
+PYTHON  ?= python3
 
 CRYPTO_CFLAGS := $(shell pkg-config --cflags libcrypto 2>/dev/null)
 CRYPTO_LIBS   := $(shell pkg-config --libs   libcrypto 2>/dev/null || echo -lcrypto)
 PAM_CFLAGS    := -I/usr/include/security
 
-PAM_LIB_DIR  ?= /lib/$(shell $(CC) -dumpmachine)/security
+# Debian/Ubuntu: /lib/<triplet>/security.  RHEL/Fedora: /lib64/security.
+PAM_LIB_DIR  ?= $(shell if [ -d /lib64/security ]; then echo /lib64/security; \
+                        else echo /lib/$$($(CC) -dumpmachine)/security; fi)
 BIN_DIR      ?= /usr/local/bin
 PAM_CONF_DIR ?= /etc/pam.d
 KEY_DIR      ?= /etc/pg_sshkeys
@@ -54,9 +57,9 @@ PAM_OBJS := $(PAM_SRCS:.c=.o)
 
 TEST_BINS := $T/test_challenge_store $T/test_key_parser \
              $T/test_sig_verify      $T/test_integration \
-             $T/test_system
+             $T/test_system          $T/test_pam_module
 
-.PHONY: all test check install install-conf uninstall clean
+.PHONY: all test check install install-conf uninstall clean e2e e2e-clean e2e-shell e2e-rocky e2e-rocky-clean
 
 all: pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge pg_sshkey_connect pg_sshkey_addkey pg_sshkey_query
 
@@ -75,7 +78,7 @@ pg_sshkey_query: $S/pg_sshkey_query.py
 	cp $S/pg_sshkey_query.py pg_sshkey_query
 	chmod +x pg_sshkey_query
 
-# ── Compile .c → .o (static pattern rule — explicit, unambiguous) ──────────
+# ── Compile .c → .o (static pattern rule, explicit, unambiguous) ──────────
 $(PAM_OBJS): $S/%.o: $S/%.c
 	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) $(PAM_CFLAGS) -fPIC -c -o $@ $<
 
@@ -111,8 +114,18 @@ $T/test_integration: $T/test_integration.c \
 $T/test_system: $T/test_system.c
 	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
 
+# libpam-seam harness: loads the production pam_pg_sshkey.so through libpam.
+# Built WITHOUT sanitizers, the object under test is the uninstrumented .so
+# dlopen'ed by libpam; instrumenting the harness would only add noise.
+TFLAGS_NOSAN := $(CFLAGS) $(PAM_CFLAGS) -g -I$S -I$T -Wno-format-truncation
+
+$T/test_pam_module: $T/test_pam_module.c pam_pg_sshkey.so pg_sshkey_challenge pg_sshkey_sign
+	$(CC) $(TFLAGS_NOSAN) -o $@ $< -lpam
+
 # ── test / check ─────────────────────────────────────────────────────────────
-test check: $(TEST_BINS)
+# Depends on `all` so every suite exercises freshly built binaries:
+# test_system execs pg_sshkey_challenge/pg_sshkey_sign from the build dir.
+test check: all $(TEST_BINS)
 	@echo ""
 	@echo "=== test_challenge_store ==="; $T/test_challenge_store
 	@echo ""
@@ -122,7 +135,39 @@ test check: $(TEST_BINS)
 	@echo ""
 	@echo "=== test_integration ===";     $T/test_integration
 	@echo ""
+	@echo "=== test_pam_module ===";      PAM_PG_SSHKEY_BUILDDIR=$(CURDIR) $T/test_pam_module
+	@echo ""
+	@echo "=== test_system ===";          PATH="$(CURDIR):$$PATH" $T/test_system
+	@echo ""
+	@echo "=== test_python_module ===";   $(PYTHON) $T/test_python_module.py
+	@echo ""
+	@echo "=== test_pg_sshkey_query ===";  $(PYTHON) $T/test_pg_sshkey_query.py
+	@echo ""
 	@echo "All test suites complete."
+
+# ── e2e: real PostgreSQL in a dedicated incus container ───────────────────
+# Not part of `make test`; requires incus on the host.  See tests/e2e/.
+E2E_CONTAINER ?= pam-sshkey-e2e
+E2E_IMAGE     ?= images:ubuntu/26.04
+
+e2e:
+	E2E_CONTAINER=$(E2E_CONTAINER) E2E_IMAGE=$(E2E_IMAGE) $T/e2e/run_incus.sh
+
+e2e-clean:
+	E2E_CONTAINER=$(E2E_CONTAINER) $T/e2e/run_incus.sh --destroy
+
+e2e-shell:
+	incus exec $(E2E_CONTAINER) -- bash -l
+
+# Same checks on RHEL-family packaging (PostgreSQL 16 module stream)
+E2E_ROCKY_CONTAINER ?= pam-sshkey-e2e-rocky9
+E2E_ROCKY_IMAGE     ?= images:rockylinux/9
+
+e2e-rocky:
+	E2E_CONTAINER=$(E2E_ROCKY_CONTAINER) E2E_IMAGE=$(E2E_ROCKY_IMAGE) $T/e2e/run_incus.sh
+
+e2e-rocky-clean:
+	E2E_CONTAINER=$(E2E_ROCKY_CONTAINER) $T/e2e/run_incus.sh --destroy
 
 # ── Install ───────────────────────────────────────────────────────────────────
 install: all
@@ -169,5 +214,6 @@ clean:
 	rm -f $S/*.o
 	rm -f pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge pg_sshkey_connect pg_sshkey_addkey pg_sshkey_query
 	rm -f $(TEST_BINS)
+	rm -rf $S/__pycache__ $T/__pycache__
 
 endif  # CWD guard

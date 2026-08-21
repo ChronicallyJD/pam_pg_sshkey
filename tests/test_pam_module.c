@@ -1,0 +1,813 @@
+/*
+ * test_pam_module.c, tests at the libpam seam.
+ *
+ * Loads the freshly built pam_pg_sshkey.so through libpam exactly the way
+ * PostgreSQL does (src/backend/libpq/auth.c, CheckPAMAuth):
+ *
+ *   pam_start_confdir(service, "pgsql@", &conv, confdir, &pamh)
+ *   pam_set_item(PAM_USER, user)
+ *   pam_set_item(PAM_CONV, &conv)
+ *   pam_authenticate(pamh, 0)
+ *   pam_acct_mgmt(pamh, 0)
+ *   pam_end(pamh, rc)
+ *
+ * The conversation function mirrors pam_passwd_conv_proc(): it answers
+ * PAM_PROMPT_ECHO_OFF from appdata_ptr (the client "password") and never
+ * talks to a terminal.  An empty password models "client sent nothing".
+ *
+ * Keys and tokens come from ssh-keygen and the built pg_sshkey_challenge /
+ * pg_sshkey_sign binaries, so the module only ever sees real client output.
+ *
+ * Environment:
+ *   PAM_PG_SSHKEY_BUILDDIR   directory holding pam_pg_sshkey.so and the tools
+ *                            (default: ".")
+ *   PAM_TEST_KEEP=1          keep per-test temp dirs for inspection
+ *   PAM_TEST_DEBUG=1         add `debug` to the module line (logs to syslog)
+ *
+ * Runs unprivileged.  Never skips: a missing .so is a failure.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "test_framework.h"
+
+#include <errno.h>
+#include <limits.h>
+#include <pwd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <utime.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+
+#include <security/pam_appl.h>
+
+/* ── global paths ─────────────────────────────────────────────────────── */
+
+static char g_so[PATH_MAX];
+static char g_chal_bin[PATH_MAX];
+static char g_sign_bin[PATH_MAX];
+
+#define SERVICE_AUTH "pam-pg-sshkey-test"
+#define SERVICE_ACCT "pam-pg-sshkey-acct"
+
+/* ── per-test environment ─────────────────────────────────────────────── */
+
+typedef struct {
+    char root[PATH_MAX];
+    char confdir[PATH_MAX];   /* root/pam.d  */
+    char keys[PATH_MAX];      /* root/keys   */
+    char chal[PATH_MAX];      /* root/chal   */
+} env_t;
+
+static env_t *g_live_env = NULL;   /* for atexit cleanup on abort */
+
+static int
+run_capture(const char *cmd, char *out, size_t out_size)
+{
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    size_t n = fread(out, 1, out_size - 1, p);
+    out[n] = '\0';
+    int status = pclose(p);
+    int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    while (n > 0 && (out[n-1] == '\n' || out[n-1] == '\r')) out[--n] = '\0';
+    return rc;
+}
+
+static void
+write_file(const char *path, const char *content, mode_t mode)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { perror(path); exit(2); }
+    fputs(content, f);
+    fclose(f);
+    chmod(path, mode);
+}
+
+static void
+write_services(const env_t *e)
+{
+    char path[PATH_MAX], body[PATH_MAX * 2];
+    const char *dbg = getenv("PAM_TEST_DEBUG") ? " debug" : "";
+
+    snprintf(body, sizeof(body),
+             "#%%PAM-1.0\n"
+             "auth    required  %s authorized_keys_dir=%s challenge_dir=%s%s\n"
+             "account required  pam_permit.so\n",
+             g_so, e->keys, e->chal, dbg);
+    snprintf(path, sizeof(path), "%s/%s", e->confdir, SERVICE_AUTH);
+    write_file(path, body, 0644);
+
+    snprintf(body, sizeof(body),
+             "#%%PAM-1.0\n"
+             "account required  %s%s\n", g_so, dbg);
+    snprintf(path, sizeof(path), "%s/%s", e->confdir, SERVICE_ACCT);
+    write_file(path, body, 0644);
+}
+
+static void env_teardown(env_t *e);
+
+static void
+atexit_cleanup(void)
+{
+    if (g_live_env) env_teardown(g_live_env);
+}
+
+static void
+env_setup(env_t *e)
+{
+    const char *tmp = getenv("TMPDIR");
+    snprintf(e->root, sizeof(e->root), "%s/pam_mod_XXXXXX", tmp ? tmp : "/tmp");
+    if (!mkdtemp(e->root)) { perror("mkdtemp"); exit(2); }
+
+    snprintf(e->confdir, sizeof(e->confdir), "%s/pam.d", e->root);
+    snprintf(e->keys,    sizeof(e->keys),    "%s/keys",  e->root);
+    snprintf(e->chal,    sizeof(e->chal),    "%s/chal",  e->root);
+    mkdir(e->confdir, 0755);
+    mkdir(e->keys,    0755);
+    mkdir(e->chal,    01733);
+    chmod(e->chal,    01733);   /* mkdir honours umask; force the real mode */
+
+    write_services(e);
+    g_live_env = e;
+}
+
+static void
+env_teardown(env_t *e)
+{
+    g_live_env = NULL;
+    if (getenv("PAM_TEST_KEEP")) {
+        fprintf(stderr, "    (kept %s)\n", e->root);
+        return;
+    }
+    char cmd[PATH_MAX * 2 + 64];
+    snprintf(cmd, sizeof(cmd), "chmod -R u+rwx '%s' && rm -rf '%s'", e->root, e->root);
+    if (system(cmd) != 0) fprintf(stderr, "    warning: cleanup failed for %s\n", e->root);
+}
+
+/* ── key helpers ──────────────────────────────────────────────────────── */
+
+/* Returns 0 on success; writes <root>/<name> and <root>/<name>.pub */
+static int
+gen_key(const env_t *e, const char *name, const char *keygen_args)
+{
+    char cmd[PATH_MAX * 2];
+    snprintf(cmd, sizeof(cmd),
+             "ssh-keygen -q %s -N '' -C '%s' -f '%s/%s' </dev/null >/dev/null 2>&1",
+             keygen_args, name, e->root, name);
+    return system(cmd) == 0 ? 0 : -1;
+}
+static int gen_ed25519(const env_t *e, const char *name) { return gen_key(e, name, "-t ed25519"); }
+static int gen_rsa_pem(const env_t *e, const char *name) { return gen_key(e, name, "-t rsa -b 2048 -m PEM"); }
+
+static void
+key_path(const env_t *e, const char *name, char *out, size_t sz)
+{
+    snprintf(out, sz, "%s/%s", e->root, name);
+}
+
+/*
+ * Copy <root>/<pubname>.pub into <keys>/<user>/authorized_keys (0640).
+ * label_override != NULL replaces the first word of the line.
+ * append != 0 appends instead of replacing.
+ */
+static int
+install_pubkey(const env_t *e, const char *user, const char *pubname,
+               const char *label_override, int append)
+{
+    char pub[PATH_MAX], dir[PATH_MAX], ak[PATH_MAX], line[8192];
+    snprintf(pub, sizeof(pub), "%s/%s.pub", e->root, pubname);
+    snprintf(dir, sizeof(dir), "%s/%s", e->keys, user);
+    snprintf(ak,  sizeof(ak),  "%s/authorized_keys", dir);
+    mkdir(dir, 0750);
+
+    FILE *in = fopen(pub, "r");
+    if (!in) return -1;
+    if (!fgets(line, sizeof(line), in)) { fclose(in); return -1; }
+    fclose(in);
+
+    FILE *out = fopen(ak, append ? "a" : "w");
+    if (!out) return -1;
+    if (label_override) {
+        const char *rest = strchr(line, ' ');
+        if (!rest) { fclose(out); return -1; }
+        fprintf(out, "%s%s", label_override, rest);
+    } else {
+        fputs(line, out);
+    }
+    fclose(out);
+    chmod(ak, 0640);
+    return 0;
+}
+
+static void
+authkeys_path(const env_t *e, const char *user, char *out, size_t sz)
+{
+    snprintf(out, sz, "%s/%s/authorized_keys", e->keys, user);
+}
+
+/* ── token helpers ────────────────────────────────────────────────────── */
+
+/* Create a nonce with pg_sshkey_challenge and sign it with pg_sshkey_sign. */
+static int
+make_token(const env_t *e, const char *keyname,
+           char *hex, size_t hex_sz, char *tok, size_t tok_sz)
+{
+    char cmd[PATH_MAX * 2], key[PATH_MAX];
+    key_path(e, keyname, key, sizeof(key));
+
+    snprintf(cmd, sizeof(cmd), "'%s' '%s' 2>/dev/null", g_chal_bin, e->chal);
+    if (run_capture(cmd, hex, hex_sz) != 0 || strlen(hex) != 64) return -1;
+
+    snprintf(cmd, sizeof(cmd), "'%s' %s '%s' 2>/dev/null", g_sign_bin, hex, key);
+    if (run_capture(cmd, tok, tok_sz) != 0 || strncmp(tok, hex, 64) != 0) return -1;
+    return 0;
+}
+
+/*
+ * v2: the client issues its own challenge.  `extra` holds optional
+ * pg_sshkey_sign flags (--at <ts>, --nonce <hex>) so tests can build
+ * expired, future, or colliding tokens.  Nothing is written on the server.
+ */
+static int
+make_token_v2(const env_t *e, const char *keyname, const char *extra,
+              char *tok, size_t tok_sz)
+{
+    char cmd[PATH_MAX * 2], key[PATH_MAX];
+    key_path(e, keyname, key, sizeof(key));
+    snprintf(cmd, sizeof(cmd), "'%s' %s '%s' 2>/dev/null", g_sign_bin, extra ? extra : "", key);
+    if (run_capture(cmd, tok, tok_sz) != 0) return -1;
+    /* <digits>:<64hex>:<b64> */
+    const char *c1 = strchr(tok, ':');
+    if (!c1 || c1 == tok) return -1;
+    const char *c2 = strchr(c1 + 1, ':');
+    if (!c2 || c2 - (c1 + 1) != 64) return -1;
+    return 0;
+}
+
+/* the nonce part of a v2 token */
+static void
+v2_nonce(const char *tok, char out[65])
+{
+    const char *c1 = strchr(tok, ':');
+    if (!c1 || strlen(c1 + 1) < 64) { out[0] = '\0'; return; }
+    memcpy(out, c1 + 1, 64); out[64] = '\0';
+}
+
+static int
+dir_entry_count(const char *dir)
+{
+    char cmd[PATH_MAX + 64], out[32];
+    snprintf(cmd, sizeof(cmd), "ls -1A '%s' | wc -l", dir);
+    run_capture(cmd, out, sizeof(out));
+    return atoi(out);
+}
+
+static int
+nonce_exists(const env_t *e, const char *hex)
+{
+    char p[PATH_MAX]; struct stat st;
+    snprintf(p, sizeof(p), "%s/%s", e->chal, hex);
+    return stat(p, &st) == 0;
+}
+
+/* ── PostgreSQL-style conversation ────────────────────────────────────── */
+
+static int g_echo_off_calls;
+
+static int
+pg_style_conv(int num_msg, const struct pam_message **msg,
+              struct pam_response **resp, void *appdata_ptr)
+{
+    const char *passwd = appdata_ptr;
+    *resp = NULL;
+    if (num_msg <= 0 || num_msg > PAM_MAX_NUM_MSG) return PAM_CONV_ERR;
+
+    struct pam_response *reply = calloc((size_t)num_msg, sizeof *reply);
+    if (!reply) return PAM_CONV_ERR;
+
+    for (int i = 0; i < num_msg; i++) {
+        switch (msg[i]->msg_style) {
+        case PAM_PROMPT_ECHO_OFF:
+            g_echo_off_calls++;
+            /* PostgreSQL would round-trip to the client here; an empty
+               password models "client sent nothing" → conversation fails. */
+            if (!passwd || passwd[0] == '\0') goto fail;
+            reply[i].resp = strdup(passwd);
+            break;
+        case PAM_ERROR_MSG:
+        case PAM_TEXT_INFO:
+            reply[i].resp = strdup("");
+            break;
+        default:
+            goto fail;
+        }
+        reply[i].resp_retcode = PAM_SUCCESS;
+    }
+    *resp = reply;
+    return PAM_SUCCESS;
+
+fail:
+    for (int i = 0; i < num_msg; i++) free(reply[i].resp);
+    free(reply);
+    return PAM_CONV_ERR;
+}
+
+/*
+ * Authenticate `user` with `token` the way PostgreSQL does.
+ * Returns the pam_authenticate() result.  If acct_rc is non-NULL and
+ * authentication succeeded, *acct_rc receives pam_acct_mgmt()'s result.
+ */
+static int
+authenticate(const env_t *e, const char *user, const char *token, int *acct_rc)
+{
+    struct pam_conv conv = { pg_style_conv, (void *)token };
+    pam_handle_t *pamh = NULL;
+    g_echo_off_calls = 0;
+    if (acct_rc) *acct_rc = -1;
+
+    int rc = pam_start_confdir(SERVICE_AUTH, "pgsql@", &conv, e->confdir, &pamh);
+    if (rc != PAM_SUCCESS) {
+        fprintf(stderr, "    pam_start_confdir: %s\n", pam_strerror(NULL, rc));
+        return rc;
+    }
+    pam_set_item(pamh, PAM_USER, user);
+    pam_set_item(pamh, PAM_CONV, &conv);
+
+    rc = pam_authenticate(pamh, 0);
+    if (rc == PAM_SUCCESS && acct_rc)
+        *acct_rc = pam_acct_mgmt(pamh, 0);
+
+    pam_end(pamh, rc);
+    return rc;
+}
+
+/* ── tests ────────────────────────────────────────────────────────────── */
+
+static void
+test_valid_ed25519_token_succeeds(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(install_pubkey(&e, "alice", "id_ed25519", NULL, 0), 0);
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+
+    int acct = -1;
+    int rc = authenticate(&e, "alice", tok, &acct);
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    /* exactly one conversation round, PostgreSQL's client can't answer a second */
+    ASSERT_EQ(g_echo_off_calls, 1);
+    /* shipped config: account stack is pam_permit, alice need not be an OS user */
+    ASSERT_EQ(acct, PAM_SUCCESS);
+    env_teardown(&e);
+}
+
+static void
+test_replayed_token_rejected_and_nonce_gone(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_TRUE(nonce_exists(&e, hex));
+
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+    /* nonce consumed on first use ... */
+    ASSERT_FALSE(nonce_exists(&e, hex));
+    /* ... so the identical token is refused */
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    env_teardown(&e);
+}
+
+static void
+test_wrong_key_rejected(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    gen_ed25519(&e, "id_wrong");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);   /* id_wrong never registered */
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_wrong", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    /* the nonce is consumed even on failure: a failed attempt burns it */
+    ASSERT_FALSE(nonce_exists(&e, hex));
+    env_teardown(&e);
+}
+
+static void
+test_malformed_and_empty_tokens_rejected(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+
+    char hex_colon[80], hex_bad[96], traversal[128];
+    snprintf(hex_colon, sizeof(hex_colon), "%s:", hex);
+    snprintf(hex_bad,   sizeof(hex_bad),   "%s:!!not-base64!!", hex);
+    snprintf(traversal, sizeof(traversal), "../../etc/passwd:%s", tok + 65);
+
+    /* Rejected before the nonce is even looked up: the nonce survives. */
+    const char *pre[] = { "", "nocolon", ":AAAA", hex_colon, traversal };
+    for (size_t i = 0; i < sizeof(pre)/sizeof(pre[0]); i++) {
+        int rc = authenticate(&e, "alice", pre[i], NULL);
+        if (rc != PAM_AUTH_ERR)
+            fprintf(stderr, "    token #%zu \"%.20s\" -> %s\n", i, pre[i], pam_strerror(NULL, rc));
+        ASSERT_EQ(rc, PAM_AUTH_ERR);
+        ASSERT_EQ(g_echo_off_calls, 1);   /* never a second prompt to the client */
+    }
+    ASSERT_TRUE(nonce_exists(&e, hex));
+
+    /* A real nonce with a garbage signature is refused AND consumed
+       (the module invalidates before verifying, like the wrong-key case). */
+    ASSERT_EQ(authenticate(&e, "alice", hex_bad, NULL), PAM_AUTH_ERR);
+    ASSERT_EQ(g_echo_off_calls, 1);
+    ASSERT_FALSE(nonce_exists(&e, hex));
+    env_teardown(&e);
+}
+
+static void
+test_missing_authorized_keys_rejected(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    /* no keys/alice/ at all */
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    env_teardown(&e);
+}
+
+static void
+test_empty_authorized_keys_rejected(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    char dir[PATH_MAX], ak[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s/alice", e.keys); mkdir(dir, 0750);
+    authkeys_path(&e, "alice", ak, sizeof(ak));
+    write_file(ak, "# no keys here\n\n", 0640);
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    env_teardown(&e);
+}
+
+static void
+test_group_writable_authorized_keys_refused(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+    char ak[PATH_MAX]; authkeys_path(&e, "alice", ak, sizeof(ak));
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    chmod(ak, 0660);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+
+    /* same key, correct mode, fresh token: proves the refusal was the mode */
+    chmod(ak, 0640);
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+    env_teardown(&e);
+}
+
+static void
+test_expired_nonce_rejected(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+
+    /* back-date the nonce file past the 60 s TTL (format: "<ts>\n<hex>\n") */
+    char np[PATH_MAX], body[128];
+    snprintf(np, sizeof(np), "%s/%s", e.chal, hex);
+    snprintf(body, sizeof(body), "%ld\n%s\n", (long)time(NULL) - 120, hex);
+    write_file(np, body, 0644);
+
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    ASSERT_FALSE(nonce_exists(&e, hex));   /* expired nonces are purged */
+    env_teardown(&e);
+}
+
+static void
+test_unremovable_nonce_fails_closed(void)
+{
+    if (geteuid() == 0) { fprintf(stderr, "(skipped as root) "); return; }
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+
+    /* unlink() needs write permission on the directory; take it away so the
+       module can read the nonce but cannot consume it (the real-world case is
+       a challenge_dir not owned by postgres). */
+    chmod(e.chal, 0555);
+
+    /* If the nonce cannot be invalidated, replay protection is void, so the
+       only safe answer is to refuse. */
+    int rc1 = authenticate(&e, "alice", tok, NULL);
+    int rc2 = authenticate(&e, "alice", tok, NULL);
+    if (rc1 == PAM_SUCCESS)
+        fprintf(stderr, "    first attempt succeeded with an unconsumable nonce; replay -> %s\n",
+                pam_strerror(NULL, rc2));
+    ASSERT_EQ(rc1, PAM_AUTH_ERR);
+    ASSERT_EQ(rc2, PAM_AUTH_ERR);
+
+    chmod(e.chal, 01733);
+    env_teardown(&e);
+}
+
+static void
+test_rsa_ssh_rsa_entry_succeeds(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_rsa_pem(&e, "id_rsa"), 0);
+    install_pubkey(&e, "alice", "id_rsa", NULL, 0);   /* genuine "ssh-rsa ..." line */
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_rsa", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+    env_teardown(&e);
+}
+
+static void
+test_rsa_sha2_512_label_succeeds(void)
+{
+    /* The module accepts an rsa-sha2-512 key-type word in authorized_keys
+       (key_parser.c, pg_sshkey_addkey).  A key registered that way must
+       authenticate with the token the shipped signer produces. */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_rsa_pem(&e, "id_rsa"), 0);
+    install_pubkey(&e, "alice", "id_rsa", "rsa-sha2-512", 0);
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_rsa", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+    env_teardown(&e);
+}
+
+/* pam_sm_acct_mgmt is exported even though the shipped config routes the
+   account stack to pam_permit; lock its contract down directly. */
+static int
+acct_mgmt_direct(const env_t *e, const char *user)
+{
+    struct pam_conv conv = { pg_style_conv, (void *)"" };
+    pam_handle_t *pamh = NULL;
+    int rc = pam_start_confdir(SERVICE_ACCT, user, &conv, e->confdir, &pamh);
+    if (rc != PAM_SUCCESS) return rc;
+    rc = pam_acct_mgmt(pamh, 0);
+    pam_end(pamh, rc);
+    return rc;
+}
+
+static void
+test_acct_mgmt_direct(void)
+{
+    env_t e; env_setup(&e);
+    struct passwd *pw = getpwuid(geteuid());
+    ASSERT_NOT_NULL(pw);
+    if (pw) ASSERT_EQ(acct_mgmt_direct(&e, pw->pw_name), PAM_SUCCESS);
+    ASSERT_EQ(acct_mgmt_direct(&e, "no_such_user_e2e"), PAM_ACCT_EXPIRED);
+    env_teardown(&e);
+}
+
+static void
+write_stale_nonce(const env_t *e, const char *name, long age)
+{
+    char p[PATH_MAX], body[128];
+    snprintf(p, sizeof(p), "%s/%s", e->chal, name);
+    snprintf(body, sizeof(body), "%ld\n%s\n", (long)time(NULL) - age, name);
+    write_file(p, body, 0644);
+    struct utimbuf t = { time(NULL) - age, time(NULL) - age };
+    utime(p, &t);
+}
+
+static void
+test_stale_nonces_swept_on_auth(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+
+    /* leftovers from earlier failed connection attempts (any user) */
+    const char *stale1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    const char *stale2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    const char *live   = "3333333333333333333333333333333333333333333333333333333333333333";
+    write_stale_nonce(&e, stale1, 3600);
+    write_stale_nonce(&e, stale2, 300);
+    write_stale_nonce(&e, live, 5);                 /* another user's pending nonce */
+    write_stale_nonce(&e, "README", 3600);          /* not a nonce */
+
+    char hex[65], tok[4096];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+
+    ASSERT_FALSE(nonce_exists(&e, stale1));
+    ASSERT_FALSE(nonce_exists(&e, stale2));
+    ASSERT_TRUE(nonce_exists(&e, live));
+    ASSERT_TRUE(nonce_exists(&e, "README"));
+    env_teardown(&e);
+}
+
+/* ── v2: client-issued challenge ─────────────────────────────────────── */
+
+static void
+test_v2_token_succeeds_with_no_server_side_nonce(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(dir_entry_count(e.chal), 0);          /* nothing pre-created */
+
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+    ASSERT_EQ(g_echo_off_calls, 1);
+
+    /* the module recorded the nonce so it can never be accepted again */
+    char nonce[65]; v2_nonce(tok, nonce);
+    ASSERT_TRUE(nonce_exists(&e, nonce));
+    env_teardown(&e);
+}
+
+static void
+test_v2_replay_rejected(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    env_teardown(&e);
+}
+
+static void
+test_v2_expired_and_future_rejected(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+    char tok[4096], extra[64];
+
+    snprintf(extra, sizeof(extra), "--at %ld", (long)time(NULL) - 120);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", extra, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+
+    snprintf(extra, sizeof(extra), "--at %ld", (long)time(NULL) + 300);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", extra, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+
+    /* small clock skew is tolerated: 30 s in the future is fine */
+    snprintf(extra, sizeof(extra), "--at %ld", (long)time(NULL) + 30);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", extra, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+
+    /* rejected tokens leave no marker behind */
+    ASSERT_EQ(dir_entry_count(e.chal), 1);
+    env_teardown(&e);
+}
+
+static void
+test_v2_wrong_key_and_tampering_rejected(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    gen_ed25519(&e, "id_wrong");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+    char tok[4096];
+
+    ASSERT_EQ(make_token_v2(&e, "id_wrong", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+
+    /* a valid token with its timestamp edited is a different message */
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    tok[0] = (tok[0] == '1') ? '2' : '1';
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+
+    /* garbage that merely looks like v2 */
+    ASSERT_EQ(authenticate(&e, "alice", "1:2:3", NULL), PAM_AUTH_ERR);
+    ASSERT_EQ(authenticate(&e, "alice", "abc:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:AAAA", NULL), PAM_AUTH_ERR);
+    ASSERT_EQ(dir_entry_count(e.chal), 0);          /* garbage creates no files */
+    env_teardown(&e);
+}
+
+static void
+test_v2_nonce_cannot_be_reused_with_a_new_timestamp(void)
+{
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+    const char *nonce = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    char tok[4096], extra[160];
+
+    snprintf(extra, sizeof(extra), "--nonce %s", nonce);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", extra, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+
+    /* freshly signed, valid timestamp, same nonce → still a replay */
+    snprintf(extra, sizeof(extra), "--nonce %s --at %ld", nonce, (long)time(NULL) + 1);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", extra, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    env_teardown(&e);
+}
+
+static void
+test_v2_works_with_private_0700_marker_dir(void)
+{
+    /* v2 needs no world-writable directory: only the module writes to it */
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+    chmod(e.chal, 0700);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    env_teardown(&e);
+}
+
+static void
+test_v2_unrecordable_nonce_fails_closed(void)
+{
+    if (geteuid() == 0) { fprintf(stderr, "(skipped as root) "); return; }
+    env_t e; env_setup(&e);
+    gen_ed25519(&e, "id_ed25519");
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+    chmod(e.chal, 0500);                 /* cannot create the marker */
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    chmod(e.chal, 01733);
+    env_teardown(&e);
+}
+
+/* ── main ─────────────────────────────────────────────────────────────── */
+
+int
+main(void)
+{
+    const char *bd = getenv("PAM_PG_SSHKEY_BUILDDIR");
+    if (!bd || !*bd) bd = ".";
+
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s/pam_pg_sshkey.so", bd);
+    if (!realpath(tmp, g_so)) {
+        fprintf(stderr, "FAIL: %s not found, build it first (make)\n", tmp);
+        return 1;
+    }
+    snprintf(tmp, sizeof(tmp), "%s/pg_sshkey_challenge", bd);
+    if (!realpath(tmp, g_chal_bin)) { fprintf(stderr, "FAIL: %s not found\n", tmp); return 1; }
+    snprintf(tmp, sizeof(tmp), "%s/pg_sshkey_sign", bd);
+    if (!realpath(tmp, g_sign_bin)) { fprintf(stderr, "FAIL: %s not found\n", tmp); return 1; }
+    if (system("command -v ssh-keygen >/dev/null 2>&1") != 0) {
+        fprintf(stderr, "FAIL: ssh-keygen not found (install openssh-client)\n");
+        return 1;
+    }
+    atexit(atexit_cleanup);
+
+    printf("=== pam module (libpam seam) ===\n");
+    printf("  module: %s\n", g_so);
+    RUN(test_valid_ed25519_token_succeeds);
+    RUN(test_replayed_token_rejected_and_nonce_gone);
+    RUN(test_wrong_key_rejected);
+    RUN(test_malformed_and_empty_tokens_rejected);
+    RUN(test_missing_authorized_keys_rejected);
+    RUN(test_empty_authorized_keys_rejected);
+    RUN(test_group_writable_authorized_keys_refused);
+    RUN(test_expired_nonce_rejected);
+    RUN(test_unremovable_nonce_fails_closed);
+    RUN(test_rsa_ssh_rsa_entry_succeeds);
+    RUN(test_rsa_sha2_512_label_succeeds);
+    RUN(test_acct_mgmt_direct);
+    RUN(test_stale_nonces_swept_on_auth);
+    RUN(test_v2_token_succeeds_with_no_server_side_nonce);
+    RUN(test_v2_replay_rejected);
+    RUN(test_v2_expired_and_future_rejected);
+    RUN(test_v2_wrong_key_and_tampering_rejected);
+    RUN(test_v2_nonce_cannot_be_reused_with_a_new_timestamp);
+    RUN(test_v2_works_with_private_0700_marker_dir);
+    RUN(test_v2_unrecordable_nonce_fails_closed);
+    return SUMMARY();
+}

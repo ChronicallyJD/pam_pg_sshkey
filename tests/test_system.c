@@ -5,13 +5,13 @@
  * Exercises the compiled binaries end-to-end as a user would.
  *
  * Requires pg_sshkey_challenge and pg_sshkey_sign in PATH.
- * The Makefile test target adds the build directory to PATH automatically.
+ * The Makefile test target runs it as PATH="$(CURDIR):$PATH" tests/test_system.
  *
  * Tests:
  *   pg_sshkey_challenge:
  *     - produces a 64-char lowercase hex nonce
  *     - creates a nonce file in the challenge directory
- *     - nonce file mode is 0644
+ *     - nonce file mode is 0644 (also under umask 077)
  *     - successive nonces are unique
  *     - auto-creates the challenge directory if absent
  *     - fails on an unwritable directory
@@ -242,6 +242,22 @@ static void test_challenge_fails_unwritable_dir(void) {
     ASSERT_NE(rc, 0);
 }
 
+static void test_challenge_file_mode_0644_under_umask_077(void) {
+    /* A client running under a restrictive umask (systemd services, cron)
+       must still produce a nonce the postgres-run PAM module can read. */
+    mk_dir();
+    char cmd[512], out[256];
+    snprintf(cmd, sizeof(cmd), "umask 077; pg_sshkey_challenge %s 2>/dev/null", g_dir);
+    int rc = run_capture(cmd, out, sizeof(out));
+    ASSERT_EQ(rc, 0);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", g_dir, out);
+    struct stat st;
+    ASSERT_EQ(stat(path, &st), 0);
+    ASSERT_EQ((int)(st.st_mode & 0777), 0644);
+    rm_dir();
+}
+
 /* ── pg_sshkey_sign tests ─────────────────────────────────────────────────── */
 
 static void test_sign_openssh_ed25519(void) {
@@ -358,6 +374,62 @@ static void test_sign_fails_invalid_hex_challenge(void) {
     rm_dir();
 }
 
+/* ── pg_sshkey_sign v2 (self-issued challenge) ───────────────────────────── */
+
+/* 1 iff str matches <digits>:<64hex>:<base64>; stores ts */
+static int parse_v2(const char *s, long *ts) {
+    char *end; *ts = strtol(s, &end, 10);
+    if (end == s || *end != ':') return 0;
+    return is_valid_token(end + 1);
+}
+
+static void test_sign_v2_needs_no_challenge(void) {
+    mk_dir();
+    char priv[512], cmd[1024], out[1024];
+    snprintf(priv, sizeof(priv), "%s/ed25519.pem", g_dir);
+    gen_pkcs8_ed25519(priv);
+
+    long before = (long)time(NULL);
+    snprintf(cmd, sizeof(cmd), "pg_sshkey_sign %s 2>/dev/null", priv);
+    int rc = run_capture(cmd, out, sizeof(out));
+    long after = (long)time(NULL);
+    ASSERT_EQ(rc, 0);
+    long ts = 0;
+    ASSERT_TRUE(parse_v2(out, &ts));
+    ASSERT_TRUE(ts >= before && ts <= after);
+    rm_dir();
+}
+
+static void test_sign_v2_tokens_are_unique(void) {
+    mk_dir();
+    char priv[512], cmd[1024], t1[1024], t2[1024];
+    snprintf(priv, sizeof(priv), "%s/ed25519.pem", g_dir);
+    gen_pkcs8_ed25519(priv);
+    snprintf(cmd, sizeof(cmd), "pg_sshkey_sign %s 2>/dev/null", priv);
+    run_capture(cmd, t1, sizeof(t1));
+    run_capture(cmd, t2, sizeof(t2));
+    long ts;
+    ASSERT_TRUE(parse_v2(t1, &ts));
+    ASSERT_TRUE(parse_v2(t2, &ts));
+    ASSERT_TRUE(strcmp(t1, t2) != 0);
+    rm_dir();
+}
+
+static void test_sign_v2_at_and_nonce_overrides(void) {
+    /* --at / --nonce exist so tests can build expired or colliding tokens */
+    mk_dir();
+    char priv[512], cmd[1024], out[1024];
+    snprintf(priv, sizeof(priv), "%s/ed25519.pem", g_dir);
+    gen_pkcs8_ed25519(priv);
+    const char *nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    snprintf(cmd, sizeof(cmd),
+        "pg_sshkey_sign --at 1700000000 --nonce %s %s 2>/dev/null", nonce, priv);
+    ASSERT_EQ(run_capture(cmd, out, sizeof(out)), 0);
+    char expect[96]; snprintf(expect, sizeof(expect), "1700000000:%s:", nonce);
+    ASSERT_TRUE(strncmp(out, expect, strlen(expect)) == 0);
+    rm_dir();
+}
+
 /* ── Pipeline tests ───────────────────────────────────────────────────────── */
 
 static void test_pipeline_two_challenges_two_tokens(void) {
@@ -423,6 +495,7 @@ int main(void) {
     RUN(test_challenge_produces_hex64);
     RUN(test_challenge_creates_file);
     RUN(test_challenge_file_mode_0644);
+    RUN(test_challenge_file_mode_0644_under_umask_077);
     RUN(test_challenge_unique);
     RUN(test_challenge_autocreates_dir);
     RUN(test_challenge_fails_unwritable_dir);
@@ -432,6 +505,9 @@ int main(void) {
     RUN(test_sign_token_hex_matches_challenge);
     RUN(test_sign_fails_missing_key);
     RUN(test_sign_fails_invalid_hex_challenge);
+    RUN(test_sign_v2_needs_no_challenge);
+    RUN(test_sign_v2_tokens_are_unique);
+    RUN(test_sign_v2_at_and_nonce_overrides);
     RUN(test_pipeline_two_challenges_two_tokens);
     RUN(test_pipeline_nonce_file_present_before_auth);
     return SUMMARY();

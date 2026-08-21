@@ -6,7 +6,7 @@ authentication and execute SELECT 1.
 Requirements:
     pip install psycopg2-binary cryptography
 
-The pam_pg_sshkey PAM module and pg_sshkey_challenge must be installed
+The pam_pg_sshkey PAM module must be installed on the server
 (sudo make install).
 """
 
@@ -25,21 +25,15 @@ from cryptography.hazmat.primitives import hashes
 
 import psycopg2
 
-# Must match SIGN_PREFIX in sig_verify.c exactly
-SIGN_PREFIX    = b"pg-sshkey-v1\x00"
-CHALLENGE_DIR  = "/var/run/pg_sshkey"
-KEY_PATH       = os.path.expanduser("~/.ssh/id_ed25519")
+# Must match the PAM module exactly (v2: client-issued challenge)
+SIGN_PREFIX_V2 = b"pg-sshkey-v2\x00"
 
 
-def create_challenge(challenge_dir: str) -> tuple[str, bytes]:
-    """Write a 32-byte nonce to challenge_dir/<hex> and return (hex, raw)."""
-    raw    = secrets.token_bytes(32)
-    hex_id = raw.hex()
-    path   = os.path.join(challenge_dir, hex_id)
-    fd     = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    with os.fdopen(fd, "w") as f:
-        f.write(f"{int(time.time())}\n{hex_id}\n")
-    return hex_id, raw
+def make_challenge() -> str:
+    """v2: the client issues its own challenge, "<unix_ts>:<nonce_hex>".
+    Nothing is written anywhere; the server bounds the timestamp (±60 s)
+    and records the nonce on first use, so this works from any host."""
+    return f"{int(time.time())}:{secrets.token_bytes(32).hex()}"
 
 
 def load_key(key_path: str):
@@ -51,22 +45,20 @@ def load_key(key_path: str):
     return load_pem_private_key(data, password=None)
 
 
-def sign(key, challenge_bytes: bytes) -> bytes:
-    """Sign SIGN_PREFIX || challenge with the private key."""
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    message = SIGN_PREFIX + challenge_bytes
+def sign(key, head: str) -> bytes:
+    """Sign SIGN_PREFIX_V2 || "<ts>:<nonce_hex>" with the private key."""
+    message = SIGN_PREFIX_V2 + head.encode("ascii")
     if isinstance(key, Ed25519PrivateKey):
         return key.sign(message)
     return key.sign(message, asym_padding.PKCS1v15(), hashes.SHA256())
 
 
-def get_token(key_path: str = KEY_PATH,
-              challenge_dir: str = CHALLENGE_DIR) -> str:
-    """Return a signed token: '<64hex>:<base64_signature>'."""
-    key            = load_key(key_path)
-    hex_id, raw    = create_challenge(challenge_dir)
-    sig            = sign(key, raw)
-    return f"{hex_id}:{base64.b64encode(sig).decode()}"
+def get_token(key_path: str = KEY_PATH) -> str:
+    """Return a v2 token "<ts>:<nonce_hex>:<base64_sig>" ready to use as the password."""
+    key  = load_key(key_path)
+    head = make_challenge()
+    sig  = sign(key, head)
+    return f"{head}:{base64.b64encode(sig).decode()}"
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

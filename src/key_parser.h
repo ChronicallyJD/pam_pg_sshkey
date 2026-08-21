@@ -5,9 +5,10 @@
  * as OpenSSL EVP_PKEY objects ready for signature verification.
  *
  * Supported key types:
- *   ssh-rsa          RSA (PKCS#1 SHA-1/SHA-256/SHA-512)
- *   rsa-sha2-256     RSA with SHA-256
- *   rsa-sha2-512     RSA with SHA-512
+ *   ssh-rsa          RSA (verified as PKCS#1 v1.5 / SHA-256)
+ *   rsa-sha2-256     RSA, alias label, same key, same verification
+ *   rsa-sha2-512     RSA, alias label, same key, same verification
+ *                    (the label names the key, not a digest; see sig_verify.c)
  *   ssh-ed25519      Ed25519
  *
  * SPDX-License-Identifier: MIT

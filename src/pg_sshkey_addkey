@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pg_sshkey_addkey — add or replace a user's authorized public key for
+# pg_sshkey_addkey, add or replace a user's authorized public key for
 # PostgreSQL SSH-key authentication.
 #
 # Must be run as root.  Sets ownership and permissions correctly so the
@@ -133,7 +133,7 @@ if [[ "$REMOVE" -eq 1 ]]; then
         rm -f "$AK_FILE"
         info "removed $AK_FILE"
     else
-        info "no authorized_keys for '$PG_USER' — nothing to remove"
+        info "no authorized_keys for '$PG_USER', nothing to remove"
     fi
     # Remove directory if empty
     rmdir "$USER_DIR" 2>/dev/null && info "removed $USER_DIR" || true

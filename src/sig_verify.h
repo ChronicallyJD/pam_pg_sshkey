@@ -7,7 +7,7 @@
  * using its SSH private key.  The resulting signature bytes are what
  * the PAM token carries.
  *
- * For Ed25519 the signature is 64 raw bytes (no hash pre-processing —
+ * For Ed25519 the signature is 64 raw bytes (no hash pre-processing -
  * Ed25519 internally hashes with SHA-512).
  * For RSA the signature is an RSASSA-PKCS1-v1_5 (SHA-256) signature.
  *
@@ -29,5 +29,14 @@
 int verify_signature(const key_list_t  *key,
                      const unsigned char *challenge, size_t challenge_len,
                      const unsigned char *sig,       size_t sig_len);
+
+/*
+ * Verify sig over an already-built message (no prefix is added).
+ * v2 tokens use msg = "pg-sshkey-v2\0" || "<ts>:<nonce_hex>".
+ * Returns 0 on success, non-zero on failure.
+ */
+int verify_signature_raw(const key_list_t    *key,
+                         const unsigned char *msg, size_t msg_len,
+                         const unsigned char *sig, size_t sig_len);
 
 #endif /* SIG_VERIFY_H */

@@ -29,6 +29,13 @@ of an attempt. Remove it afterwards.
 | Journal: `authentication failed for 'U'` | The signing key is not one of the registered keys | `pg_sshkey_addkey --list U`; check `-i` on the client |
 | Journal: `token timestamp ... expired or clock skew` | Client clock differs from server by more than 60 seconds, or a token was reused after 60 seconds | Synchronise clocks; mint a token per connection |
 | Journal: `replayed token for 'U'` | The same token was presented twice | Mint a token per connection; do not store tokens |
+| Journal: `certificate token for 'U' but trusted_ca_keys is not set` | A `--cert` client against a server without the option | Add `trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys` to the module line; see [Configuration](configuration.md#certificates) |
+| Journal: `cannot read trusted_ca_keys ...` or `trusted_ca_keys ... is world/group writable` | CA file ownership or mode | `sudo chown root:postgres /etc/pg_sshkeys/trusted_ca_keys && sudo chmod 640 /etc/pg_sshkeys/trusted_ca_keys` |
+| Journal: `certificate for 'U' rejected: principal 'U' not listed` | The certificate was signed with a different `-n` principal, or none | Re-sign with `-n U` |
+| Journal: `certificate for 'U' rejected: expired` or `not yet valid` | Server time outside the `-V` window | Re-sign; check clocks with `ssh-keygen -L -f cert.pub` against `date` on the server |
+| Journal: `certificate for 'U' rejected: not signed by a trusted CA` | A CA not listed in `trusted_ca_keys` | Add the CA public key to the file, or re-sign with the trusted CA |
+| Journal: `certificate for 'U' rejected: unsupported critical option NAME` | Signed with `-O source-address=` or `-O force-command=` | Re-sign without critical options |
+| Journal: `certificate for 'U' rejected: unsupported signature algorithm ssh-rsa` | The RSA CA signed with SHA-1 (`ssh-keygen -t ssh-rsa`) | Re-sign without `-t`; ssh-keygen defaults to `rsa-sha2-512` |
 | Journal: `challenge not found or expired for 'U'` | v1 token whose nonce file is missing, used, or old; typically a remote v1 client that created the nonce locally | Use v2 tokens, or create the v1 nonce on the server with `--challenge-cmd` |
 | Journal: `could not record nonce in DIR` | `/var/run/pg_sshkey` missing (after a reboot without the tmpfiles rule) or not writable by `postgres` | `sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/pg_sshkey.conf`, or `chown postgres:postgres` |
 | Journal: `could not delete challenge ... refusing` | v1 nonce directory not owned by `postgres` | `sudo chown postgres:postgres /var/run/pg_sshkey && sudo chmod 1733 /var/run/pg_sshkey` |
@@ -36,6 +43,7 @@ of an attempt. Remove it afterwards.
 | PostgreSQL: `password authentication failed` with nothing in the journal | An earlier `pg_hba.conf` rule (`scram-sha-256`, `md5`) matched first | Move the `pam` rule above it; check with `SELECT * FROM pg_hba_file_rules` |
 | PostgreSQL: `no pg_hba.conf entry for replication connection` | No `replication` database rule for the subscriber | Add one; see [Replication](replication.md) |
 | Subscription authenticates once, then fails | Token stored in `CREATE SUBSCRIPTION` connection string | Not supported; see [Replication](replication.md#what-works-and-what-does-not) |
+| `pg_sshkey_sign`: `... is not an OpenSSH certificate` | `--cert` was given the plain `.pub` file | Pass the `-cert.pub` file written by `ssh-keygen -s` |
 | `pg_sshkey_sign`: `Failed to load private key` | OpenSSH RSA key, or a key with a passphrase | `openssl pkey -in ~/.ssh/id_rsa -out key.pem`; use the Python module for passphrases |
 | Python: `KeyError_: ... Need bcrypt module` | Passphrase-protected OpenSSH key without `bcrypt` installed | `pip install bcrypt`, or export the key to unencrypted PEM |
 | Python: `ImportError: dynamic module does not define module export function` | `import pam_pg_sshkey` ran with the repository root as working directory, so `pam_pg_sshkey.so` was found first | Run from another directory, or install the Python file where the `.so` is not |

@@ -31,6 +31,7 @@ Usage:
   -p, --port PORT         Port                       (default: 5432)
   -d, --dbname DBNAME     Database name              (default: username)
   -i, --identity FILE     SSH private key            (default: ~/.ssh/id_ed25519)
+      --cert FILE         OpenSSH user certificate for the key (v3 token)
       --v1                Legacy token (server-issued nonce file)
   -c, --challenge-dir DIR (--v1) Challenge nonce dir  (default: /var/run/pg_sshkey)
   -q, --query SQL         Query to run               (default: SELECT 1)
@@ -119,15 +120,20 @@ def generate_challenge(challenge_dir: str, verbose: bool) -> str:
     return challenge
 
 
-def sign_challenge(challenge: str | None, key_path: str, verbose: bool) -> str:
+def sign_challenge(challenge: str | None, key_path: str, verbose: bool,
+                   cert_path: str | None = None) -> str:
     """
     Run pg_sshkey_sign to produce a signed token.
 
     challenge=None (v2, default): pg_sshkey_sign issues its own timestamp and
     nonce, "<ts>:<nonce_hex>:<sig>"; nothing exists on the server first.
     challenge="<hex>" (v1): sign a server-issued nonce, "<hex>:<sig>".
+    cert_path (v3): pass "--cert FILE" so the token also carries the OpenSSH
+    user certificate, "<ts>:<nonce_hex>:<sig>:<cert>". Not valid with v1.
     Raises RuntimeError on failure.
     """
+    if cert_path and challenge:
+        raise RuntimeError("--cert cannot be combined with --v1")
     if verbose:
         print(f"[pg_sshkey_query] signing with {key_path}", file=sys.stderr)
 
@@ -140,13 +146,23 @@ def sign_challenge(challenge: str | None, key_path: str, verbose: bool) -> str:
             f"  sudo pg_sshkey_addkey <username> {key_path}.pub"
         )
 
-    argv = [_find_tool("pg_sshkey_sign")] + ([challenge] if challenge else []) + [key_path]
+    argv = [_find_tool("pg_sshkey_sign")]
+    if cert_path:
+        if not Path(cert_path).exists():
+            raise RuntimeError(f"Certificate not found: {cert_path}")
+        argv += ["--cert", cert_path]
+    argv += ([challenge] if challenge else []) + [key_path]
     result = subprocess.run(
         argv,
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
+        if "certificate" in result.stderr:
+            raise RuntimeError(
+                f"pg_sshkey_sign failed (exit {result.returncode}).\n"
+                f"stderr: {result.stderr.strip()}"
+            )
         raise RuntimeError(
             f"pg_sshkey_sign failed (exit {result.returncode}).\n"
             f"stderr: {result.stderr.strip()}\n\n"
@@ -160,15 +176,22 @@ def sign_challenge(challenge: str | None, key_path: str, verbose: bool) -> str:
 
     token = result.stdout.strip()
 
-    # Validate token shape: v2 "<ts>:<64hex>:<b64>" or v1 "<64hex>:<b64>"
-    shape = (r"^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]{4,}=*$" if challenge is None
-             else r"^[0-9a-f]{64}:[A-Za-z0-9+/]{4,}=*$")
+    # Validate token shape: v3 "<ts>:<64hex>:<b64>:<b64>", v2 "<ts>:<64hex>:<b64>"
+    # or v1 "<64hex>:<b64>"
+    b64 = r"[A-Za-z0-9+/]{4,}=*"
+    if cert_path:
+        shape = rf"^[0-9]+:[0-9a-f]{{64}}:{b64}:{b64}$"
+        expected = "<unix_ts>:<64 hex chars>:<base64 signature>:<base64 certificate>"
+    elif challenge is None:
+        shape = rf"^[0-9]+:[0-9a-f]{{64}}:{b64}$"
+        expected = "<unix_ts>:<64 hex chars>:<base64 signature>"
+    else:
+        shape = rf"^[0-9a-f]{{64}}:{b64}$"
+        expected = "<64 hex chars>:<base64 signature>"
     if not re.match(shape, token):
         raise RuntimeError(
             f"pg_sshkey_sign produced invalid token: {token!r}\n"
-            f"Expected format: "
-            + ("<unix_ts>:<64 hex chars>:<base64 signature>" if challenge is None
-               else "<64 hex chars>:<base64 signature>")
+            f"Expected format: {expected}"
         )
 
     if verbose:
@@ -363,6 +386,13 @@ examples:
         help="SSH private key file (default: ~/.ssh/id_ed25519)",
     )
     parser.add_argument(
+        "--cert",
+        default=None,
+        metavar="FILE",
+        help="OpenSSH user certificate (*-cert.pub) for the key; sends a v3 "
+             "token checked against the server's trusted_ca_keys",
+    )
+    parser.add_argument(
         "--v1",
         action="store_true",
         help="Legacy token: create a nonce in the server's challenge dir first",
@@ -421,16 +451,21 @@ def main() -> int:
         print(f"[pg_sshkey_query] database:      {dbname}", file=sys.stderr)
         print(f"[pg_sshkey_query] host:          {args.host or '<local socket>'}", file=sys.stderr)
         print(f"[pg_sshkey_query] key:           {identity}", file=sys.stderr)
+        if args.cert:
+            print(f"[pg_sshkey_query] cert:          {args.cert}", file=sys.stderr)
         print(f"[pg_sshkey_query] challenge dir: {args.challenge_dir}", file=sys.stderr)
         print(f"[pg_sshkey_query] query:         {args.query}", file=sys.stderr)
 
     try:
+        if args.cert and args.v1:
+            raise RuntimeError("--cert cannot be combined with --v1")
+
         # Step 1 (--v1 only): create the nonce in the SERVER's challenge dir.
         # v2 tokens carry their own timestamp + nonce, so there is nothing to do.
         challenge = generate_challenge(args.challenge_dir, args.verbose) if args.v1 else None
 
         # Step 2: sign (v2: pg_sshkey_sign issues the challenge itself)
-        token = sign_challenge(challenge, identity, args.verbose)
+        token = sign_challenge(challenge, identity, args.verbose, cert_path=args.cert)
 
         # Step 3: connect and run the query
         # The token is passed as password= BEFORE the connection opens.

@@ -52,12 +52,13 @@ S := src
 T := tests
 
 PAM_SRCS := $S/pam_pg_sshkey.c $S/challenge_store.c \
-            $S/key_parser.c    $S/sig_verify.c
+            $S/key_parser.c    $S/sig_verify.c $S/ssh_cert.c
 PAM_OBJS := $(PAM_SRCS:.c=.o)
 
 TEST_BINS := $T/test_challenge_store $T/test_key_parser \
-             $T/test_sig_verify      $T/test_integration \
-             $T/test_system          $T/test_pam_module
+             $T/test_sig_verify      $T/test_ssh_cert    \
+             $T/test_integration     $T/test_system      \
+             $T/test_pam_module
 
 .PHONY: all test check install install-conf uninstall clean e2e e2e-clean e2e-shell e2e-rocky e2e-rocky-clean
 
@@ -107,6 +108,9 @@ $T/test_key_parser: $T/test_key_parser.c $S/key_parser.c $S/challenge_store.c
 $T/test_sig_verify: $T/test_sig_verify.c $S/sig_verify.c $S/key_parser.c
 	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
 
+$T/test_ssh_cert: $T/test_ssh_cert.c $S/ssh_cert.c $S/key_parser.c
+	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
+
 $T/test_integration: $T/test_integration.c \
                      $S/challenge_store.c $S/key_parser.c $S/sig_verify.c
 	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
@@ -120,7 +124,7 @@ $T/test_system: $T/test_system.c
 TFLAGS_NOSAN := $(CFLAGS) $(PAM_CFLAGS) -g -I$S -I$T -Wno-format-truncation
 
 $T/test_pam_module: $T/test_pam_module.c pam_pg_sshkey.so pg_sshkey_challenge pg_sshkey_sign
-	$(CC) $(TFLAGS_NOSAN) -o $@ $< -lpam
+	$(CC) $(TFLAGS_NOSAN) -rdynamic -o $@ $< -lpam
 
 # ── test / check ─────────────────────────────────────────────────────────────
 # Depends on `all` so every suite exercises freshly built binaries:
@@ -132,6 +136,8 @@ test check: all $(TEST_BINS)
 	@echo "=== test_key_parser ===";      $T/test_key_parser
 	@echo ""
 	@echo "=== test_sig_verify ===";      $T/test_sig_verify
+	@echo ""
+	@echo "=== test_ssh_cert ===";        $T/test_ssh_cert
 	@echo ""
 	@echo "=== test_integration ===";     $T/test_integration
 	@echo ""

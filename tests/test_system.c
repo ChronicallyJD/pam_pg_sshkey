@@ -23,6 +23,10 @@
  *     - token hex prefix matches the input challenge
  *     - fails on a missing key file
  *     - fails on an invalid (too-short) challenge
+ *     - --cert prints a v3 token whose 4th field is the cert base64
+ *     - --cert works with an RSA PEM key and RSA cert
+ *     - --cert fails on a missing file or a non-certificate file
+ *     - --cert signature verifies over the pg-sshkey-v3 message with the cert's key
  *
  *   Pipeline:
  *     - two challenges produce two different valid tokens
@@ -430,6 +434,201 @@ static void test_sign_v2_at_and_nonce_overrides(void) {
     rm_dir();
 }
 
+
+/* 1 iff s starts with <digits>:<64hex>: ; stores ts */
+static int parse_v2_head(const char *s, long *ts) {
+    char *end; *ts = strtol(s, &end, 10);
+    if (end == s || *end != ':') return 0;
+    const char *n = end + 1;
+    const char *c = strchr(n, ':');
+    if (!c || c - n != 64) return 0;
+    for (const char *p = n; p < c; p++)
+        if (!((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f'))) return 0;
+    return 1;
+}
+
+/* ── pg_sshkey_sign v3 (certificate) ─────────────────────────────────────── */
+
+/* Read the second whitespace field of a *-cert.pub file into out. */
+static int
+cert_b64_field(const char *path, char *out, size_t out_size)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[16384];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+    fclose(f);
+    char *sp = strchr(line, ' ');
+    if (!sp) return -1;
+    char *start = sp + 1;
+    char *end = start;
+    while (*end && *end != ' ' && *end != '\n') end++;
+    size_t n = (size_t)(end - start);
+    if (n + 1 > out_size) return -1;
+    memcpy(out, start, n);
+    out[n] = '\0';
+    return 0;
+}
+
+/* Generate a CA and a user key with ssh-keygen and sign the user key.
+   type is "ed25519" or "rsa"; the user private key ends up at priv,
+   the certificate at <priv>-cert.pub. */
+static int
+gen_cert(const char *type, const char *priv, char *cert_out, size_t cert_size)
+{
+    char ca[512], cmd[2048];
+    snprintf(ca, sizeof(ca), "%s/ca_%s", g_dir, type);
+    snprintf(cert_out, cert_size, "%s-cert.pub", priv);
+    snprintf(cmd, sizeof(cmd),
+        "ssh-keygen -q -t ed25519 -N '' -f %s >/dev/null 2>&1 && "
+        "ssh-keygen -q -t %s %s -N '' -f %s >/dev/null 2>&1 && "
+        "ssh-keygen -q -s %s -I testid -n testuser -V -1m:+5m %s.pub >/dev/null 2>&1",
+        ca, type, strcmp(type, "rsa") == 0 ? "-b 2048 -m PEM" : "", priv, ca, priv);
+    return system(cmd) == 0 ? 0 : -1;
+}
+
+/* 1 iff s has exactly three ':' and the 4th field equals cert_b64 */
+static int
+v3_fourth_field_equals(const char *s, const char *cert_b64)
+{
+    int colons = 0; const char *last = NULL;
+    for (const char *p = s; *p; p++) if (*p == ':') { colons++; last = p; }
+    if (colons != 3) return 0;
+    return strcmp(last + 1, cert_b64) == 0;
+}
+
+static void test_sign_cert_ed25519_prints_v3_token(void) {
+    mk_dir();
+    char priv[512], cert[512], cert_b64[8192], cmd[2048], out[16384];
+    snprintf(priv, sizeof(priv), "%s/user_ed25519", g_dir);
+    ASSERT_EQ(gen_cert("ed25519", priv, cert, sizeof(cert)), 0);
+    ASSERT_EQ(cert_b64_field(cert, cert_b64, sizeof(cert_b64)), 0);
+
+    const char *nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    snprintf(cmd, sizeof(cmd),
+        "pg_sshkey_sign --cert %s --at 1700000000 --nonce %s %s 2>/dev/null",
+        cert, nonce, priv);
+    int rc = run_capture(cmd, out, sizeof(out));
+    ASSERT_EQ(rc, 0);
+    char expect[96]; snprintf(expect, sizeof(expect), "1700000000:%s:", nonce);
+    ASSERT_TRUE(strncmp(out, expect, strlen(expect)) == 0);
+    ASSERT_TRUE(v3_fourth_field_equals(out, cert_b64));
+    rm_dir();
+}
+
+static void test_sign_cert_rsa_pem_prints_v3_token(void) {
+    mk_dir();
+    char priv[512], cert[512], cert_b64[8192], cmd[2048], out[16384];
+    snprintf(priv, sizeof(priv), "%s/user_rsa", g_dir);
+    ASSERT_EQ(gen_cert("rsa", priv, cert, sizeof(cert)), 0);
+    ASSERT_EQ(cert_b64_field(cert, cert_b64, sizeof(cert_b64)), 0);
+
+    snprintf(cmd, sizeof(cmd), "pg_sshkey_sign --cert %s %s 2>/dev/null", cert, priv);
+    int rc = run_capture(cmd, out, sizeof(out));
+    ASSERT_EQ(rc, 0);
+    long ts = 0;
+    ASSERT_TRUE(parse_v2_head(out, &ts));
+    ASSERT_TRUE(v3_fourth_field_equals(out, cert_b64));
+    rm_dir();
+}
+
+
+/* 1 iff <g_dir>/err names the cert file and is not the unknown-option usage text */
+static int
+stderr_mentions_cert(const char *cert_name)
+{
+    char errpath[512]; snprintf(errpath, sizeof(errpath), "%s/err", g_dir);
+    FILE *f = fopen(errpath, "r");
+    if (!f) return 0;
+    char buf[4096]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = '\0';
+    fclose(f);
+    if (strstr(buf, "Unknown option")) return 0;
+    return strstr(buf, cert_name) != NULL;
+}
+
+static void test_sign_cert_missing_file_fails(void) {
+    mk_dir();
+    char priv[512], cmd[2048], out[1024];
+    snprintf(priv, sizeof(priv), "%s/ed25519.pem", g_dir);
+    gen_pkcs8_ed25519(priv);
+    snprintf(cmd, sizeof(cmd),
+        "pg_sshkey_sign --cert %s/no_such-cert.pub %s 2>%s/err", g_dir, priv, g_dir);
+    int rc = run_capture(cmd, out, sizeof(out));
+    ASSERT_EQ(rc, 1);
+    ASSERT_STR_EQ(out, "");
+    ASSERT_TRUE(stderr_mentions_cert("no_such-cert.pub"));
+    rm_dir();
+}
+
+static void test_sign_cert_not_a_cert_fails(void) {
+    /* A plain public key is not a certificate: first field lacks -cert-v01@openssh.com */
+    mk_dir();
+    char priv[512], cert[512], pub[1024], cmd[2048], out[1024];
+    snprintf(priv, sizeof(priv), "%s/user_ed25519", g_dir);
+    ASSERT_EQ(gen_cert("ed25519", priv, cert, sizeof(cert)), 0);
+    snprintf(pub, sizeof(pub), "%s.pub", priv);
+    snprintf(cmd, sizeof(cmd),
+        "pg_sshkey_sign --cert %s %s 2>%s/err", pub, priv, g_dir);
+    int rc = run_capture(cmd, out, sizeof(out));
+    ASSERT_EQ(rc, 1);
+    ASSERT_STR_EQ(out, "");
+    ASSERT_TRUE(stderr_mentions_cert(pub));
+    rm_dir();
+}
+
+static void test_sign_cert_unpadded_field_fails(void) {
+    /* The server's decoder drops a final partial base64 group: refuse early */
+    mk_dir();
+    char priv[512], cert[512], bad[1024], cmd[2048], out[1024];
+    snprintf(priv, sizeof(priv), "%s/user_ed25519", g_dir);
+    ASSERT_EQ(gen_cert("ed25519", priv, cert, sizeof(cert)), 0);
+    snprintf(bad, sizeof(bad), "%s/unpadded-cert.pub", g_dir);
+    /* copy the cert line minus its last character (drops a padding byte) */
+    snprintf(cmd, sizeof(cmd),
+        "awk '{ sub(/.$/, \"\", $2); print $1, $2 }' %s > %s", cert, bad);
+    ASSERT_EQ(system(cmd), 0);
+    snprintf(cmd, sizeof(cmd),
+        "pg_sshkey_sign --cert %s %s 2>%s/err", bad, priv, g_dir);
+    int rc = run_capture(cmd, out, sizeof(out));
+    ASSERT_EQ(rc, 1);
+    ASSERT_STR_EQ(out, "");
+    ASSERT_TRUE(stderr_mentions_cert("not padded base64"));
+    rm_dir();
+}
+
+static void test_sign_cert_signature_covers_v3_prefix(void) {
+    /* The signature must be over "pg-sshkey-v3\0<ts>:<nonce>" with the key
+       embedded in the certificate, else the server's v3 check cannot pass. */
+    mk_dir();
+    char priv[512], cert[512], cmd[2048], out[16384], tokpath[512];
+    snprintf(priv, sizeof(priv), "%s/user_ed25519", g_dir);
+    ASSERT_EQ(gen_cert("ed25519", priv, cert, sizeof(cert)), 0);
+    snprintf(cmd, sizeof(cmd), "pg_sshkey_sign --cert %s %s 2>/dev/null", cert, priv);
+    ASSERT_EQ(run_capture(cmd, out, sizeof(out)), 0);
+    snprintf(tokpath, sizeof(tokpath), "%s/token", g_dir);
+    FILE *tf = fopen(tokpath, "w"); ASSERT_TRUE(tf != NULL);
+    fputs(out, tf); fclose(tf);
+
+    const char *script =
+        "import sys, struct, base64\n"
+        "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey\n"
+        "tok = open(sys.argv[1]).read().strip()\n"
+        "ts, nonce, sig, cert = tok.split(':')\n"
+        "blob = base64.b64decode(cert)\n"
+        "pos = 0\n"
+        "def rs():\n"
+        "    global pos\n"
+        "    n = struct.unpack('>I', blob[pos:pos+4])[0]; pos += 4\n"
+        "    v = blob[pos:pos+n]; pos += n\n"
+        "    return v\n"
+        "assert rs() == b'ssh-ed25519-cert-v01@openssh.com'\n"
+        "rs()  # cert nonce\n"
+        "pk = Ed25519PublicKey.from_public_bytes(rs())\n"
+        "pk.verify(base64.b64decode(sig), b'pg-sshkey-v3\\x00' + (ts + ':' + nonce).encode())\n";
+    ASSERT_EQ(run_python_script(script, tokpath), 0);
+    rm_dir();
+}
+
 /* ── Pipeline tests ───────────────────────────────────────────────────────── */
 
 static void test_pipeline_two_challenges_two_tokens(void) {
@@ -508,6 +707,12 @@ int main(void) {
     RUN(test_sign_v2_needs_no_challenge);
     RUN(test_sign_v2_tokens_are_unique);
     RUN(test_sign_v2_at_and_nonce_overrides);
+    RUN(test_sign_cert_ed25519_prints_v3_token);
+    RUN(test_sign_cert_rsa_pem_prints_v3_token);
+    RUN(test_sign_cert_missing_file_fails);
+    RUN(test_sign_cert_not_a_cert_fails);
+    RUN(test_sign_cert_unpadded_field_fails);
+    RUN(test_sign_cert_signature_covers_v3_prefix);
     RUN(test_pipeline_two_challenges_two_tokens);
     RUN(test_pipeline_nonce_file_present_before_auth);
     return SUMMARY();

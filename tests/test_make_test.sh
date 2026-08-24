@@ -23,6 +23,8 @@ check "test_system is invoked with the build dir on PATH" \
     grep -Eq 'PATH=[^;&|]*tests/test_system' <<<"$dry"
 check "make -n test invokes tests/test_python_module.py" \
     grep -q 'tests/test_python_module.py' <<<"$dry"
+check "make -n test invokes tests/test_ssh_cert" \
+    grep -q 'tests/test_ssh_cert' <<<"$dry"
 check "make -n test invokes tests/test_pam_module" \
     grep -q 'tests/test_pam_module' <<<"$dry"
 check "make -n test invokes tests/test_pg_sshkey_query.py" \
@@ -33,7 +35,7 @@ check "make -n test invokes tests/test_docs.sh" \
 echo "=== artifact hygiene ==="
 check "no ELF binaries tracked in git" bash -c '! git ls-files -z | xargs -0 file -b 2>/dev/null | grep -q "^ELF"'
 check "no build outputs tracked in git" bash -c \
-    '! git ls-files | grep -Eq "^(pam_pg_sshkey\.so|pg_sshkey_(sign|challenge|connect|addkey|query)|src/.*\.o|tests/test_(challenge_store|key_parser|sig_verify|integration|system|pam_module))$"'
+    '! git ls-files | grep -Eq "^(pam_pg_sshkey\.so|pg_sshkey_(sign|challenge|connect|addkey|query)|src/.*\.o|tests/test_(challenge_store|key_parser|sig_verify|ssh_cert|integration|system|pam_module))$"'
 
 echo "=== behavioural ==="
 out=$(make test 2>&1)

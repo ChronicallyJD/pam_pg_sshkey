@@ -18,6 +18,9 @@ Tests:
   - passing password= to connect() raises ValueError
   - SIGN_PREFIX is exactly b"pg-sshkey-v1\\x00" (13 bytes)
   - Signed message matches what the PAM module verifies
+  - get_token(cert_path=...) produces a 4-field v3 token, signed over
+    "pg-sshkey-v3\\0<ts>:<nonce>", whose 4th field is the cert file's base64,
+    byte-identical to pg_sshkey_sign --cert for the same ts and nonce
 
 Run:
     python3 -m pytest tests/test_python_module.py -v
@@ -48,6 +51,7 @@ from pam_pg_sshkey import (
     KeyError_,
     _SIGN_PREFIX,
     _SIGN_PREFIX_V2,
+    _SIGN_PREFIX_V3,
     _create_challenge,
     _load_private_key,
     _sign,
@@ -88,6 +92,7 @@ needs_bcrypt = unittest.skipUnless(
 
 TOKEN_RE = re.compile(r"^[0-9a-f]{64}:[A-Za-z0-9+/]+=*$")
 TOKEN_V2_RE = re.compile(r"^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]+=*$")
+TOKEN_V3_RE = re.compile(r"^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]+=*:[A-Za-z0-9+/]+=*$")
 
 
 def _is_valid_token(token: str) -> bool:
@@ -571,6 +576,151 @@ class TestConnectReplication(unittest.TestCase):
     def test_password_is_a_fresh_token(self):
         kw = self._call()
         self.assertTrue(_is_valid_token(kw["password"]))
+
+
+# ── Tests: v3 certificate tokens ─────────────────────────────────────────────
+
+ROOT = Path(__file__).parent.parent
+PG_SSHKEY_SIGN = ROOT / "pg_sshkey_sign"
+
+
+@unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen not installed")
+class TestCertToken(unittest.TestCase):
+    """v3: "<ts>:<nonce_hex>:<sig>:<cert_b64>", signed with the certified key
+    over "pg-sshkey-v3\\0" + "<ts>:<nonce_hex>".  Acceptance by the real module
+    is proven through libpam in tests/test_pam_module.c for the tokens that
+    pg_sshkey_sign --cert prints; the last test here pins the Python token to
+    that output byte for byte (Ed25519 signatures are deterministic)."""
+
+    TS = 1700000000
+    NONCE = "0123456789abcdef" * 4
+
+    def _certified_key(self, d: TempDir, key_type: str = "ed25519"):
+        """Return (private_key_path, cert_path, cert_b64) for a fresh key
+        signed by a fresh CA for principal alice."""
+        ca = d.key_path("ca")
+        key = d.key_path("user_" + key_type)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", ca], check=True)
+        if key_type == "rsa":
+            subprocess.run(["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-m", "PEM",
+                            "-N", "", "-f", key], check=True)
+        else:
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], check=True)
+        subprocess.run(["ssh-keygen", "-q", "-s", ca, "-I", "alice-key", "-n", "alice",
+                        "-V", "-1m:+5m", key + ".pub"], check=True)
+        cert = key + "-cert.pub"
+        fields = Path(cert).read_text().split()
+        self.assertTrue(fields[0].endswith("-cert-v01@openssh.com"), fields[0])
+        return key, cert, fields[1]
+
+    def test_prefix_v3_is_13_bytes_with_nul(self):
+        self.assertEqual(_SIGN_PREFIX_V3, b"pg-sshkey-v3\x00")
+        self.assertEqual(len(_SIGN_PREFIX_V3), 13)
+
+    def test_token_has_four_fields_and_cert_is_the_file_base64(self):
+        with TempDir() as d:
+            key, cert, cert_b64 = self._certified_key(d)
+            before = int(time.time())
+            token = get_token(key_path=key, cert_path=cert)
+            self.assertTrue(TOKEN_V3_RE.match(token), token)
+            ts, nonce, sig, cert_field = token.split(":")
+            self.assertTrue(before <= int(ts) <= int(time.time()) + 1)
+            self.assertEqual(cert_field, cert_b64)
+            self.assertEqual(os.listdir(d.chaldir), [])
+
+    def test_signature_verifies_over_v3_message_with_certified_key(self):
+        from cryptography.hazmat.primitives.serialization import load_ssh_public_key
+        with TempDir() as d:
+            key, cert, _ = self._certified_key(d)
+            token = get_token(key_path=key, cert_path=cert)
+            ts, nonce, sig_b64, _ = token.split(":")
+            pub = load_ssh_public_key(Path(key + ".pub").read_bytes())
+            pub.verify(base64.b64decode(sig_b64),
+                       _SIGN_PREFIX_V3 + f"{ts}:{nonce}".encode("ascii"))
+            with self.assertRaises(Exception):
+                pub.verify(base64.b64decode(sig_b64),
+                           _SIGN_PREFIX_V2 + f"{ts}:{nonce}".encode("ascii"))
+
+    def test_rsa_key_signature_verifies_over_v3_message(self):
+        from cryptography.hazmat.primitives.serialization import load_ssh_public_key
+        from cryptography.hazmat.primitives.asymmetric import padding as p
+        from cryptography.hazmat.primitives import hashes as h
+        with TempDir() as d:
+            key, cert, cert_b64 = self._certified_key(d, "rsa")
+            token = get_token(key_path=key, cert_path=cert)
+            self.assertTrue(TOKEN_V3_RE.match(token), token)
+            ts, nonce, sig_b64, cert_field = token.split(":")
+            self.assertEqual(cert_field, cert_b64)
+            pub = load_ssh_public_key(Path(key + ".pub").read_bytes())
+            pub.verify(base64.b64decode(sig_b64),
+                       _SIGN_PREFIX_V3 + f"{ts}:{nonce}".encode("ascii"),
+                       p.PKCS1v15(), h.SHA256())
+
+    def test_cert_path_with_version_1_raises_valueerror(self):
+        with TempDir() as d:
+            key, cert, _ = self._certified_key(d)
+            with self.assertRaises(ValueError):
+                get_token(key_path=key, cert_path=cert, version=1, challenge_dir=d.chaldir)
+            self.assertEqual(os.listdir(d.chaldir), [], "no nonce may be created")
+
+    def test_cert_path_with_challenge_cmd_raises_valueerror(self):
+        with TempDir() as d:
+            key, cert, _ = self._certified_key(d)
+            with self.assertRaises(ValueError):
+                get_token(key_path=key, cert_path=cert, challenge_cmd="echo x")
+
+    def test_plain_public_key_as_cert_is_refused(self):
+        with TempDir() as d:
+            key, cert, _ = self._certified_key(d)
+            with self.assertRaises(KeyError_):
+                get_token(key_path=key, cert_path=key + ".pub")
+            with self.assertRaises(KeyError_):
+                get_token(key_path=key, cert_path=d.key_path("missing-cert.pub"))
+
+    def test_unpadded_cert_field_is_refused(self):
+        # the server's decoder drops a final partial group, so refuse it here
+        with TempDir() as d:
+            key, cert, _ = self._certified_key(d)
+            ctype, b64, *rest = open(cert).read().split()
+            bad = d.key_path("unpadded-cert.pub")
+            with open(bad, "w") as f:
+                f.write(f"{ctype} {b64.rstrip('=')[:-1]}\n")
+            with self.assertRaises(KeyError_):
+                get_token(key_path=key, cert_path=bad)
+
+    @unittest.skipUnless(PG_SSHKEY_SIGN.exists(), "pg_sshkey_sign not built (run make)")
+    def test_token_is_identical_to_pg_sshkey_sign_cert(self):
+        """Same key, cert, timestamp and nonce: the Python token must equal
+        the C signer's, which tests/test_pam_module.c proves the module
+        accepts through libpam."""
+        with TempDir() as d:
+            key, cert, _ = self._certified_key(d)
+            r = subprocess.run([str(PG_SSHKEY_SIGN), "--cert", cert, "--at", str(self.TS),
+                                "--nonce", self.NONCE, key],
+                               capture_output=True, text=True, check=True)
+            expected = r.stdout.strip()
+            self.assertTrue(TOKEN_V3_RE.match(expected), expected)
+            with mock.patch("pam_pg_sshkey.time.time", return_value=self.TS), \
+                 mock.patch("pam_pg_sshkey.secrets.token_bytes",
+                            return_value=bytes.fromhex(self.NONCE)):
+                token = get_token(key_path=key, cert_path=cert)
+            self.assertEqual(token, expected)
+
+    @unittest.skipUnless(HAVE_PSYCOPG2, "psycopg2 not installed")
+    def test_connect_and_connect_replication_forward_cert_path(self):
+        with TempDir() as d:
+            key, cert, cert_b64 = self._certified_key(d)
+            with mock.patch("psycopg2.connect") as m:
+                pam_pg_sshkey.connect(key_path=key, cert_path=cert, user="alice")
+                pw = m.call_args.kwargs["password"]
+                self.assertTrue(TOKEN_V3_RE.match(pw), pw)
+                self.assertEqual(pw.split(":")[3], cert_b64)
+            with mock.patch("psycopg2.connect") as m:
+                connect_replication(key_path=key, cert_path=cert, user="replicator", host="pub")
+                pw = m.call_args.kwargs["password"]
+                self.assertTrue(TOKEN_V3_RE.match(pw), pw)
+                self.assertEqual(pw.split(":")[3], cert_b64)
+                self.assertEqual(m.call_args.kwargs["replication"], "database")
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────

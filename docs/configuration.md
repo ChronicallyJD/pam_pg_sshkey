@@ -63,10 +63,35 @@ stack is `pam_permit.so` because a database role need not be an OS account.
 | --- | --- | --- |
 | `authorized_keys_dir=<dir>` | `/etc/pg_sshkeys` | Keys are read from `<dir>/<username>/authorized_keys` |
 | `challenge_dir=<dir>` | `/var/run/pg_sshkey` | Where used nonces are recorded (and where v1 nonce files are read) |
+| `trusted_ca_keys=<file>` | unset | CA public keys that may certify user keys; unset refuses every certificate token |
 | `debug` | off | Log each step at `LOG_DEBUG` to the `authpriv` facility |
 
 Turn `debug` on only while diagnosing a problem; it logs the challenge of
 every attempt.
+
+### Certificates
+
+With `trusted_ca_keys` set, a user whose key is certified by one of the
+listed CAs authenticates without an `authorized_keys` file, the way sshd's
+`TrustedUserCAKeys` works. The recommended path is
+`/etc/pg_sshkeys/trusted_ca_keys`, owner `root:postgres`, mode `0640`:
+
+```text
+auth    required    pam_pg_sshkey.so \
+            authorized_keys_dir=/etc/pg_sshkeys \
+            challenge_dir=/var/run/pg_sshkey \
+            trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys
+```
+
+The file is in `authorized_keys` format, one `ssh-ed25519` or `ssh-rsa` CA
+public key per line; `pg_sshkey_addkey` does not manage it. The module
+refuses the file when `postgres` cannot read it or when group or others can
+write it, and logs
+`cannot read trusted_ca_keys PATH (permission denied, file must be owned root:postgres mode 0640, ...)`
+or `trusted_ca_keys PATH is world/group writable, refusing`. Certificates
+signed with the SHA-1 `ssh-rsa` algorithm, host certificates, and
+certificates carrying any critical option are refused; there is no
+revocation list. [Security](security.md#certificates) lists every check.
 
 ## Roles
 

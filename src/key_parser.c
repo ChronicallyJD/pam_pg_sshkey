@@ -188,6 +188,21 @@ decode_ed25519_key(const unsigned char *data, size_t len)
     return pkey; /* may be NULL if OpenSSL < 1.1.1 */
 }
 
+/* ── ssh_pubkey_from_blob ────────────────────────────────────────────── */
+EVP_PKEY *
+ssh_pubkey_from_blob(const unsigned char *blob, size_t len)
+{
+    const unsigned char *p = blob, *end = blob + len;
+    const unsigned char *ktype; size_t ktype_len;
+    if (!blob || read_string(&p, end, &ktype, &ktype_len) != 0)
+        return NULL;
+    if (ktype_len == 7 && memcmp(ktype, "ssh-rsa", 7) == 0)
+        return decode_rsa_key(blob, len);
+    if (ktype_len == 11 && memcmp(ktype, "ssh-ed25519", 11) == 0)
+        return decode_ed25519_key(blob, len);
+    return NULL;
+}
+
 /* ── parse_authorized_keys ───────────────────────────────────────────── */
 int
 parse_authorized_keys(const char *path, key_list_t **out)

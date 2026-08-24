@@ -9,7 +9,7 @@
 
 <a href="docs/installation.md"><img src="badges/postgresql.svg" alt="PostgreSQL 16 and 18 tested"></a>
 <a href="LICENSE"><img src="badges/license.svg" alt="License: MIT"></a>
-<a href="CHANGELOG.md"><img src="badges/version.svg" alt="Version 1.1.0"></a>
+<a href="CHANGELOG.md"><img src="badges/version.svg" alt="Version 1.2.0"></a>
 <a href="docs/security.md"><img src="badges/tokens.svg" alt="Tokens: single use, 60 seconds"></a>
 <a href="https://github.com/ChronicallyJD/pam_pg_sshkey/actions/workflows/test.yml"><img src="https://github.com/ChronicallyJD/pam_pg_sshkey/actions/workflows/test.yml/badge.svg" alt="CI status"></a>
 
@@ -25,7 +25,7 @@ the application, or in a connection string.
 
 It is written in C against libpam and OpenSSL, ships a Python module for
 applications and replication clients, and is licensed under the
-[MIT License](LICENSE). The current version is 1.1.0; see
+[MIT License](LICENSE). The current version is 1.2.0; see
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Why pam_pg_sshkey
@@ -42,6 +42,9 @@ applications and replication clients, and is licensed under the
   an `authorized_keys` file, and any libpq client works: `psql` through
   `pg_sshkey_connect`, psycopg2 through `pam_pg_sshkey.py`, or your own code
   with a 13-byte prefix and one signature.
+- **Certificates, no per-user files.** Point the module at a CA public key
+  and any key certified by `ssh-keygen -s` for that role name logs in, the
+  way sshd's `TrustedUserCAKeys` works.
 - **Proven, not promised.** Every release runs the production module through
   libpam exactly as PostgreSQL does, and logs real OS users in against
   PostgreSQL 18 on Ubuntu and PostgreSQL 16 on Rocky Linux. See
@@ -124,6 +127,7 @@ src/
     challenge_store.[ch]    nonce records and sweeping
     key_parser.[ch]         authorized_keys to EVP_PKEY
     sig_verify.[ch]         Ed25519 and RSA verification
+    ssh_cert.[ch]           OpenSSH certificate parsing and CA verification
     pg_sshkey_sign.c        client: issue and sign a token
     pg_sshkey_challenge.c   server: create a v1 nonce (legacy)
     pg_sshkey_connect       client: token, then psql

@@ -5,6 +5,62 @@ Notable changes to pam_pg_sshkey are recorded here. The format follows
 [Semantic Versioning](https://semver.org/). Each entry names the test that
 covers it; see [docs/testing.md](docs/testing.md).
 
+## [1.2.0] - 2026-08-24
+
+### Added
+
+- SSH certificate authentication. With `trusted_ca_keys=<file>` in
+  `/etc/pam.d/postgresql` (recommended `/etc/pg_sshkeys/trusted_ca_keys`,
+  `root:postgres` mode 0640, one `ssh-ed25519` or `ssh-rsa` CA public key
+  per line), a user whose key was certified with
+  `ssh-keygen -s <ca> -I <id> -n <role> -V <window>` authenticates without
+  an `authorized_keys` file, as sshd does with `TrustedUserCAKeys`. The
+  client sends a v3 token, `<unix_ts>:<nonce_hex>:<base64_sig>:<base64_cert>`,
+  signed over `"pg-sshkey-v3\0" || "<unix_ts>:<nonce_hex>"` by the certified
+  key; timestamp window, nonce recording, and replay refusal are as for v2.
+  The module refuses a certificate that is not a user certificate, is
+  outside its validity window, does not list the role name as a principal,
+  carries any critical option, is not signed by a listed CA, or has a CA
+  signature that does not verify or uses SHA-1 `ssh-rsa`; each refusal has
+  its own log line and no nonce is recorded. Certificate strings must be
+  printable ASCII, so a key id or option name cannot forge a log line, and
+  a token of 8192 bytes or more is refused before parsing. There is no revocation list.
+  Without the option every v3 token is refused, and v1 and v2 tokens are
+  unchanged. The module's token limit rises from 4096 to 8192 bytes.
+  `pg_sshkey_sign --cert <cert.pub>`, `pg_sshkey_connect --cert FILE`,
+  `pg_sshkey_query --cert FILE`, and `cert_path=` in `get_token`, `connect`,
+  and `connect_replication` produce the token; `<identity>-cert.pub` is
+  never picked up automatically.
+  Tests: `test_pam_module` (`test_cert_ed25519_authenticates_without_authorized_keys`,
+  `test_cert_refused_when_trusted_ca_keys_unset`,
+  `test_cert_from_untrusted_ca_refused`, `test_cert_expired_refused`,
+  `test_cert_not_yet_valid_refused`, `test_cert_wrong_principal_refused`,
+  `test_cert_without_principals_refused`, `test_host_cert_refused`,
+  `test_cert_with_critical_option_refused`, `test_cert_tampered_byte_refused`,
+  `test_cert_token_signed_by_other_key_refused`,
+  `test_cert_replay_and_timestamp_window`,
+  `test_cert_rsa_key_under_ed25519_ca`, `test_cert_ed25519_key_under_rsa_ca`,
+  `test_cert_group_writable_ca_file_refused`,
+  `test_oversized_token_refused_before_parsing`,
+  `test_cert_with_control_characters_refused`,
+  `test_v1_and_v2_still_pass_with_trusted_ca_keys_set`); `test_ssh_cert`
+  (five tests, including truncated blobs under AddressSanitizer);
+  `test_system` (`test_sign_cert_ed25519_prints_v3_token`,
+  `test_sign_cert_rsa_pem_prints_v3_token`, `test_sign_cert_missing_file_fails`,
+  `test_sign_cert_not_a_cert_fails`, `test_sign_cert_unpadded_field_fails`,
+  `test_sign_cert_signature_covers_v3_prefix`);
+  `test_python_module` (`test_token_has_four_fields_and_cert_is_the_file_base64`,
+  `test_signature_verifies_over_v3_message_with_certified_key`,
+  `test_token_is_identical_to_pg_sshkey_sign_cert`,
+  `test_cert_path_with_version_1_raises_valueerror`,
+  `test_connect_and_connect_replication_forward_cert_path`,
+  `test_unpadded_cert_field_is_refused`, and four more);
+  `test_pg_sshkey_query` (`TestCertOption`,
+  `test_cert_with_v1_is_refused_before_minting_a_nonce`); e2e `cert_connect_as_carol`,
+  `cert_python_connect`, `cert_pg_sshkey_query`, `cert_untrusted_ca_rejected`,
+  `cert_expired_rejected`, `cert_wrong_principal_rejected`,
+  `cert_replay_rejected`, `cert_alice_key_without_cert_still_works`.
+
 ## [1.1.0] - 2026-08-21
 
 ### Changed

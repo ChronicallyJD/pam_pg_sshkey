@@ -86,6 +86,55 @@ pg_sshkey_query -h dbserver -U alice -q 'SELECT now()' mydb
 `pg_sshkey_query` uses psycopg2 and prints the rows. It takes the same
 connection options as `pg_sshkey_connect`.
 
+## Connecting with a certificate
+
+A key certified by a trusted certificate authority needs no `authorized_keys`
+file on the server. The server administrator creates the CA once and
+installs its public key; each user's key is then signed by the CA with the
+role name as the principal. This is the same certificate format sshd
+accepts with `TrustedUserCAKeys`.
+
+Create the CA, on a machine you control and not on the database server:
+
+```sh
+ssh-keygen -t ed25519 -f ca_key -N '' -C 'pg CA'
+```
+
+Sign a user's public key. `-I` is a key id that appears in the server log,
+`-n` is the principal, which must equal the PostgreSQL role name, and `-V`
+is the validity window:
+
+```sh
+ssh-keygen -s ca_key -I alice-laptop -n alice -V +52w ~alice/.ssh/id_ed25519.pub
+```
+
+This writes `~alice/.ssh/id_ed25519-cert.pub`. Install the CA public key on
+the database server and name it in `/etc/pam.d/postgresql`
+([Configuration](configuration.md#certificates)):
+
+```sh
+sudo install -o root -g postgres -m 0640 ca_key.pub /etc/pg_sshkeys/trusted_ca_keys
+```
+
+Connect with `--cert`; the private key is still `-i` or the default
+`~/.ssh/id_ed25519`, and there is no automatic lookup of `<identity>-cert.pub`:
+
+```sh
+pg_sshkey_connect --cert ~/.ssh/id_ed25519-cert.pub -h dbserver -U alice mydb
+pg_sshkey_query --cert ~/.ssh/id_ed25519-cert.pub -h dbserver -U alice -q 'SELECT 1' mydb
+```
+
+The server log shows `user 'alice' authenticated with certificate
+'alice-laptop' serial 0`. The certificate must list the role name among its
+principals, be within its validity window, be a user certificate, and carry
+no critical options (`-O source-address=...` or `-O force-command=...` are
+refused). There is no revocation list: to withdraw a certificate before it
+expires, replace the CA key or wait for the window to close, so keep windows
+short. RSA user keys and RSA CAs work; a CA signature made with the SHA-1
+`ssh-rsa` algorithm (`ssh-keygen -t ssh-rsa` when signing) is refused. A
+certificate token is about 770 characters for Ed25519 and about 1660 for a
+3072-bit RSA key.
+
 ## Tokens
 
 A token is valid for one use and for 60 seconds either side of the server's

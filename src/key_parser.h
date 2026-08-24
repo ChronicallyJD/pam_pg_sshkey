@@ -46,6 +46,12 @@ int parse_authorized_keys(const char *path, key_list_t **out);
 void free_key_list(key_list_t *list);
 
 /*
+ * Decode an SSH public key blob (string type || fields) into an EVP_PKEY.
+ * Accepts "ssh-rsa" and "ssh-ed25519" blobs.  Returns NULL on error.
+ */
+EVP_PKEY *ssh_pubkey_from_blob(const unsigned char *blob, size_t len);
+
+/*
  * Decode a base64 string into bytes.
  * Returns 0 on success, -1 on error.
  */

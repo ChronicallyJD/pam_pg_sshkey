@@ -23,6 +23,33 @@ token format in [Reference](reference.md#token-formats).
 - Client and server clocks must agree to within 60 seconds. A client further
   adrift is refused, never accepted with a stale timestamp.
 
+## Certificates
+
+With `trusted_ca_keys` set, the module also trusts any key certified by one
+of the listed CA public keys, so the CA private key is the secret that
+matters: whoever holds it can mint a certificate for any role name. Keep it
+off the database server and sign with short validity windows. A v3 token
+carries the certificate and a signature by the certified key over the same
+timestamped nonce as v2, so the replay and clock rules above apply
+unchanged. A token of 8192 bytes or more is refused before parsing. Before
+it accepts the certificate the module checks, in order, that the blob parses
+(every string in it must be printable ASCII, so that a key id or option name
+chosen by the client cannot put a newline, and with it a forged line, into
+the log), that it is a user certificate (type 1), that the
+current time is inside `valid_after` to `valid_before`, that the principal
+list is non-empty and contains the role name exactly, that there are no
+critical options, that the signing key equals one of the trusted CA keys,
+and that the CA signature verifies over the certificate body with
+`ssh-ed25519`, `rsa-sha2-256`, or `rsa-sha2-512`. Only then does it verify
+the token signature with the certified key and record the nonce. What it
+does not do: there is no revocation list (no KRL and no `RevokedKeys`), so a
+leaked certified key stays valid until `valid_before`; `source-address`,
+`force-command`, and every other critical option are refused rather than
+enforced; host certificates are refused; CA signatures made with the SHA-1
+`ssh-rsa` algorithm are refused; and there is no principals file, so the
+principal must be the role name itself. The CA file is subject to the same
+ownership and mode rules as `authorized_keys`.
+
 ## What the module does not do
 
 - It does not encrypt the connection. The token is the PostgreSQL password
@@ -46,6 +73,7 @@ token format in [Reference](reference.md#token-formats).
 | `/etc/pg_sshkeys/` | `root:postgres` | `0750` | Only root writes keys; `postgres` reads them |
 | `/etc/pg_sshkeys/<user>/` | `root:postgres` | `0750` | Per-user directory |
 | `/etc/pg_sshkeys/<user>/authorized_keys` | `root:postgres` | `0640` | The module refuses files writable by group or others, and files it cannot read |
+| `/etc/pg_sshkeys/trusted_ca_keys` | `root:postgres` | `0640` | CA public keys; the same refusal rules as `authorized_keys` apply |
 | `/var/run/pg_sshkey/` | `postgres:postgres` | `1733` installed; `0700` recommended once only v2 clients remain | Nonce records |
 | `/var/run/pg_sshkey/<nonce>` | `postgres` | `0600` | Written by the module on first use |
 
@@ -73,6 +101,8 @@ and change the tmpfiles.d rule in `/usr/lib/tmpfiles.d/pg_sshkey.conf` to
 - `authorized_keys` files `root:postgres 0640`, managed by `pg_sshkey_addkey`
   or by configuration management.
 - `/var/run/pg_sshkey` owned by `postgres`; `0700` when v1 is no longer used.
+- `trusted_ca_keys` set only when certificates are in use; the CA private
+  key kept off the database server; certificate windows of weeks, not years.
 - `debug` off in `/etc/pam.d/postgresql` outside of diagnosis.
 - Ed25519 keys, or RSA keys of at least 3072 bits.
 - Replication roles with `REPLICATION` and the `SELECT` grants they need,

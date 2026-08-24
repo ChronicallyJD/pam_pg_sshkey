@@ -38,6 +38,7 @@ summary() {
 as_user() { local u=$1; shift; runuser -l "$u" -c "$*"; }
 as_alice() { as_user alice "$@"; }
 as_bob()   { as_user bob   "$@"; }
+as_carol() { as_user carol "$@"; }
 
 # ── journald (pam_syslog output) ─────────────────────────────────────────────
 journal_mark()  { journalctl --show-cursor -n0 -q 2>/dev/null | sed -n 's/^-- cursor: *//p'; }

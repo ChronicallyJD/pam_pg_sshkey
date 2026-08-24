@@ -113,8 +113,12 @@ except ImportError as e:
 # Domain-separation prefixes, must match the PAM module exactly
 _SIGN_PREFIX: bytes = b"pg-sshkey-v1\x00"        # v1: server-issued nonce file
 _SIGN_PREFIX_V2: bytes = b"pg-sshkey-v2\x00"     # v2: client-issued challenge
+_SIGN_PREFIX_V3: bytes = b"pg-sshkey-v3\x00"     # v3: certificate, client-issued challenge
 
 # Token versions:
+#   3 (cert_path) "<unix_ts>:<nonce_hex>:<sig>:<cert_b64>", message = PREFIX_V3 +
+#                "<ts>:<nonce_hex>", signed by the private key whose public key
+#                the OpenSSH certificate carries.  Chosen by passing cert_path.
 #   2 (default)  "<unix_ts>:<nonce_hex>:<sig>", message = PREFIX_V2 + "<ts>:<nonce_hex>".
 #                The client picks timestamp and nonce; nothing is created on the
 #                server beforehand; works from any host.  The server accepts
@@ -334,6 +338,30 @@ def _load_private_key(
     return key
 
 
+# ── Certificate loading ───────────────────────────────────────────────────────
+
+def _load_cert_b64(cert_path: str) -> str:
+    """
+    Return the base64 field of an OpenSSH certificate file (`*-cert.pub`),
+    unchanged.  The first field must end in "-cert-v01@openssh.com"; a plain
+    public key or a missing file raises KeyError_.
+    """
+    path = Path(cert_path).expanduser()
+    try:
+        fields = path.read_text().split()
+    except OSError as e:
+        raise KeyError_(f"Cannot read certificate {cert_path}: {e}") from e
+    if len(fields) < 2 or not fields[0].endswith("-cert-v01@openssh.com"):
+        raise KeyError_(
+            f"{cert_path} is not an OpenSSH certificate (expected a "
+            f"'*-cert-v01@openssh.com' first field, as ssh-keygen -s writes)"
+        )
+    b64 = fields[1]
+    if len(b64) % 4 != 0 or not re.fullmatch(r"[A-Za-z0-9+/]+=*", b64):
+        raise KeyError_(f"{cert_path}: certificate field is not padded base64")
+    return b64
+
+
 # ── Signing ───────────────────────────────────────────────────────────────────
 
 def _sign_message(key: Ed25519PrivateKey | RSAPrivateKey, message: bytes) -> bytes:
@@ -368,6 +396,7 @@ def get_token(
     passphrase: bytes | None = DEFAULT_KEY_PASSPHRASE,
     challenge_cmd: str | Sequence[str] | None = None,
     version: int = DEFAULT_TOKEN_VERSION,
+    cert_path: str | None = None,
 ) -> str:
     """
     Generate a signed authentication token for pam_pg_sshkey.
@@ -399,6 +428,12 @@ def get_token(
                         step, works from any host.  1: legacy server nonce
                         (challenge_dir / challenge_cmd).
 
+        cert_path:      OpenSSH certificate for the key (`*-cert.pub` from
+                        `ssh-keygen -s`).  Produces a v3 token that the server
+                        accepts without an authorized_keys entry when its
+                        trusted_ca_keys file lists the signing CA.  Cannot be
+                        combined with version=1 or challenge_cmd (ValueError).
+
     Raises:
         ChallengeError: if the challenge directory is missing or unwritable.
         KeyError_:      if the key cannot be loaded or signing fails.
@@ -406,10 +441,24 @@ def get_token(
     # 1. Load the private key first (fail fast before creating a nonce)
     key = _load_private_key(key_path, passphrase)
 
-    if challenge_cmd is not None:
+    if cert_path is not None:
+        if challenge_cmd is not None or version not in (2, 3):
+            raise ValueError(
+                "cert_path produces a v3 token; it cannot be combined with "
+                "version=1 or challenge_cmd"
+            )
+        version = 3
+    elif challenge_cmd is not None:
         version = 1                      # a server-minted nonce is v1 by definition
-    if version not in (1, 2):
-        raise ValueError(f"unsupported token version {version!r} (1 or 2)")
+    elif version not in (1, 2):
+        raise ValueError(f"unsupported token version {version!r} (1 or 2; 3 needs cert_path)")
+
+    if version == 3:
+        # v3: like v2, plus the certificate; signed with the certified key.
+        cert_b64 = _load_cert_b64(cert_path)
+        head = f"{int(time.time())}:{secrets.token_bytes(32).hex()}"
+        sig = _sign_message(key, _SIGN_PREFIX_V3 + head.encode("ascii"))
+        return f"{head}:{base64.b64encode(sig).decode('ascii')}:{cert_b64}"
 
     if version == 2:
         # v2: issue our own challenge.  Nothing touches the filesystem.
@@ -435,6 +484,7 @@ def connect(
     passphrase: bytes | None = DEFAULT_KEY_PASSPHRASE,
     challenge_cmd: str | Sequence[str] | None = None,
     version: int = DEFAULT_TOKEN_VERSION,
+    cert_path: str | None = None,
     **psycopg2_kwargs: Any,
 ) -> Any:
     """
@@ -449,6 +499,7 @@ def connect(
         challenge_dir:    Challenge nonce directory.
         passphrase:       Key passphrase (bytes) or None.
         challenge_cmd:    See get_token(); required when host= is another machine.
+        cert_path:        OpenSSH certificate for the key; see get_token().
         **psycopg2_kwargs: Passed directly to psycopg2.connect().
                            Do NOT include password=, it is set by this function.
 
@@ -482,6 +533,7 @@ def connect(
         passphrase=passphrase,
         challenge_cmd=challenge_cmd,
         version=version,
+        cert_path=cert_path,
     )
 
     return psycopg2.connect(password=token, **psycopg2_kwargs)
@@ -494,6 +546,7 @@ def connect_replication(
     replication: str | bool = "database",
     challenge_cmd: str | Sequence[str] | None = None,
     version: int = DEFAULT_TOKEN_VERSION,
+    cert_path: str | None = None,
     **psycopg2_kwargs: Any,
 ) -> Any:
     """
@@ -528,6 +581,7 @@ def connect_replication(
         challenge_cmd:       See get_token().  A subscriber on another host
                              MUST pass this, e.g.
                              "ssh publisher pg_sshkey_challenge /var/run/pg_sshkey".
+        cert_path:           OpenSSH certificate for the key; see get_token().
         **psycopg2_kwargs:   Passed to psycopg2.connect() (user, host, dbname, etc.).
 
     Returns:
@@ -578,6 +632,7 @@ def connect_replication(
         passphrase=passphrase,
         challenge_cmd=challenge_cmd,
         version=version,
+        cert_path=cert_path,
     )
 
     # libpq accepts replication=true/on/yes/1 for a physical (walsender)

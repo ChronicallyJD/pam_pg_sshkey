@@ -19,6 +19,8 @@
 #   -p, --port PORT         PostgreSQL port (default: 5432)
 #   -d, --dbname DBNAME     Database name (default: username)
 #   -i, --identity FILE     SSH private key file (default: ~/.ssh/id_ed25519)
+#       --cert FILE         OpenSSH user certificate (*-cert.pub) for the key;
+#                           produces a v3 token, no authorized_keys needed
 #       --v1                Legacy token: needs a server-side nonce (see below)
 #   -c, --challenge-dir DIR (v1) Challenge directory (default: /var/run/pg_sshkey)
 #       --challenge-cmd CMD (v1) Shell command that mints the nonce ON THE SERVER
@@ -46,6 +48,7 @@ PG_HOST=""
 PG_PORT=""
 PG_DBNAME=""
 SSH_KEY="${HOME}/.ssh/id_ed25519"
+CERT_FILE=""
 CHALLENGE_DIR="/var/run/pg_sshkey"
 CHALLENGE_CMD=""
 TOKEN_V1=0
@@ -67,6 +70,9 @@ Options:
   -p, --port PORT         PostgreSQL port            (default: 5432)
   -d, --dbname DBNAME     Database name              (default: username)
   -i, --identity FILE     SSH private key            (default: ~/.ssh/id_ed25519)
+      --cert FILE         OpenSSH user certificate for the key (*-cert.pub).
+                          Sends a v3 token; the server checks it against
+                          trusted_ca_keys instead of authorized_keys.
       --v1                Legacy token format (server-issued nonce). The options
                           below apply to --v1 only:
   -c, --challenge-dir DIR Challenge nonce directory  (default: /var/run/pg_sshkey)
@@ -100,6 +106,7 @@ while [[ $# -gt 0 ]]; do
         -p|--port)        PG_PORT="$2";       shift 2 ;;
         -d|--dbname)      PG_DBNAME="$2";     shift 2 ;;
         -i|--identity)    SSH_KEY="$2";       shift 2 ;;
+        --cert)           CERT_FILE="$2";     shift 2 ;;
         -c|--challenge-dir) CHALLENGE_DIR="$2"; shift 2 ;;
         --challenge-cmd)  CHALLENGE_CMD="$2";  shift 2 ;;
         --v1)             TOKEN_V1=1;          shift ;;
@@ -134,6 +141,7 @@ die() { echo "pg_sshkey_connect: error: $*" >&2; exit 1; }
 
 # --challenge-cmd implies the legacy flow
 [[ -n "$CHALLENGE_CMD" ]] && TOKEN_V1=1
+[[ -n "$CERT_FILE" && "$TOKEN_V1" -eq 1 ]] && die "--cert cannot be combined with --v1 or --challenge-cmd."
 
 # Locate binaries (pg_sshkey_challenge is only needed for a local v1 nonce)
 if [[ "$TOKEN_V1" -eq 1 && -z "$CHALLENGE_CMD" ]] && ! command -v "$CHAL_BIN" &>/dev/null; then
@@ -158,6 +166,7 @@ fi
 [[ -f "$SSH_KEY" ]] || die "SSH key not found: $SSH_KEY
 Use -i to specify the key path, or generate one with:
   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519"
+[[ -n "$CERT_FILE" && ! -f "$CERT_FILE" ]] && die "Certificate not found: $CERT_FILE"
 
 log "username:      $PG_USER"
 log "database:      $PG_DBNAME"
@@ -195,6 +204,17 @@ Check that $CHALLENGE_DIR exists and is writable:
         die "Signing failed. Output was: $TOKEN"
     TOKEN="${TOKEN%$'\n'}"
     if ! [[ "$TOKEN" =~ ^[0-9a-f]{64}:[A-Za-z0-9+/]+=*$ ]]; then
+        die "Malformed token from pg_sshkey_sign: '$TOKEN'"
+    fi
+elif [[ -n "$CERT_FILE" ]]; then
+    # ── v3: like v2, plus the certificate that vouches for the key ─────────
+    log "token:         v3 (certificate)"
+    log "cert:          $CERT_FILE"
+    log "signing with $SSH_KEY..."
+    TOKEN=$("$SIGN_BIN" --cert "$CERT_FILE" "$SSH_KEY" 2>&1) || \
+        die "Signing failed. Output was: $TOKEN"
+    TOKEN="${TOKEN%$'\n'}"
+    if ! [[ "$TOKEN" =~ ^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]+=*:[A-Za-z0-9+/]+=*$ ]]; then
         die "Malformed token from pg_sshkey_sign: '$TOKEN'"
     fi
 else

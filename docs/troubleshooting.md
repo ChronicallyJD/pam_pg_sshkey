@@ -49,6 +49,10 @@ of an attempt. Remove it afterwards.
 | `pg_sshkey_sign`: `The ssh-agent refused to sign with this key` | The identity is not in the agent; the message lists what the agent holds | `ssh-add <private key>` |
 | `pg_sshkey_sign`: `The ssh-agent signed with 'ssh-rsa'` | An agent older than OpenSSH 7.2 signing an RSA key with SHA-1 | Use a newer agent, or sign from a PEM key file |
 | `pg_sshkey_sign`: `... is not an OpenSSH public key line` | `--agent` was given the private key | Pass the `.pub` file |
+| `pg_sshkey_sign`: `returned a signature that does not verify` | The agent holds a different key under that name | Check `ssh-add -l` against the `.pub` file you named |
+| `pg_sshkey_sign`: `The ssh-agent returned an empty signature` | The agent answered with no signature bytes | Check the agent; try `ssh-add -l` and re-add the key |
+| `pg_sshkey_sign`: `ssh-agent: timed out waiting for a reply` | The agent did not answer within 60 seconds | Confirm any `ssh-add -c` prompt, or raise `PG_SSHKEY_AGENT_TIMEOUT_MS` |
+| Either client: `--agent replaces -i/--identity` | Both were given | Pass only `--agent` |
 | Python: `KeyError_: ... Need bcrypt module` | Passphrase-protected OpenSSH key without `bcrypt` installed | `pip install bcrypt`, or export the key to unencrypted PEM |
 | Python: `ImportError: dynamic module does not define module export function` | `import pam_pg_sshkey` ran with the repository root as working directory, so `pam_pg_sshkey.so` was found first | Run from another directory, or install the Python file where the `.so` is not |
 

@@ -22,14 +22,24 @@ covers it; see [docs/testing.md](docs/testing.md).
   SHA-1 `ssh-rsa` algorithm is refused, as are `sk-` FIDO keys, whose
   signature carries authenticator fields the module does not verify. The
   server is unchanged: an agent signature is an ordinary v2 or v3 token.
-  Tests: `test_pam_module` (six tests against a real `ssh-agent`, including
+  The client verifies the agent's answer against the public key it was given
+  before printing a token, refuses an empty signature, waits at most 60
+  seconds for the agent, survives an agent that closes the socket mid
+  exchange, and replaces any byte outside printable ASCII in agent-supplied
+  text before printing it, so a forwarded agent cannot repaint the terminal.
+  `-i` together with `--agent` is refused rather than silently ignored.
+  Tests: `test_ssh_agent` (six tests driving a hostile agent under
+  AddressSanitizer: the timeout, oversize and truncated replies, an empty
+  signature, a wrong algorithm name on a valid signature, a signature by
+  another key, and a refusal followed by a close);
+  `test_pam_module` (six tests against a real `ssh-agent`, including
   an Ed25519 key deleted from disk after `ssh-add` and a
   passphrase-protected key that no other route can use),
   `test_system` (`test_agent_without_auth_sock_fails`,
   `test_agent_security_key_type_refused`,
   `test_agent_rejects_private_key_and_stray_positional`),
   `test_python_module` (`TestAgentSigning`, `TestAgentErrors`, 15 tests),
-  `test_pg_sshkey_query` (four forwarding tests); e2e
+  `test_pg_sshkey_query` (five forwarding and refusal tests); e2e
   `agent_connect_as_alice`, `agent_passphrase_key_connects`,
   `agent_rsa_key_connects`, `agent_certificate_connects`,
   `agent_query_and_python_connect`, `agent_absent_is_a_clean_error`.

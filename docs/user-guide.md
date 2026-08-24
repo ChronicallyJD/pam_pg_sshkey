@@ -89,10 +89,13 @@ connection options as `pg_sshkey_connect`.
 ## Connecting through an ssh-agent
 
 `--agent` signs with a key held by the ssh-agent at `$SSH_AUTH_SOCK` instead
-of reading a private key file. This is the only way to use a
-passphrase-protected key or an OpenSSH-format RSA key, and it works over a
-forwarded agent, so the key can stay on your laptop while you connect from a
-jump host.
+of reading a private key file. It is the only way for the C tools to use a
+passphrase-protected key or an OpenSSH-format RSA key (the Python module can
+also take a passphrase, and `openssl pkey` can convert a key), and it works
+over a forwarded agent, so the key can stay on your laptop while you connect
+from a jump host. Anyone who can reach the forwarded socket on the jump host
+can have your agent mint database tokens; forwarding is not in the tested
+matrix.
 
 Add the key to the agent, then name its public key:
 

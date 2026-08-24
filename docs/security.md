@@ -64,6 +64,9 @@ ownership and mode rules as `authorized_keys`.
 - It does not hold your private key. With `--agent` the key stays in the
   ssh-agent and the client only receives a signature, so the key can be
   passphrase-protected or on another machine behind a forwarded agent.
+  Forwarding moves the trust: anyone who can reach the forwarded socket on
+  the intermediate host can have the agent sign a database token for as long
+  as the socket lives, and the tested matrix covers only a local agent.
   Without `--agent` the C tools read an unencrypted private key file and the
   Python module accepts a passphrase. FIDO security keys (`sk-`) are not
   supported by either route.

@@ -100,6 +100,7 @@ from typing import Any, Sequence
 try:
     from cryptography.hazmat.primitives.serialization import (
         load_ssh_private_key,
+        load_ssh_public_key,
         load_pem_private_key,
     )
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -157,10 +158,38 @@ _SSH_AGENT_SIGN_RESPONSE: int = 14
 # which the PAM module refuses.
 _SSH_AGENT_RSA_SHA2_256: int = 2
 _AGENT_MAX_MSG: int = 256 * 1024
+# How long to wait on the agent socket.  An agent that asks a human (ssh-add -c
+# confirmation, a smartcard PIN) is healthy and slow, so the wait is generous.
+# PG_SSHKEY_AGENT_TIMEOUT_MS overrides it, spelled as src/ssh_agent.c reads it.
+_AGENT_TIMEOUT_SECS: float = 60
 
-# Sentinel: tells "key_path was not passed" apart from an explicit value,
-# so agent_pubkey= can refuse an explicit key_path.
-_UNSET: Any = object()
+
+def _agent_timeout_secs(env: dict[str, str] | None = None) -> float:
+    """Seconds to wait on the agent socket: PG_SSHKEY_AGENT_TIMEOUT_MS if it
+    holds a positive integer, else _AGENT_TIMEOUT_SECS."""
+    raw = (os.environ if env is None else env).get("PG_SSHKEY_AGENT_TIMEOUT_MS")
+    if raw:
+        try:
+            ms = int(raw)
+        except ValueError:
+            return _AGENT_TIMEOUT_SECS
+        if ms > 0:
+            return ms / 1000.0
+    return _AGENT_TIMEOUT_SECS
+
+
+class _UnsetKeyPath:
+    """Sentinel: tells "key_path was not passed" apart from an explicit value,
+    so agent_pubkey= can refuse an explicit key_path.  It prints as the default
+    it stands for, so help() and inspect.signature() read correctly."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return repr(DEFAULT_KEY_PATH)
+
+
+_UNSET: Any = _UnsetKeyPath()
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
@@ -397,13 +426,16 @@ def _agent_pubkey_blob(pubkey_path: str) -> bytes:
         raise KeyError_(f"Cannot read public key {pubkey_path}: {e}") from e
     lines = text.splitlines()
     fields = lines[0].split() if lines else []
-    if len(fields) < 2:
+    # A field that is not padded base64 means the line is not a public key at
+    # all, most often a private key passed by mistake.  src/ssh_agent.c folds
+    # the length check into the same branch and says the same sentence.
+    if len(fields) < 2 or len(fields[1]) % 4 != 0:
         raise KeyError_(
             f"{pubkey_path} is not an OpenSSH public key line "
             f"(expected '<type> <base64> [comment]', as ssh-keygen -y writes)"
         )
     b64 = fields[1]
-    if len(b64) % 4 != 0 or not re.fullmatch(r"[A-Za-z0-9+/]+=*", b64):
+    if not re.fullmatch(r"[A-Za-z0-9+/]+=*", b64):
         raise KeyError_(f"{pubkey_path}: key field is not base64")
     try:
         return base64.b64decode(b64, validate=True)
@@ -433,7 +465,7 @@ def _agent_connect() -> socket.socket:
         )
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        s.settimeout(10)
+        s.settimeout(_agent_timeout_secs())
         s.connect(sock_path)
     except OSError as e:
         s.close()
@@ -529,7 +561,44 @@ def _agent_sign(agent_pubkey: str, message: bytes) -> bytes:
             f"The ssh-agent signed with '{algo_str}', which the server does "
             f"not verify.  Use an ed25519 or rsa key."
         )
+    if not sig:
+        raise KeyError_(
+            f"The ssh-agent returned an empty signature for the key in "
+            f"{agent_pubkey}."
+        )
+    # Verify with the public key the caller named.  The agent can return
+    # anything, and a forwarded socket is served by another host; without this
+    # a wrong signature only surfaces as "authentication failed" on the server,
+    # with nothing to go on.  A certificate blob is skipped: the key inside the
+    # certificate is not this blob.
+    if not key_type.endswith(b"-cert-v01@openssh.com"):
+        _agent_verify(agent_pubkey, key_type, blob, message, sig, is_rsa)
     return sig
+
+
+def _agent_verify(agent_pubkey: str, key_type: bytes, blob: bytes,
+                  message: bytes, sig: bytes, is_rsa: bool) -> None:
+    """Check the agent's signature against the public key in agent_pubkey.
+    Raises KeyError_ when it does not verify."""
+    line = key_type + b" " + base64.b64encode(blob)
+    try:
+        pub = load_ssh_public_key(line)
+    except (ValueError, UnsupportedAlgorithm) as e:
+        raise KeyError_(
+            f"Cannot read the public key in {agent_pubkey} to check the "
+            f"signature the ssh-agent returned: {e}"
+        ) from e
+    try:
+        if is_rsa:
+            pub.verify(sig, message, asym_padding.PKCS1v15(), hashes.SHA256())
+        else:
+            pub.verify(sig, message)
+    except (InvalidSignature, TypeError, ValueError) as e:
+        raise KeyError_(
+            f"The ssh-agent returned a signature that does not verify with "
+            f"the public key in {agent_pubkey}.  The agent may hold a "
+            f"different key under that name."
+        ) from e
 
 
 # ── Signing ───────────────────────────────────────────────────────────────────
@@ -582,8 +651,9 @@ def get_token(
     Args:
         key_path:      Path to the SSH private key file.
                        Supports OpenSSH format, PKCS#8 PEM, and traditional PEM.
-                       Defaults to ~/.ssh/id_ed25519.  Ignored, and rejected if
-                       passed, when agent_pubkey is set.
+                       Defaults to ~/.ssh/id_ed25519.  With agent_pubkey set,
+                       a path is rejected (ValueError) and None means
+                       "not specified", so a wrapper may forward it.
         challenge_dir: Directory where nonce files are stored.
                        Must be writable and exist with mode 1733.
         passphrase:    Passphrase for encrypted keys, as bytes.
@@ -611,9 +681,12 @@ def get_token(
                         ssh-agent at $SSH_AUTH_SOCK holds.  The token is signed
                         through the agent and the private key is never read, so
                         passphrase-protected keys and forwarded agents work.
-                        Cannot be combined with key_path, version=1, or
-                        challenge_cmd (ValueError).  Works with cert_path (v3).
-                        FIDO/security keys (`sk-*`) are refused.
+                        Cannot be combined with key_path, passphrase,
+                        version=1, or challenge_cmd (ValueError).  Works with
+                        cert_path (v3).  FIDO/security keys (`sk-*`) are
+                        refused.  The signature the agent returns is verified
+                        against this public key before it becomes a token,
+                        except when the file holds a certificate.
 
     Raises:
         ChallengeError: if the challenge directory is missing or unwritable.
@@ -621,10 +694,15 @@ def get_token(
                         reached or refuses, or signing fails.
     """
     if agent_pubkey is not None:
-        if key_path is not _UNSET:
+        if key_path is not _UNSET and key_path is not None:
             raise ValueError(
                 "agent_pubkey takes the PUBLIC key file and signs through the "
                 "ssh-agent; do not also pass key_path"
+            )
+        if passphrase is not None:
+            raise ValueError(
+                "agent_pubkey signs through the ssh-agent, which holds the "
+                "unlocked key; a passphrase has nothing to unlock here"
             )
         if version == 1 or challenge_cmd is not None:
             raise ValueError(

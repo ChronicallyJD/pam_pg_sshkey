@@ -348,8 +348,9 @@ make_token_agent(const env_t *e, const char *name, const char *extra,
 {
     char key[PATH_MAX], cmd[PATH_MAX * 3];
     key_path(e, name, key, sizeof(key));
+    /* stderr is kept: a missing token must say why, not just fail */
     snprintf(cmd, sizeof(cmd),
-             "SSH_AUTH_SOCK='%s' '%s' --agent '%s.pub' %s 2>/dev/null",
+             "SSH_AUTH_SOCK='%s' '%s' --agent '%s.pub' %s 2>&1",
              sock_override ? sock_override : e->agent_sock,
              g_sign_bin, key, extra ? extra : "");
     return run_capture(cmd, tok, tok_sz);
@@ -1197,12 +1198,17 @@ test_agent_absent_or_keyless_produces_no_token(void)
     ASSERT_EQ(install_pubkey(&e, "alice", "id_ed25519", NULL, 0), 0);
 
     char tok[8192], sock[PATH_MAX];
+    /* each case must fail for its own reason, not merely fail */
     ASSERT_NE(make_token_agent(&e, "id_ed25519", NULL, "", tok, sizeof(tok)), 0);
+    ASSERT_TRUE(strstr(tok, "SSH_AUTH_SOCK is not set") != NULL);
+
     snprintf(sock, sizeof(sock), "%s/no-such.sock", e.root);
     ASSERT_NE(make_token_agent(&e, "id_ed25519", NULL, sock, tok, sizeof(tok)), 0);
+    ASSERT_TRUE(strstr(tok, "Cannot connect to the ssh-agent") != NULL);
 
     ASSERT_EQ(agent_start(&e), 0);            /* running, but empty */
     ASSERT_NE(make_token_agent(&e, "id_ed25519", NULL, NULL, tok, sizeof(tok)), 0);
+    ASSERT_TRUE(strstr(tok, "refused to sign") != NULL);
     env_teardown(&e);
 }
 

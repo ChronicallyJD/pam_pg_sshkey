@@ -55,7 +55,7 @@ PAM_SRCS := $S/pam_pg_sshkey.c $S/challenge_store.c \
             $S/key_parser.c    $S/sig_verify.c $S/ssh_cert.c
 PAM_OBJS := $(PAM_SRCS:.c=.o)
 
-TEST_BINS := $T/test_challenge_store $T/test_key_parser \
+TEST_BINS := $T/test_challenge_store $T/test_key_parser $T/test_ssh_agent \
              $T/test_sig_verify      $T/test_ssh_cert    \
              $T/test_integration     $T/test_system      \
              $T/test_pam_module
@@ -88,8 +88,8 @@ pam_pg_sshkey.so: $(PAM_OBJS)
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $^ $(CRYPTO_LIBS) -lpam
 
 # ── Standalone binaries (compiled directly from .c, no intermediate .o) ────
-pg_sshkey_sign: $S/pg_sshkey_sign.c $S/ssh_agent.c
-	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -o $@ $^ $(CRYPTO_LIBS)
+pg_sshkey_sign: $S/pg_sshkey_sign.c $S/ssh_agent.c $S/key_parser.c
+	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -I$S -o $@ $^ $(CRYPTO_LIBS)
 
 pg_sshkey_challenge: $S/pg_sshkey_challenge.c $S/challenge_store.c
 	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -o $@ $^ $(CRYPTO_LIBS)
@@ -109,6 +109,9 @@ $T/test_sig_verify: $T/test_sig_verify.c $S/sig_verify.c $S/key_parser.c
 	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
 
 $T/test_ssh_cert: $T/test_ssh_cert.c $S/ssh_cert.c $S/key_parser.c
+	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
+
+$T/test_ssh_agent: $T/test_ssh_agent.c $S/ssh_agent.c $S/key_parser.c
 	$(CC) $(TFLAGS) -o $@ $^ $(TLIBS)
 
 $T/test_integration: $T/test_integration.c \
@@ -136,6 +139,8 @@ test check: all $(TEST_BINS)
 	@echo "=== test_key_parser ===";      $T/test_key_parser
 	@echo ""
 	@echo "=== test_sig_verify ===";      $T/test_sig_verify
+	@echo ""
+	@echo "=== test_ssh_agent ===";       $T/test_ssh_agent
 	@echo ""
 	@echo "=== test_ssh_cert ===";        $T/test_ssh_cert
 	@echo ""

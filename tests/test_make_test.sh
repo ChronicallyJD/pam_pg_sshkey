@@ -23,6 +23,8 @@ check "test_system is invoked with the build dir on PATH" \
     grep -Eq 'PATH=[^;&|]*tests/test_system' <<<"$dry"
 check "make -n test invokes tests/test_python_module.py" \
     grep -q 'tests/test_python_module.py' <<<"$dry"
+check "make -n test invokes tests/test_ssh_agent" \
+    grep -q 'tests/test_ssh_agent' <<<"$dry"
 check "make -n test invokes tests/test_ssh_cert" \
     grep -q 'tests/test_ssh_cert' <<<"$dry"
 check "make -n test invokes tests/test_pam_module" \

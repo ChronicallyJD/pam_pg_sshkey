@@ -37,6 +37,8 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 
+#include "key_parser.h"
+
 #define SSH_AGENTC_REQUEST_IDENTITIES  11
 #define SSH_AGENT_IDENTITIES_ANSWER    12
 #define SSH_AGENTC_SIGN_REQUEST        13
@@ -44,7 +46,26 @@
 #define SSH_AGENT_RSA_SHA2_256          2
 
 #define AGENT_MAX_MSG   (256 * 1024)
+/* Generous: an agent may be waiting for a person to confirm (ssh-add -c) or
+   to enter a smartcard PIN.  Only a wedged agent should ever hit this. */
+#define AGENT_TIMEOUT_MS_DEFAULT 60000
 #define PUBKEY_MAX_LINE (64 * 1024)
+
+/*
+ * Copy an agent-supplied string for printing.  Everything the agent sends is
+ * attacker-controlled when the socket is forwarded from another host, and
+ * these strings reach a terminal: an escape or a carriage return could
+ * repaint the line and fake a prompt.  Only printable ASCII survives.
+ */
+static const char *
+printable(const unsigned char *s, size_t n, char *out, size_t out_size)
+{
+    size_t i = 0;
+    for (; i < n && i < out_size - 1; i++)
+        out[i] = (s[i] >= 0x20 && s[i] <= 0x7e) ? (char)s[i] : '?';
+    out[i] = '\0';
+    return out;
+}
 
 /* ── wire helpers ─────────────────────────────────────────────────────── */
 
@@ -164,6 +185,22 @@ agent_connect(void)
     }
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); return -1; }
+
+    /*
+     * A wedged or hostile agent must not hang the login.  With a forwarded
+     * agent the socket is served by another host, so this is not theoretical.
+     * PG_SSHKEY_AGENT_TIMEOUT_MS exists so the tests need not wait 10 s.
+     */
+    long ms = AGENT_TIMEOUT_MS_DEFAULT;
+    const char *tmo = getenv("PG_SSHKEY_AGENT_TIMEOUT_MS");
+    if (tmo && *tmo) {
+        char *end;
+        long v = strtol(tmo, &end, 10);
+        if (!*end && v > 0) ms = v;
+    }
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, sock, sizeof(addr.sun_path) - 1);
@@ -181,10 +218,10 @@ write_all(int fd, const unsigned char *buf, size_t len)
 {
     size_t off = 0;
     while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
+        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
         if (n <= 0) {
             if (n < 0 && errno == EINTR) continue;
-            return -1;
+            return -1;   /* includes EPIPE and the send timeout */
         }
         off += (size_t)n;
     }
@@ -219,7 +256,10 @@ agent_round_trip(int fd, const unsigned char *payload, size_t payload_len,
         return NULL;
     }
     if (read_all(fd, hdr, 4) != 0) {
-        fprintf(stderr, "ssh-agent: no reply: %s\n", strerror(errno));
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            fprintf(stderr, "ssh-agent: timed out waiting for a reply\n");
+        else
+            fprintf(stderr, "ssh-agent: no reply: %s\n", strerror(errno));
         return NULL;
     }
     size_t len = get_u32(hdr);
@@ -230,7 +270,10 @@ agent_round_trip(int fd, const unsigned char *payload, size_t payload_len,
     unsigned char *reply = malloc(len);
     if (!reply) return NULL;
     if (read_all(fd, reply, len) != 0) {
-        fprintf(stderr, "ssh-agent: truncated reply: %s\n", strerror(errno));
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            fprintf(stderr, "ssh-agent: timed out reading the reply\n");
+        else
+            fprintf(stderr, "ssh-agent: truncated reply: %s\n", strerror(errno));
         free(reply);
         return NULL;
     }
@@ -261,9 +304,10 @@ report_missing_identity(int fd)
         if (rd_string(reply, reply_len, &pos, &comment, &comment_len) != 0) break;
         const unsigned char *type; size_t type_len;
         if (rd_string(blob, blob_len, &bpos, &type, &type_len) != 0) break;
-        fprintf(stderr, "  %.*s %.*s\n",
-                (int)type_len, (const char *)type,
-                (int)comment_len, (const char *)comment);
+        char tbuf[64], cbuf[256];
+        fprintf(stderr, "  %s %s\n",
+                printable(type, type_len, tbuf, sizeof(tbuf)),
+                printable(comment, comment_len, cbuf, sizeof(cbuf)));
     }
     free(reply);
 }
@@ -282,10 +326,11 @@ ssh_agent_sign(const unsigned char *keyblob, size_t blob_len,
         return NULL;
     }
     if (type_len > 3 && memcmp(type, "sk-", 3) == 0) {
+        char tbuf[64];
         fprintf(stderr,
-            "Key type %.*s (a FIDO/security key) is not supported: its\n"
+            "Key type %s (a FIDO/security key) is not supported: its\n"
             "signature carries authenticator fields the server does not verify.\n",
-            (int)type_len, (const char *)type);
+            printable(type, type_len, tbuf, sizeof(tbuf)));
         return NULL;
     }
     int is_rsa = (type_len >= 7 && memcmp(type, "ssh-rsa", 7) == 0);
@@ -334,23 +379,63 @@ ssh_agent_sign(const unsigned char *keyblob, size_t blob_len,
         free(reply);
         return NULL;
     }
+    char abuf[64];
     if (is_rsa && !(algo_len == 12 && memcmp(algo, "rsa-sha2-256", 12) == 0)) {
         fprintf(stderr,
-            "The ssh-agent signed with '%.*s'; the server needs rsa-sha2-256.\n"
+            "The ssh-agent signed with '%s'; the server needs rsa-sha2-256.\n"
             "Use an OpenSSH 7.2 or newer agent, or sign from the key file.\n",
-            (int)algo_len, (const char *)algo);
+            printable(algo, algo_len, abuf, sizeof(abuf)));
         free(reply);
         return NULL;
     }
     if (!is_rsa && !(algo_len == 11 && memcmp(algo, "ssh-ed25519", 11) == 0)) {
         fprintf(stderr,
-            "The ssh-agent signed with '%.*s', which the server does not verify.\n",
-            (int)algo_len, (const char *)algo);
+            "The ssh-agent signed with '%s', which the server does not verify.\n",
+            printable(algo, algo_len, abuf, sizeof(abuf)));
+        free(reply);
+        return NULL;
+    }
+    if (sig_len == 0) {
+        fprintf(stderr, "The ssh-agent returned an empty signature.\n");
         free(reply);
         return NULL;
     }
 
-    unsigned char *out = malloc(sig_len ? sig_len : 1);
+    /*
+     * Verify with the public key the caller named.  The agent could return
+     * anything; without this a wrong or corrupt signature only surfaces as
+     * "authentication failed" on the server, with nothing to go on.  A
+     * certificate blob is skipped: the key inside it is not this blob.
+     */
+    int is_cert = (type_len > 21 &&
+                   memcmp(type + type_len - 21, "-cert-v01@openssh.com", 21) == 0);
+    if (!is_cert) {
+        EVP_PKEY *pub = ssh_pubkey_from_blob(keyblob, blob_len);
+        if (!pub) {
+            fprintf(stderr, "Cannot read the public key to check the signature\n");
+            free(reply);
+            return NULL;
+        }
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        int ok = 0;
+        if (ctx) {
+            const EVP_MD *md = is_rsa ? EVP_sha256() : NULL;
+            if (EVP_DigestVerifyInit(ctx, NULL, md, NULL, pub) == 1)
+                ok = (EVP_DigestVerify(ctx, sig, sig_len, msg, msg_len) == 1);
+            EVP_MD_CTX_free(ctx);
+        }
+        EVP_PKEY_free(pub);
+        if (!ok) {
+            fprintf(stderr,
+                "The ssh-agent returned a signature that does not verify with\n"
+                "the public key in the file you named.  The agent may hold a\n"
+                "different key under that name.\n");
+            free(reply);
+            return NULL;
+        }
+    }
+
+    unsigned char *out = malloc(sig_len);
     if (!out) { free(reply); return NULL; }
     memcpy(out, sig, sig_len);
     free(reply);

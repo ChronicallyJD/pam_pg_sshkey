@@ -487,6 +487,11 @@ def main() -> int:
             raise RuntimeError("--cert cannot be combined with --v1")
         if args.agent and args.v1:
             raise RuntimeError("--agent cannot be combined with --v1")
+        if args.agent and args.identity:
+            raise RuntimeError(
+                "--agent replaces -i/--identity; pass only one.\n"
+                "--agent takes the PUBLIC key of an identity the agent holds."
+            )
 
         # Step 1 (--v1 only): create the nonce in the SERVER's challenge dir.
         # v2 tokens carry their own timestamp + nonce, so there is nothing to do.

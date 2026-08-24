@@ -52,6 +52,7 @@ PG_DBNAME=""
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 CERT_FILE=""
 AGENT_PUBKEY=""
+IDENTITY_GIVEN=0
 CHALLENGE_DIR="/var/run/pg_sshkey"
 CHALLENGE_CMD=""
 TOKEN_V1=0
@@ -112,7 +113,7 @@ while [[ $# -gt 0 ]]; do
         -h|--host)        PG_HOST="$2";       shift 2 ;;
         -p|--port)        PG_PORT="$2";       shift 2 ;;
         -d|--dbname)      PG_DBNAME="$2";     shift 2 ;;
-        -i|--identity)    SSH_KEY="$2";       shift 2 ;;
+        -i|--identity)    SSH_KEY="$2"; IDENTITY_GIVEN=1; shift 2 ;;
         --cert)           CERT_FILE="$2";     shift 2 ;;
         --agent)          AGENT_PUBKEY="$2";  shift 2 ;;
         -c|--challenge-dir) CHALLENGE_DIR="$2"; shift 2 ;;
@@ -172,6 +173,8 @@ if ! command -v "$SIGN_BIN" &>/dev/null; then
 fi
 
 [[ -n "$AGENT_PUBKEY" && "$TOKEN_V1" -eq 1 ]] && die "--agent cannot be combined with --v1 or --challenge-cmd."
+[[ -n "$AGENT_PUBKEY" && "$IDENTITY_GIVEN" -eq 1 ]] && die "--agent replaces -i/--identity; pass only one.
+--agent takes the PUBLIC key of an identity the agent holds."
 if [[ -n "$AGENT_PUBKEY" ]]; then
     [[ -f "$AGENT_PUBKEY" ]] || die "Public key not found: $AGENT_PUBKEY
 --agent takes the PUBLIC key file of an identity held by the agent, for example

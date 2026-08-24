@@ -229,6 +229,24 @@ class TestCertOption(unittest.TestCase):
                                        capture_output=True, text=True, env=env)
             self.assertEqual(withagent.returncode, 0, withagent.stderr)
 
+    def test_agent_with_identity_is_refused_by_both_clients(self):
+        """-i and --agent name two different keys: refuse rather than pick."""
+        with tempfile.TemporaryDirectory() as td:
+            b = self._bin(td, v2=True)
+            key = Path(td) / "id_ed25519"; key.write_text("k")
+            pub = Path(td) / "id_ed25519.pub"; pub.write_text("ssh-ed25519 AAAA c\n")
+            r = run(SCRIPT_SRC, "-U", "carol", "-i", str(key), "--agent", str(pub),
+                    path=f"{b}:{NO_TOOLS_PATH}")
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("--agent replaces -i/--identity", r.stderr)
+            env = {"PATH": f"{b}:{NO_TOOLS_PATH}", "HOME": td, "USER": "carol",
+                   "STUB_ARGV": str(Path(td) / "argv"), "STUB_PW": str(Path(td) / "pw")}
+            c = subprocess.run(["bash", str(CONNECT_SRC), "-i", str(key),
+                                "--agent", str(pub)],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(c.returncode, 1, c.stderr)
+            self.assertIn("--agent replaces -i/--identity", c.stderr)
+
     def test_connect_forwards_cert_to_sign(self):
         with tempfile.TemporaryDirectory() as td:
             b = self._bin(td)

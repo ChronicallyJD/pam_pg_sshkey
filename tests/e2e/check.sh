@@ -329,13 +329,23 @@ as_alice_with_agent() {   # <keyname> <ask|-> <command...>
         $*
     "
 }
+# An earlier check rewrites alice's authorized_keys, so every check that
+# needs id_agent registers it first.  Appending twice is harmless, so this
+# only adds when the key is absent.
+ensure_agent_key_registered() {
+    grep -qf /home/alice/.ssh/id_agent.pub /etc/pg_sshkeys/alice/authorized_keys 2>/dev/null \
+        || pg_sshkey_addkey -a alice /home/alice/.ssh/id_agent.pub >/dev/null
+}
 check_agent_connect_as_alice() {
+    ensure_agent_key_registered || { echo "addkey failed"; return 1; }
     local cur off; cur=$(journal_mark); off=$(pglog_mark)
-    local out; out=$(as_alice_with_agent id_ed25519 - \
-        "pg_sshkey_connect --agent ~/.ssh/id_ed25519.pub -h 127.0.0.1 -- -tAc 'select current_user'" 2>&1) \
+    # id_agent, not the default identity: a client that ignored --agent would
+    # sign with ~/.ssh/id_ed25519 and the journal would name that key instead
+    local out; out=$(as_alice_with_agent id_agent - \
+        "pg_sshkey_connect --agent ~/.ssh/id_agent.pub -h 127.0.0.1 -- -tAc 'select current_user'" 2>&1) \
         || { echo "$out"; return 1; }
     [[ "$out" == "alice" ]] || { echo "got: $out"; return 1; }
-    expect_journal "$cur" "pam_pg_sshkey: user 'alice' authenticated with key id_ed25519" || return 1
+    expect_journal "$cur" "pam_pg_sshkey: user 'alice' authenticated with key id_agent" || return 1
     expect_no_pglog "$off" 'PAM authentication failed'
 }
 check_agent_passphrase_key_connects() {
@@ -365,31 +375,38 @@ check_agent_rsa_key_connects() {
 check_agent_certificate_connects() {
     [[ ! -e /etc/pg_sshkeys/carol/authorized_keys ]] || { echo "carol has an authorized_keys file"; return 1; }
     local cur; cur=$(journal_mark)
+    # id_agent with its own certificate: the default identity is not certified
+    # by it, so ignoring --agent fails the login instead of passing silently
     local out; out=$(as_user carol "
         eval \$(ssh-agent -s) >/dev/null
         trap 'ssh-agent -k >/dev/null 2>&1' EXIT
-        timeout 20 ssh-add ~/.ssh/id_ed25519 </dev/null >/dev/null 2>&1 || exit 9
-        pg_sshkey_connect --agent ~/.ssh/id_ed25519.pub --cert $CAROL_CERT -h 127.0.0.1 -- -tAc 'select current_user'
+        timeout 20 ssh-add ~/.ssh/id_agent </dev/null >/dev/null 2>&1 || exit 9
+        pg_sshkey_connect --agent ~/.ssh/id_agent.pub --cert ~/.ssh/id_agent-cert.pub -h 127.0.0.1 -- -tAc 'select current_user'
     " 2>&1) || { echo "$out"; return 1; }
     [[ "$out" == "carol" ]] || { echo "got: $out"; return 1; }
-    expect_journal "$cur" "pam_pg_sshkey: user 'carol' authenticated with certificate 'carol-key'"
+    expect_journal "$cur" "pam_pg_sshkey: user 'carol' authenticated with certificate 'carol-agent'"
 }
 check_agent_query_and_python_connect() {
-    local out; out=$(as_alice_with_agent id_ed25519 - \
-        "pg_sshkey_query --agent ~/.ssh/id_ed25519.pub -h 127.0.0.1 -q 'select current_user'" 2>&1) \
+    ensure_agent_key_registered || { echo "addkey failed"; return 1; }
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_alice_with_agent id_agent - \
+        "pg_sshkey_query --agent ~/.ssh/id_agent.pub -h 127.0.0.1 -q 'select current_user'" 2>&1) \
         || { echo "query: $out"; return 1; }
     grep -q alice <<<"$out" || { echo "query got: $out"; return 1; }
-    out=$(as_alice_with_agent id_ed25519 - \
+    expect_journal "$cur" "pam_pg_sshkey: user 'alice' authenticated with key id_agent" || return 1
+    cur=$(journal_mark)
+    out=$(as_alice_with_agent id_agent - \
         "PYTHONPATH=$SRC/src python3 -c \"
 from pam_pg_sshkey import connect
 c = connect(user='alice', dbname='alice', host='127.0.0.1',
-            agent_pubkey='/home/alice/.ssh/id_ed25519.pub')
+            agent_pubkey='/home/alice/.ssh/id_agent.pub')
 cur = c.cursor(); cur.execute('select current_user'); print(cur.fetchone()[0])\"" 2>&1) \
         || { echo "python: $out"; return 1; }
     [[ "$out" == "alice" ]] || { echo "python got: $out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: user 'alice' authenticated with key id_agent"
 }
 check_agent_absent_is_a_clean_error() {
-    local out; out=$(as_alice "unset SSH_AUTH_SOCK; pg_sshkey_connect --agent ~/.ssh/id_ed25519.pub -h 127.0.0.1 -- -tAc 'select 1'" 2>&1) \
+    local out; out=$(as_alice "unset SSH_AUTH_SOCK; pg_sshkey_connect --agent ~/.ssh/id_agent.pub -h 127.0.0.1 -- -tAc 'select 1'" 2>&1) \
         && { echo "connected with no agent running"; return 1; }
     grep -q "SSH_AUTH_SOCK is not set" <<<"$out" || { echo "unclear error: $out"; return 1; }
 }

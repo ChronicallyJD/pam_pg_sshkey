@@ -669,7 +669,8 @@ static void test_agent_rejects_private_key_and_stray_positional(void) {
         "SSH_AUTH_SOCK=/nonexistent pg_sshkey_sign --agent %s.pub %064d %s 2>%s/err",
         priv, 0, priv, g_dir);
     ASSERT_EQ(run_capture(cmd, out, sizeof(out)), 1);
-    ASSERT_TRUE(stderr_mentions_cert("--agent"));
+    /* the usage text also contains "--agent": pin the refusal itself */
+    ASSERT_TRUE(stderr_mentions_cert("--agent cannot be combined with a v1 challenge"));
     rm_dir();
 }
 

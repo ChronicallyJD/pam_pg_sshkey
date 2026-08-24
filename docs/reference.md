@@ -26,7 +26,7 @@ apart by the number of colons (one, two, or three). A token of 8192 bytes
 ```text
 pg_sshkey_sign [--at <unix_ts>] [--nonce <hex64>] <private_key>                    v2
 pg_sshkey_sign --cert <cert.pub> [--at <unix_ts>] [--nonce <hex64>] <private_key>  v3
-pg_sshkey_sign --agent <public_key.pub> [--cert <cert.pub>]                        v2 or v3
+pg_sshkey_sign --agent <pubkey.pub> [--cert <cert.pub>] [--at <ts>] [--nonce <hex>]  v2 or v3
 pg_sshkey_sign <nonce_hex> <private_key>                                            v1
 ```
 
@@ -41,8 +41,11 @@ OpenSSH Ed25519 (unencrypted), PKCS#8 PEM (Ed25519 or RSA), traditional PEM
 
 `--agent` signs through the ssh-agent listening on `$SSH_AUTH_SOCK` using the
 identity whose public key is in the named file, and takes no private key
-argument. The private key is never read, so a passphrase-protected key, an
-OpenSSH-format RSA key, and a forwarded agent all work. For an RSA key the
+argument, and cannot be combined with `-i`. The private key is never read,
+so a passphrase-protected key, an OpenSSH-format RSA key, and a forwarded
+agent all work. The client verifies the agent's signature against that public
+key before printing the token, and waits at most 60 seconds for the agent
+(`PG_SSHKEY_AGENT_TIMEOUT_MS` overrides that). For an RSA key the
 client asks the agent for `rsa-sha2-256`, because the module verifies RSA
 with SHA-256; an agent that answers with `ssh-rsa` is refused. `sk-` key
 types (FIDO security keys) are refused: their signature carries

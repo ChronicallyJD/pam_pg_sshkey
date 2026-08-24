@@ -129,12 +129,18 @@ gen bob   id_ed25519 -t ed25519
 # passphrase is fixed so the agent checks can add it non-interactively.
 runuser -l alice -c "mkdir -p -m 700 ~/.ssh; [ -f ~/.ssh/id_locked ] || ssh-keygen -q -t ed25519 -N 'e2e-passphrase' -C id_locked -f ~/.ssh/id_locked"
 gen carol id_ed25519 -t ed25519
+# Keys used only through an agent.  Deliberately NOT the default identity
+# (~/.ssh/id_ed25519): if --agent stopped being forwarded, the clients would
+# fall back to the default key and the checks would pass for the wrong reason.
+gen alice id_agent -t ed25519
+gen carol id_agent -t ed25519
 
 # alice's ed25519 key is registered; id_wrong, id_rsa_pem, bob's and carol's
 # keys are not (id_rsa_pem is registered by the rsa check itself; carol
 # authenticates with a certificate only).
 pg_sshkey_addkey alice /home/alice/.ssh/id_ed25519.pub >/dev/null
 pg_sshkey_addkey -a alice /home/alice/.ssh/id_locked.pub >/dev/null
+pg_sshkey_addkey -a alice /home/alice/.ssh/id_agent.pub >/dev/null
 pg_sshkey_addkey --remove bob   >/dev/null 2>&1 || true
 pg_sshkey_addkey --remove carol >/dev/null 2>&1 || true
 
@@ -166,10 +172,11 @@ chown root:postgres "$TRUSTED_CA_KEYS"; chmod 640 "$TRUSTED_CA_KEYS"
 # Copies ~/.ssh/id_ed25519.pub to ~/.ssh/<name>.pub and signs it, producing
 # ~/.ssh/<name>-cert.pub.  Re-signs when the user key or the CA key is newer
 # than the certificate, so regenerated keys never leave a stale certificate.
+# SIGN_SRC names the key to certify; it defaults to the user's id_ed25519.
 sign() {
     local u=$1 n=$2 ca=$3; shift 3
     local home; home=$(getent passwd "$u" | cut -d: -f6)
-    local pub=$home/.ssh/id_ed25519.pub copy=$home/.ssh/$n.pub cert=$home/.ssh/$n-cert.pub
+    local pub=$home/.ssh/${SIGN_SRC:-id_ed25519}.pub copy=$home/.ssh/$n.pub cert=$home/.ssh/$n-cert.pub
     if [[ "$copy" != "$pub" ]] && ! cmp -s "$pub" "$copy"; then cp "$pub" "$copy"; chown "$u:$u" "$copy"; chmod 644 "$copy"; fi
     if [[ ! -f "$cert" || "$pub" -nt "$cert" || "$CA_DIR/$ca" -nt "$cert" ]]; then
         rm -f "$cert"
@@ -185,6 +192,10 @@ sign carol id_ed25519_untrusted untrusted_ca -I carol-untrusted -n carol -V -1m:
 sign carol id_ed25519_expired   trusted_ca   -I carol-expired   -n carol -V -2h:-1h
 # same key, trusted CA, but only principal bob is listed
 sign carol id_ed25519_bob       trusted_ca   -I carol-as-bob    -n bob   -V -1m:+52w
+# carol's agent-only key, certified under its own key id.  A client that
+# ignored --agent would sign with id_ed25519, which this certificate does
+# not certify, so the login would fail rather than pass by accident.
+SIGN_SRC=id_agent sign carol id_agent trusted_ca -I carol-agent -n carol -V -1m:+52w
 
 # ── sshd: lets alice mint a nonce "on the server" via ssh (remote-client flow) ──
 runuser -l alice -c 'grep -qf ~/.ssh/id_ed25519.pub ~/.ssh/authorized_keys 2>/dev/null || cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys'

@@ -31,7 +31,7 @@ the connection opens.
 | `version` | `2` | `1` selects the legacy server-nonce token |
 | `challenge_dir` | `/var/run/pg_sshkey` | v1 only: where to create the nonce on a local server |
 | `challenge_cmd` | `None` | v1 only: command that creates the nonce on a remote server and prints it; implies `version=1` |
-| `agent_pubkey` | `None` | Path to the public key of an identity in the ssh-agent at `$SSH_AUTH_SOCK`; the private key is never read. `ValueError` with `key_path`, `version=1`, or `challenge_cmd` |
+| `agent_pubkey` | `None` | Path to the public key of an identity in the ssh-agent at `$SSH_AUTH_SOCK`; the private key is never read. `ValueError` with `key_path`, `passphrase`, `version=1`, or `challenge_cmd` |
 | `cert_path` | `None` | Path to an OpenSSH user certificate (`*-cert.pub`) for the key; produces a v3 token `<ts>:<nonce_hex>:<base64_signature>:<base64_cert>`. `ValueError` with `version=1` or `challenge_cmd` |
 
 `agent_pubkey` replaces `key_path`: the agent signs, so the key may carry a
@@ -39,7 +39,9 @@ passphrase, be an OpenSSH-format RSA key, or live on another machine behind a
 forwarded agent. RSA identities are signed as `rsa-sha2-256`, and an agent
 that answers with `ssh-rsa` raises `KeyError_`, as do a missing
 `SSH_AUTH_SOCK`, an unreachable socket, an identity the agent does not hold,
-and an `sk-` FIDO key. It combines with `cert_path`.
+an `sk-` FIDO key, an empty signature, and a signature that does not verify
+with the public key you named. The wait for the agent is 60 seconds,
+overridden by `PG_SSHKEY_AGENT_TIMEOUT_MS`. It combines with `cert_path`.
 
 ```python
 token = get_token(agent_pubkey="~/.ssh/id_ed25519.pub")

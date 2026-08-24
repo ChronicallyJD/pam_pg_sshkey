@@ -12,6 +12,8 @@ restore_chal_dir() { chown postgres:postgres "$CHAL_DIR"; chmod 1733 "$CHAL_DIR"
 trap restore_chal_dir EXIT
 
 PSQL_TCP="psql -h 127.0.0.1 -U alice -d alice -tA"
+PSQL_TCP_CAROL="psql -h 127.0.0.1 -U carol -d carol -tA"
+CAROL_CERT=/home/carol/.ssh/id_ed25519-cert.pub
 
 # ── 2.1 ──────────────────────────────────────────────────────────────────────
 check_tcp_connect_as_alice() {
@@ -241,6 +243,78 @@ cur = c.cursor(); cur.execute('select current_user'); print(cur.fetchone()[0])\"
     [[ "$out" == "alice" ]] || { echo "python got: $out"; return 1; }
 }
 
+# ── certificates (v3): carol has NO authorized_keys, only a CA-signed key ───
+check_cert_connect_as_carol() {
+    [[ ! -e /etc/pg_sshkeys/carol/authorized_keys ]] || { echo "carol has an authorized_keys file; the check would not prove the certificate path"; return 1; }
+    local cur off; cur=$(journal_mark); off=$(pglog_mark)
+    local out; out=$(as_carol "pg_sshkey_connect --cert $CAROL_CERT -h 127.0.0.1 -- -tAc 'select current_user'" 2>&1) || { echo "$out"; return 1; }
+    [[ "$out" == "carol" ]] || { echo "got: $out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: user 'carol' authenticated with certificate 'carol-key'" || return 1
+    expect_no_pglog "$off" 'PAM authentication failed'
+}
+check_cert_python_connect() {
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_carol "PYTHONPATH=$SRC/src python3 -c \"
+from pam_pg_sshkey import connect
+c = connect(user='carol', dbname='carol', host='127.0.0.1', cert_path='$CAROL_CERT')
+cur = c.cursor(); cur.execute('select current_user'); print(cur.fetchone()[0])\"" 2>&1) || { echo "$out"; return 1; }
+    [[ "$out" == "carol" ]] || { echo "got: $out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: user 'carol' authenticated with certificate"
+}
+check_cert_pg_sshkey_query() {
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_carol "pg_sshkey_query --cert $CAROL_CERT -h 127.0.0.1 -q 'select current_user'" 2>&1) || { echo "$out"; return 1; }
+    grep -q carol <<<"$out" || { echo "got: $out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: user 'carol' authenticated with certificate"
+}
+check_cert_untrusted_ca_rejected() {
+    local cur; cur=$(journal_mark)
+    if as_carol "pg_sshkey_connect --cert ~/.ssh/id_ed25519_untrusted-cert.pub -h 127.0.0.1 -- -tAc 'select 1'" >/dev/null 2>&1; then
+        echo "connected with a certificate from an untrusted CA"; return 1
+    fi
+    expect_journal "$cur" "pam_pg_sshkey: certificate for 'carol' rejected: not signed by a trusted CA"
+}
+check_cert_expired_rejected() {
+    local cur; cur=$(journal_mark)
+    if as_carol "pg_sshkey_connect --cert ~/.ssh/id_ed25519_expired-cert.pub -h 127.0.0.1 -- -tAc 'select 1'" >/dev/null 2>&1; then
+        echo "connected with an expired certificate"; return 1
+    fi
+    expect_journal "$cur" "pam_pg_sshkey: certificate for 'carol' rejected: expired"
+}
+check_cert_wrong_principal_rejected() {
+    local cur; cur=$(journal_mark)
+    if as_carol "pg_sshkey_connect --cert ~/.ssh/id_ed25519_bob-cert.pub -h 127.0.0.1 -- -tAc 'select 1'" >/dev/null 2>&1; then
+        echo "connected with a certificate whose only principal is bob"; return 1
+    fi
+    expect_journal "$cur" "pam_pg_sshkey: certificate for 'carol' rejected: principal 'carol' not listed"
+}
+check_cert_replay_rejected() {
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_carol "
+        tok=\$(pg_sshkey_sign --cert $CAROL_CERT ~/.ssh/id_ed25519) || exit 9
+        PGPASSWORD=\$tok $PSQL_TCP_CAROL -c 'select 1' >/dev/null 2>&1 && echo first=ok || echo first=fail
+        PGPASSWORD=\$tok $PSQL_TCP_CAROL -c 'select 1' >/dev/null 2>&1 && echo second=ok || echo second=fail
+        echo \"nonce=\$(cut -d: -f2 <<<\"\$tok\")\"
+    " 2>&1)
+    grep -q '^first=ok'    <<<"$out" || { echo "first use did not succeed:"; echo "$out"; return 1; }
+    grep -q '^second=fail' <<<"$out" || { echo "REPLAY SUCCEEDED:"; echo "$out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: replayed token for 'carol' (nonce already used)" || return 1
+    local nonce; nonce=$(sed -n 's/^nonce=//p' <<<"$out")
+    [[ -f "$CHAL_DIR/$nonce" ]] || { echo "nonce marker $nonce not recorded"; return 1; }
+}
+check_cert_alice_key_without_cert_still_works() {
+    grep -q 'trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys' /etc/pam.d/postgresql \
+        || { echo "trusted_ca_keys is not set in /etc/pam.d/postgresql; the check would not prove coexistence"; return 1; }
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_alice "pg_sshkey_connect -h 127.0.0.1 -- -tAc 'select current_user'" 2>&1) || { echo "v2: $out"; return 1; }
+    [[ "$out" == "alice" ]] || { echo "v2 got: $out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: user 'alice' authenticated with key" || return 1
+    cur=$(journal_mark)
+    out=$(as_alice "pg_sshkey_connect --v1 -h 127.0.0.1 -- -tAc 'select current_user'" 2>&1) || { echo "v1: $out"; return 1; }
+    [[ "$out" == "alice" ]] || { echo "v1 got: $out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: user 'alice' authenticated with key"
+}
+
 echo "=== pam_pg_sshkey e2e ($(. /etc/os-release; echo "$PRETTY_NAME"), $(runuser -u postgres -- psql -tAc 'show server_version')) ==="
 run_check tcp_connect_as_alice
 run_check local_socket_connect_as_alice
@@ -263,4 +337,12 @@ run_check stale_nonces_swept
 run_check python_replication_connect
 run_check pg_sshkey_query_bad_sql_clean_error
 run_check ssh_challenge_cmd_connect
+run_check cert_connect_as_carol
+run_check cert_python_connect
+run_check cert_pg_sshkey_query
+run_check cert_untrusted_ca_rejected
+run_check cert_expired_rejected
+run_check cert_wrong_principal_rejected
+run_check cert_replay_rejected
+run_check cert_alice_key_without_cert_still_works
 summary

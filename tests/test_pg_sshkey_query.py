@@ -120,6 +120,11 @@ echo "1700000000:{nonce}:{sig}:{cert}"
 STUB_PSQL = """#!/bin/sh
 printf '%s' "$PGPASSWORD" > "$STUB_PW"
 """
+# The same, printing a 3-field v2 token (the agent tests do not pass --cert).
+STUB_SIGN_V2 = """#!/bin/sh
+printf '%s\\n' "$@" > "$STUB_ARGV"
+echo "1700000000:{nonce}:{sig}"
+"""
 V3_NONCE = "ab" * 32
 V3_SIG = "c2ln" * 22          # base64, no padding needed
 V3_CERT = "Y2VydA" * 3 + "=="  # well-formed base64 (padding only at the end)
@@ -129,10 +134,13 @@ class TestCertOption(unittest.TestCase):
     """--cert FILE must reach pg_sshkey_sign as '--cert FILE' and the
     4-field v3 token it prints must pass the client's shape check."""
 
-    def _bin(self, td):
+    def _bin(self, td, v2=False):
         b = Path(td) / "bin"; b.mkdir()
         sign = b / "pg_sshkey_sign"
-        sign.write_text(STUB_SIGN.format(nonce=V3_NONCE, sig=V3_SIG, cert=V3_CERT))
+        if v2:
+            sign.write_text(STUB_SIGN_V2.format(nonce=V3_NONCE, sig=V3_SIG))
+        else:
+            sign.write_text(STUB_SIGN.format(nonce=V3_NONCE, sig=V3_SIG, cert=V3_CERT))
         sign.chmod(0o755)
         psql = b / "psql"
         psql.write_text(STUB_PSQL); psql.chmod(0o755)
@@ -167,6 +175,59 @@ class TestCertOption(unittest.TestCase):
             self.assertEqual(argv.read_text().split("\n")[:-1], [str(key)])
             # The stub prints a v3 token; without --cert the v2 shape is required.
             self.assertIn("invalid token", r.stderr)
+
+    def test_query_forwards_agent_to_sign_without_a_key_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            b = self._bin(td, v2=True)
+            pub = Path(td) / "id_ed25519.pub"; pub.write_text("ssh-ed25519 AAAA c\n")
+            argv = Path(td) / "argv"
+            r = run(SCRIPT_SRC, "-U", "carol", "-h", "127.0.0.1", "-p", "1",
+                    "--agent", str(pub), "-v",
+                    path=f"{b}:{NO_TOOLS_PATH}", env_extra={"STUB_ARGV": str(argv)})
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertTrue(argv.exists(), f"pg_sshkey_sign was not run: {r.stderr}")
+            self.assertEqual(argv.read_text().split("\n")[:-1],
+                             ["--agent", str(pub)])
+            self.assertIn(f"key:           {pub} (ssh-agent)", r.stderr)
+
+    def test_query_agent_with_v1_is_refused_before_minting_a_nonce(self):
+        with tempfile.TemporaryDirectory() as td:
+            b = self._bin(td, v2=True)
+            chal = Path(td) / "chal"; chal.mkdir(mode=0o1733)
+            pub = Path(td) / "id_ed25519.pub"; pub.write_text("ssh-ed25519 AAAA c\n")
+            r = run(SCRIPT_SRC, "-U", "carol", "--v1", "-c", str(chal),
+                    "--agent", str(pub), "-v", path=f"{b}:{NO_TOOLS_PATH}")
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("--agent cannot be combined with --v1", r.stderr)
+            self.assertEqual(list(chal.iterdir()), [])
+
+    def test_connect_forwards_agent_to_sign_without_a_key_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            b = self._bin(td, v2=True)
+            pub = Path(td) / "id_ed25519.pub"; pub.write_text("ssh-ed25519 AAAA c\n")
+            argv = Path(td) / "argv"; pw = Path(td) / "pw"
+            env = {"PATH": f"{b}:{NO_TOOLS_PATH}", "HOME": td, "USER": "carol",
+                   "STUB_ARGV": str(argv), "STUB_PW": str(pw)}
+            r = subprocess.run(["bash", str(CONNECT_SRC), "--agent", str(pub), "-v"],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(argv.read_text().split("\n")[:-1], ["--agent", str(pub)])
+            self.assertIn(f"key:           {pub} (ssh-agent)", r.stderr)
+
+    def test_connect_agent_needs_no_private_key_file(self):
+        """The default identity does not exist: only --agent makes this work."""
+        with tempfile.TemporaryDirectory() as td:
+            b = self._bin(td, v2=True)
+            pub = Path(td) / "id_ed25519.pub"; pub.write_text("ssh-ed25519 AAAA c\n")
+            env = {"PATH": f"{b}:{NO_TOOLS_PATH}", "HOME": td, "USER": "carol",
+                   "STUB_ARGV": str(Path(td) / "argv"), "STUB_PW": str(Path(td) / "pw")}
+            without = subprocess.run(["bash", str(CONNECT_SRC), "-v"],
+                                     capture_output=True, text=True, env=env)
+            self.assertEqual(without.returncode, 1)
+            self.assertIn("SSH key not found", without.stderr)
+            withagent = subprocess.run(["bash", str(CONNECT_SRC), "--agent", str(pub), "-v"],
+                                       capture_output=True, text=True, env=env)
+            self.assertEqual(withagent.returncode, 0, withagent.stderr)
 
     def test_connect_forwards_cert_to_sign(self):
         with tempfile.TemporaryDirectory() as td:

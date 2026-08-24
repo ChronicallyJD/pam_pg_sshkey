@@ -19,6 +19,8 @@
 #   -p, --port PORT         PostgreSQL port (default: 5432)
 #   -d, --dbname DBNAME     Database name (default: username)
 #   -i, --identity FILE     SSH private key file (default: ~/.ssh/id_ed25519)
+#       --agent FILE        Sign through the ssh-agent holding the key whose
+#                           public key is FILE; the private key is never read
 #       --cert FILE         OpenSSH user certificate (*-cert.pub) for the key;
 #                           produces a v3 token, no authorized_keys needed
 #       --v1                Legacy token: needs a server-side nonce (see below)
@@ -49,6 +51,7 @@ PG_PORT=""
 PG_DBNAME=""
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 CERT_FILE=""
+AGENT_PUBKEY=""
 CHALLENGE_DIR="/var/run/pg_sshkey"
 CHALLENGE_CMD=""
 TOKEN_V1=0
@@ -70,6 +73,10 @@ Options:
   -p, --port PORT         PostgreSQL port            (default: 5432)
   -d, --dbname DBNAME     Database name              (default: username)
   -i, --identity FILE     SSH private key            (default: ~/.ssh/id_ed25519)
+      --agent FILE        Sign through the ssh-agent at $SSH_AUTH_SOCK using the
+                          identity whose public key is FILE. The private key is
+                          never read, so passphrase-protected keys, OpenSSH-format
+                          RSA keys, and forwarded agents work. Replaces -i.
       --cert FILE         OpenSSH user certificate for the key (*-cert.pub).
                           Sends a v3 token; the server checks it against
                           trusted_ca_keys instead of authorized_keys.
@@ -107,6 +114,7 @@ while [[ $# -gt 0 ]]; do
         -d|--dbname)      PG_DBNAME="$2";     shift 2 ;;
         -i|--identity)    SSH_KEY="$2";       shift 2 ;;
         --cert)           CERT_FILE="$2";     shift 2 ;;
+        --agent)          AGENT_PUBKEY="$2";  shift 2 ;;
         -c|--challenge-dir) CHALLENGE_DIR="$2"; shift 2 ;;
         --challenge-cmd)  CHALLENGE_CMD="$2";  shift 2 ;;
         --v1)             TOKEN_V1=1;          shift ;;
@@ -163,15 +171,27 @@ if ! command -v "$SIGN_BIN" &>/dev/null; then
     fi
 fi
 
-[[ -f "$SSH_KEY" ]] || die "SSH key not found: $SSH_KEY
-Use -i to specify the key path, or generate one with:
+[[ -n "$AGENT_PUBKEY" && "$TOKEN_V1" -eq 1 ]] && die "--agent cannot be combined with --v1 or --challenge-cmd."
+if [[ -n "$AGENT_PUBKEY" ]]; then
+    [[ -f "$AGENT_PUBKEY" ]] || die "Public key not found: $AGENT_PUBKEY
+--agent takes the PUBLIC key file of an identity held by the agent, for example
+  pg_sshkey_connect --agent ~/.ssh/id_ed25519.pub"
+else
+    [[ -f "$SSH_KEY" ]] || die "SSH key not found: $SSH_KEY
+Use -i to specify the key path, --agent to sign through an ssh-agent, or
+generate a key with:
   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519"
+fi
 [[ -n "$CERT_FILE" && ! -f "$CERT_FILE" ]] && die "Certificate not found: $CERT_FILE"
 
 log "username:      $PG_USER"
 log "database:      $PG_DBNAME"
 log "host:          ${PG_HOST:-<local socket>}"
-log "key:           $SSH_KEY"
+if [[ -n "$AGENT_PUBKEY" ]]; then
+    log "key:           $AGENT_PUBKEY (ssh-agent)"
+else
+    log "key:           $SSH_KEY"
+fi
 if [[ "$TOKEN_V1" -eq 1 ]]; then
     log "token:         v1 (server-issued nonce)"
     if [[ -n "$CHALLENGE_CMD" ]]; then log "challenge cmd: $CHALLENGE_CMD"; else log "challenge dir: $CHALLENGE_DIR"; fi
@@ -210,9 +230,15 @@ elif [[ -n "$CERT_FILE" ]]; then
     # ── v3: like v2, plus the certificate that vouches for the key ─────────
     log "token:         v3 (certificate)"
     log "cert:          $CERT_FILE"
-    log "signing with $SSH_KEY..."
-    TOKEN=$("$SIGN_BIN" --cert "$CERT_FILE" "$SSH_KEY" 2>&1) || \
-        die "Signing failed. Output was: $TOKEN"
+    if [[ -n "$AGENT_PUBKEY" ]]; then
+        log "signing with the ssh-agent identity $AGENT_PUBKEY..."
+        TOKEN=$("$SIGN_BIN" --agent "$AGENT_PUBKEY" --cert "$CERT_FILE" 2>&1) || \
+            die "Signing failed. Output was: $TOKEN"
+    else
+        log "signing with $SSH_KEY..."
+        TOKEN=$("$SIGN_BIN" --cert "$CERT_FILE" "$SSH_KEY" 2>&1) || \
+            die "Signing failed. Output was: $TOKEN"
+    fi
     TOKEN="${TOKEN%$'\n'}"
     if ! [[ "$TOKEN" =~ ^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]+=*:[A-Za-z0-9+/]+=*$ ]]; then
         die "Malformed token from pg_sshkey_sign: '$TOKEN'"
@@ -220,9 +246,15 @@ elif [[ -n "$CERT_FILE" ]]; then
 else
     # ── v2: the token carries its own timestamp + nonce ───────────────────
     log "token:         v2 (client-issued challenge)"
-    log "signing with $SSH_KEY..."
-    TOKEN=$("$SIGN_BIN" "$SSH_KEY" 2>&1) || \
-        die "Signing failed. Output was: $TOKEN"
+    if [[ -n "$AGENT_PUBKEY" ]]; then
+        log "signing with the ssh-agent identity $AGENT_PUBKEY..."
+        TOKEN=$("$SIGN_BIN" --agent "$AGENT_PUBKEY" 2>&1) || \
+            die "Signing failed. Output was: $TOKEN"
+    else
+        log "signing with $SSH_KEY..."
+        TOKEN=$("$SIGN_BIN" "$SSH_KEY" 2>&1) || \
+            die "Signing failed. Output was: $TOKEN"
+    fi
     TOKEN="${TOKEN%$'\n'}"
     if ! [[ "$TOKEN" =~ ^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]+=*$ ]]; then
         die "Malformed token from pg_sshkey_sign: '$TOKEN'"

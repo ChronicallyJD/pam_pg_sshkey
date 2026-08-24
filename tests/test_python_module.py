@@ -34,6 +34,7 @@ import base64
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -721,6 +722,256 @@ class TestCertToken(unittest.TestCase):
                 self.assertTrue(TOKEN_V3_RE.match(pw), pw)
                 self.assertEqual(pw.split(":")[3], cert_b64)
                 self.assertEqual(m.call_args.kwargs["replication"], "database")
+
+
+# ── Tests: ssh-agent signing ─────────────────────────────────────────────────
+
+HAVE_SSH_AGENT = bool(shutil.which("ssh-agent") and shutil.which("ssh-add")
+                      and shutil.which("ssh-keygen"))
+needs_ssh_agent = unittest.skipUnless(
+    HAVE_SSH_AGENT, "ssh-agent/ssh-add not installed")
+
+
+class _AgentFixture(unittest.TestCase):
+    """Starts a real ssh-agent on a private socket for each test and points
+    SSH_AUTH_SOCK at it; tearDown kills the agent.  No test methods."""
+
+    TS = 1700000000
+    NONCE = "0123456789abcdef" * 4
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.dir = self._td.name
+        self.sock = os.path.join(self.dir, "agent.sock")
+        r = subprocess.run(["ssh-agent", "-a", self.sock],
+                           capture_output=True, text=True, check=True)
+        m = re.search(r"SSH_AGENT_PID=(\d+)", r.stdout)
+        self.assertIsNotNone(m, r.stdout)
+        self.agent_pid = int(m.group(1))
+        self._env = mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": self.sock})
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        try:
+            os.kill(self.agent_pid, 15)
+        except ProcessLookupError:
+            pass
+        self._td.cleanup()
+
+    def _keygen(self, name: str, key_type: str = "ed25519",
+                passphrase: str = "") -> str:
+        path = os.path.join(self.dir, name)
+        cmd = ["ssh-keygen", "-q", "-t", key_type, "-N", passphrase, "-f", path]
+        if key_type == "rsa":
+            cmd += ["-b", "2048"]
+        subprocess.run(cmd, check=True)
+        return path
+
+    def _add(self, key_path: str) -> None:
+        subprocess.run(["ssh-add", "-q", key_path],
+                       capture_output=True, check=True)
+
+    def _fixed_token(self, **kw) -> str:
+        with mock.patch("pam_pg_sshkey.time.time", return_value=self.TS), \
+             mock.patch("pam_pg_sshkey.secrets.token_bytes",
+                        return_value=bytes.fromhex(self.NONCE)):
+            return get_token(**kw)
+
+
+@needs_ssh_agent
+class TestAgentSigning(_AgentFixture):
+    """agent_pubkey=: the token is signed by a real ssh-agent started here;
+    the private key file is never read.  The C signer proved this path against
+    the real module through libpam; these tests pin the Python token to the
+    C signer's byte for byte and verify the signatures independently."""
+
+    @unittest.skipUnless(PG_SSHKEY_SIGN.exists(), "pg_sshkey_sign not built (run make)")
+    def test_ed25519_token_matches_pg_sshkey_sign_agent(self):
+        """Same agent, pubkey, timestamp and nonce: the Python token must be
+        byte-identical to pg_sshkey_sign --agent (Ed25519 is deterministic)."""
+        key = self._keygen("id_ed25519")
+        self._add(key)
+        r = subprocess.run([str(PG_SSHKEY_SIGN), "--agent", key + ".pub",
+                            "--at", str(self.TS), "--nonce", self.NONCE],
+                           capture_output=True, text=True, check=True)
+        expected = r.stdout.strip()
+        self.assertTrue(TOKEN_V2_RE.match(expected), expected)
+        token = self._fixed_token(agent_pubkey=key + ".pub")
+        self.assertEqual(token, expected)
+
+    def test_ed25519_signature_verifies_over_v2_message(self):
+        from cryptography.hazmat.primitives.serialization import load_ssh_public_key
+        key = self._keygen("ed_verify")
+        self._add(key)
+        token = get_token(agent_pubkey=key + ".pub")
+        self.assertTrue(TOKEN_V2_RE.match(token), token)
+        ts, nonce, sig_b64 = token.split(":")
+        pub = load_ssh_public_key(Path(key + ".pub").read_bytes())
+        pub.verify(base64.b64decode(sig_b64),
+                   _SIGN_PREFIX_V2 + f"{ts}:{nonce}".encode("ascii"))
+
+    def test_rsa_signature_verifies_with_pkcs1v15_sha256(self):
+        """Proves the SSH_AGENT_RSA_SHA2_256 flag is sent: without it the
+        agent signs with SHA-1 and this PKCS1v15+SHA256 verify cannot pass
+        (the module refuses the 'ssh-rsa' algo before even returning)."""
+        from cryptography.hazmat.primitives.serialization import load_ssh_public_key
+        from cryptography.hazmat.primitives.asymmetric import padding as p
+        from cryptography.hazmat.primitives import hashes as h
+        key = self._keygen("rsa_verify", key_type="rsa")
+        self._add(key)
+        token = get_token(agent_pubkey=key + ".pub")
+        self.assertTrue(TOKEN_V2_RE.match(token), token)
+        ts, nonce, sig_b64 = token.split(":")
+        pub = load_ssh_public_key(Path(key + ".pub").read_bytes())
+        pub.verify(base64.b64decode(sig_b64),
+                   _SIGN_PREFIX_V2 + f"{ts}:{nonce}".encode("ascii"),
+                   p.PKCS1v15(), h.SHA256())
+
+    @unittest.skipUnless(PG_SSHKEY_SIGN.exists(), "pg_sshkey_sign not built (run make)")
+    def test_rsa_token_matches_pg_sshkey_sign_agent(self):
+        """RSASSA-PKCS1-v1_5 is deterministic, so the RSA token must also be
+        byte-identical to the C signer's."""
+        key = self._keygen("rsa_ident", key_type="rsa")
+        self._add(key)
+        r = subprocess.run([str(PG_SSHKEY_SIGN), "--agent", key + ".pub",
+                            "--at", str(self.TS), "--nonce", self.NONCE],
+                           capture_output=True, text=True, check=True)
+        expected = r.stdout.strip()
+        self.assertTrue(TOKEN_V2_RE.match(expected), expected)
+        self.assertEqual(self._fixed_token(agent_pubkey=key + ".pub"), expected)
+
+    def test_passphrase_key_signs_through_agent_but_not_from_file(self):
+        """The whole point of the agent path: a passphrase-protected key works
+        without the passphrase ever reaching this module, while reading the
+        same key file directly raises."""
+        key = self._keygen("enc_ed25519", passphrase="secret")
+        askpass = os.path.join(self.dir, "askpass.sh")
+        with open(askpass, "w") as f:
+            f.write("#!/bin/sh\necho secret\n")
+        os.chmod(askpass, 0o755)
+        env = dict(os.environ, SSH_ASKPASS=askpass,
+                   SSH_ASKPASS_REQUIRE="force", DISPLAY=":0")
+        subprocess.run(["ssh-add", "-q", key], env=env, check=True,
+                       capture_output=True, stdin=subprocess.DEVNULL)
+        token = get_token(agent_pubkey=key + ".pub")
+        self.assertTrue(TOKEN_V2_RE.match(token), token)
+        with self.assertRaises(KeyError_):
+            get_token(key_path=key)   # no passphrase, no agent: must raise
+
+    def _certified_key(self):
+        """(key_path, cert_path, cert_b64) for an agent-held certified key."""
+        ca = os.path.join(self.dir, "ca")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", ca],
+                       check=True)
+        key = self._keygen("user_cert_key")
+        subprocess.run(["ssh-keygen", "-q", "-s", ca, "-I", "alice-key",
+                        "-n", "alice", "-V", "-1m:+5m", key + ".pub"], check=True)
+        cert = key + "-cert.pub"
+        return key, cert, Path(cert).read_text().split()[1]
+
+    def test_cert_with_agent_is_v3_with_cert_base64(self):
+        from cryptography.hazmat.primitives.serialization import load_ssh_public_key
+        key, cert, cert_b64 = self._certified_key()
+        self._add(key)
+        token = get_token(agent_pubkey=key + ".pub", cert_path=cert)
+        self.assertTrue(TOKEN_V3_RE.match(token), token)
+        ts, nonce, sig_b64, cert_field = token.split(":")
+        self.assertEqual(cert_field, cert_b64)
+        pub = load_ssh_public_key(Path(key + ".pub").read_bytes())
+        pub.verify(base64.b64decode(sig_b64),
+                   _SIGN_PREFIX_V3 + f"{ts}:{nonce}".encode("ascii"))
+
+    @unittest.skipUnless(PG_SSHKEY_SIGN.exists(), "pg_sshkey_sign not built (run make)")
+    def test_cert_with_agent_matches_pg_sshkey_sign(self):
+        key, cert, _ = self._certified_key()
+        self._add(key)
+        r = subprocess.run([str(PG_SSHKEY_SIGN), "--agent", key + ".pub",
+                            "--cert", cert, "--at", str(self.TS),
+                            "--nonce", self.NONCE],
+                           capture_output=True, text=True, check=True)
+        expected = r.stdout.strip()
+        self.assertTrue(TOKEN_V3_RE.match(expected), expected)
+        token = self._fixed_token(agent_pubkey=key + ".pub", cert_path=cert)
+        self.assertEqual(token, expected)
+
+    @unittest.skipUnless(HAVE_PSYCOPG2, "psycopg2 not installed")
+    def test_connect_and_connect_replication_forward_agent_pubkey(self):
+        key = self._keygen("forwarded")
+        self._add(key)
+        with mock.patch("psycopg2.connect") as m:
+            pam_pg_sshkey.connect(agent_pubkey=key + ".pub", user="alice")
+            self.assertTrue(TOKEN_V2_RE.match(m.call_args.kwargs["password"]))
+        with mock.patch("psycopg2.connect") as m:
+            connect_replication(agent_pubkey=key + ".pub",
+                                user="replicator", host="publisher")
+            self.assertTrue(TOKEN_V2_RE.match(m.call_args.kwargs["password"]))
+            self.assertEqual(m.call_args.kwargs["replication"], "database")
+
+
+@needs_ssh_agent
+class TestAgentErrors(_AgentFixture):
+    """Every agent failure raises the module's own KeyError_ (or ValueError
+    for bad argument combinations) with a message that says what to do,
+    never a bare socket traceback."""
+
+    def test_no_ssh_auth_sock_raises_keyerror_with_fix(self):
+        key = self._keygen("no_sock")
+        env = {k: v for k, v in os.environ.items() if k != "SSH_AUTH_SOCK"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(KeyError_) as ctx:
+                get_token(agent_pubkey=key + ".pub")
+        self.assertIn("SSH_AUTH_SOCK", str(ctx.exception))
+        self.assertIn("ssh-add", str(ctx.exception))
+
+    def test_dead_socket_path_raises_keyerror_with_fix(self):
+        key = self._keygen("dead_sock")
+        dead = os.path.join(self.dir, "no_agent_here.sock")
+        with mock.patch.dict(os.environ, {"SSH_AUTH_SOCK": dead}):
+            with self.assertRaises(KeyError_) as ctx:
+                get_token(agent_pubkey=key + ".pub")
+        self.assertIn(dead, str(ctx.exception))
+        self.assertIn("ssh-add", str(ctx.exception))
+
+    def test_key_not_in_agent_raises_keyerror_naming_ssh_add(self):
+        key = self._keygen("never_added")
+        with self.assertRaises(KeyError_) as ctx:
+            get_token(agent_pubkey=key + ".pub")
+        self.assertIn("refused to sign", str(ctx.exception))
+        self.assertIn("ssh-add", str(ctx.exception))
+
+    def test_sk_key_type_is_refused(self):
+        """FIDO/security keys: signature carries authenticator fields the
+        server does not verify.  Blob crafted by hand, no hardware needed."""
+        typ = b"sk-ssh-ed25519@openssh.com"
+        blob = (struct.pack(">I", len(typ)) + typ
+                + struct.pack(">I", 32) + b"\x00" * 32
+                + struct.pack(">I", 4) + b"ssh:")
+        pub = os.path.join(self.dir, "sk.pub")
+        with open(pub, "w") as f:
+            f.write("sk-ssh-ed25519@openssh.com "
+                    + base64.b64encode(blob).decode("ascii") + " test\n")
+        with self.assertRaises(KeyError_) as ctx:
+            get_token(agent_pubkey=pub)
+        self.assertIn("security key", str(ctx.exception))
+        self.assertIn("sk-ssh-ed25519@openssh.com", str(ctx.exception))
+
+    def test_agent_pubkey_with_key_path_raises_valueerror(self):
+        key = self._keygen("both_args")
+        with self.assertRaises(ValueError):
+            get_token(agent_pubkey=key + ".pub", key_path=key)
+
+    def test_agent_pubkey_with_version_1_raises_valueerror(self):
+        key = self._keygen("v1_combo")
+        with self.assertRaises(ValueError):
+            get_token(agent_pubkey=key + ".pub", version=1)
+        with self.assertRaises(ValueError):
+            get_token(agent_pubkey=key + ".pub", challenge_cmd="echo x")
+
+    def test_missing_pubkey_file_raises_keyerror(self):
+        with self.assertRaises(KeyError_) as ctx:
+            get_token(agent_pubkey=os.path.join(self.dir, "missing.pub"))
+        self.assertIn("Cannot read public key", str(ctx.exception))
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────

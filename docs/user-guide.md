@@ -121,6 +121,47 @@ keys (`sk-ssh-ed25519@openssh.com`) are refused, because their signature
 carries authenticator fields the module does not verify. `--agent` does not
 work with `--v1`.
 
+## Connecting with a security key
+
+A key on a FIDO authenticator (`ssh-keygen -t ed25519-sk`) authenticates like
+any other, with two differences: the private key never leaves the hardware,
+so signing goes through an agent, and the authenticator must report that
+someone touched it.
+
+```sh
+ssh-keygen -t ed25519-sk -f ~/.ssh/id_ed25519_sk
+sudo pg_sshkey_addkey -a alice ~/.ssh/id_ed25519_sk.pub
+ssh-add ~/.ssh/id_ed25519_sk
+pg_sshkey_connect --agent ~/.ssh/id_ed25519_sk.pub -h dbserver -U alice mydb
+```
+
+The key flashes; touch it. A signature whose user-presence bit is clear is
+refused, so a login cannot happen without that touch. Only
+`sk-ssh-ed25519@openssh.com` is supported:
+`sk-ecdsa-sha2-nistp256@openssh.com` is refused, because the server has no
+ECDSA verifier. There is no key-file route, because there is no private key
+file to read, and no certificate support for security keys yet.
+
+The tests exercise this path with signatures built to the authenticator
+format rather than with hardware, so the format is verified and a particular
+vendor's token is not.
+
+## Revoking a key
+
+`revoked_keys` in `/etc/pam.d/postgresql` names a file of public keys that
+may not authenticate ([Configuration](configuration.md#revoked-keys)). To
+withdraw a key, append it and reload nothing: the module reads the file on
+every attempt.
+
+```sh
+sudo sh -c 'cat /home/alice/.ssh/id_ed25519.pub >> /etc/pg_sshkeys/revoked_keys'
+```
+
+This works for a key registered in an `authorized_keys` file and for a key
+certified by a CA, which is the only way to withdraw a certificate before it
+expires. The list names keys, so there is no revocation by certificate
+serial or key id.
+
 ## Connecting with a certificate
 
 A key certified by a trusted certificate authority needs no `authorized_keys`

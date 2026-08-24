@@ -160,7 +160,7 @@ fi
 [[ -z "$KEY_DATA" ]] && die "No key data provided"
 
 # ── validate key format ───────────────────────────────────────────────────────
-VALID_TYPES="ssh-ed25519 ssh-rsa rsa-sha2-256 rsa-sha2-512"
+VALID_TYPES="ssh-ed25519 ssh-rsa rsa-sha2-256 rsa-sha2-512 sk-ssh-ed25519@openssh.com"
 KEY_TYPE=$(echo "$KEY_DATA" | awk 'NR==1{print $1}')
 
 # Strip unsupported types with a warning

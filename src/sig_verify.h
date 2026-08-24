@@ -10,6 +10,10 @@
  * For Ed25519 the signature is 64 raw bytes (no hash pre-processing -
  * Ed25519 internally hashes with SHA-512).
  * For RSA the signature is an RSASSA-PKCS1-v1_5 (SHA-256) signature.
+ * For sk-ssh-ed25519@openssh.com the signature is 69 bytes, the 64 raw bytes
+ * followed by the flags byte and the 4-byte counter, and it covers
+ * SHA256(application) || flags || counter || SHA256(message).  The
+ * user-presence flag must be set.
  *
  * SPDX-License-Identifier: MIT
  */

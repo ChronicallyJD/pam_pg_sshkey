@@ -13,7 +13,10 @@ see the [User guide](user-guide.md).
 | 1 (legacy) | `<nonce_hex>:<base64_sig>` | `"pg-sshkey-v1\0" \|\| nonce_bytes` | A nonce file created by `pg_sshkey_challenge` exists in `challenge_dir` and is under 60 seconds old; the file is then deleted |
 
 Each prefix is 13 bytes including the NUL. `nonce_hex` is 64 lowercase
-hexadecimal characters (32 random bytes). Ed25519 signs the message directly;
+hexadecimal characters (32 random bytes). A security key's signature field
+holds 69 bytes, the 64 raw bytes followed by the flags byte and the 4-byte
+counter, and covers `SHA256(application) || flags || counter ||
+SHA256(message)`. Ed25519 signs the message directly;
 RSA uses PKCS#1 v1.5 with SHA-256. `base64_cert` is the second field of an
 OpenSSH `*-cert.pub` file, unchanged; `ssh-ed25519-cert-v01@openssh.com` and
 `ssh-rsa-cert-v01@openssh.com` are accepted. The module tells the versions
@@ -117,6 +120,7 @@ Set in `/etc/pam.d/postgresql`; see [Configuration](configuration.md#module-opti
 | `authorized_keys_dir=<dir>` | `/etc/pg_sshkeys` |
 | `challenge_dir=<dir>` | `/var/run/pg_sshkey` |
 | `trusted_ca_keys=<file>` | unset (certificate tokens refused) |
+| `revoked_keys=<file>` | unset (no revocation list) |
 | `debug` | off |
 
 ## Log messages
@@ -131,6 +135,10 @@ hosts read them with `journalctl -t postgres` or
 | info | `user 'U' authenticated with key K` | Success. `K` is the key comment, or its type |
 | info | `user 'U' authenticated with certificate 'KEYID' serial N` | Success with a v3 token. `KEYID` is the `-I` value given to `ssh-keygen` |
 | warning | `authentication failed for 'U'` | No registered key (v1, v2) or the certified key (v3) verifies the signature |
+| warning | `key for 'U' is revoked` | The key that verified is listed in `revoked_keys` |
+| warning | `certificate for 'U' rejected: key is revoked` | The certified key is listed in `revoked_keys` |
+| error | `cannot read revoked_keys PATH: ..., refusing` | The list is missing or unreadable, so every login is refused |
+| error | `revoked_keys PATH is world/group writable, refusing` | Mode allows writes by group or others |
 | warning | `replayed token for 'U' (nonce already used)` | A v2 or v3 token was presented a second time |
 | warning | `token timestamp for 'U' is N s from server time (limit 60), expired or clock skew` | v2 or v3 timestamp outside the window |
 | warning | `certificate token for 'U' but trusted_ca_keys is not set` | A v3 token arrived and the option is absent from `/etc/pam.d/postgresql` |

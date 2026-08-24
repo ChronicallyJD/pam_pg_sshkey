@@ -72,12 +72,17 @@ make -C "$SRC" install-conf >/dev/null
 # install-conf ships the auth line without trusted_ca_keys; the e2e checks
 # need it.  Appended once, after the challenge_dir continuation line.
 PAMCONF=/etc/pam.d/postgresql
+# install-conf ships the auth line with neither option; the e2e checks need
+# both.  One edit adds them together: appending them separately would leave
+# the second sed without the challenge_dir line it anchors on.
 if ! grep -qE '^[^#]*trusted_ca_keys=' "$PAMCONF"; then
-    log "adding trusted_ca_keys to $PAMCONF"
-    sed -i 's|^\([[:space:]]*challenge_dir=[^[:space:]]*\)[[:space:]]*$|\1 \\\n            trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys|' "$PAMCONF"
-    grep -q 'trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys' "$PAMCONF" \
-        || { echo "provision: could not add trusted_ca_keys to $PAMCONF (no challenge_dir= line?)" >&2; exit 1; }
+    log "adding trusted_ca_keys and revoked_keys to $PAMCONF"
+    sed -i 's|^\([[:space:]]*challenge_dir=[^[:space:]]*\)[[:space:]]*$|\1 \\\n            trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys \\\n            revoked_keys=/etc/pg_sshkeys/revoked_keys|' "$PAMCONF"
 fi
+for opt in trusted_ca_keys revoked_keys; do
+    grep -qE "^[^#]*$opt=" "$PAMCONF" \
+        || { echo "provision: could not add $opt to $PAMCONF" >&2; exit 1; }
+done
 install -d -m 1733 -o postgres -g postgres "$CHAL_DIR"
 chown postgres:postgres "$CHAL_DIR"; chmod 1733 "$CHAL_DIR"
 
@@ -167,6 +172,20 @@ if ! cmp -s "$CA_DIR/trusted_ca.pub" "$TRUSTED_CA_KEYS" 2>/dev/null; then
     install -m 640 -o root -g postgres "$CA_DIR/trusted_ca.pub" "$TRUSTED_CA_KEYS"
 fi
 chown root:postgres "$TRUSTED_CA_KEYS"; chmod 640 "$TRUSTED_CA_KEYS"
+
+# ── revocation list: present and empty, so the checks can fill it ───────────
+REVOKED_KEYS=/etc/pg_sshkeys/revoked_keys
+[[ -f "$REVOKED_KEYS" ]] || : > "$REVOKED_KEYS"
+chown root:postgres "$REVOKED_KEYS"; chmod 640 "$REVOKED_KEYS"
+
+# ── a software security key for the sk checks ──────────────────────────────
+# No FIDO hardware in a container: sk_helper.py signs the way an
+# authenticator does, which is what the module verifies.
+runuser -l alice -c "mkdir -p -m 700 ~/.ssh"
+if [[ ! -f /home/alice/.ssh/sk.pub ]]; then
+    log "generating a software security key for alice"
+    runuser -l alice -c "python3 $SRC/tests/sk_helper.py keygen ~/.ssh >/dev/null"
+fi
 
 # sign <user> <name> <ca> <ssh-keygen -s args...>
 # Copies ~/.ssh/id_ed25519.pub to ~/.ssh/<name>.pub and signs it, producing

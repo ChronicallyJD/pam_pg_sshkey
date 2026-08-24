@@ -411,6 +411,75 @@ check_agent_absent_is_a_clean_error() {
     grep -q "SSH_AUTH_SOCK is not set" <<<"$out" || { echo "unclear error: $out"; return 1; }
 }
 
+# ── revocation ──────────────────────────────────────────────────────────────
+REVOKED=/etc/pg_sshkeys/revoked_keys
+clear_revocations() { : > "$REVOKED"; chown root:postgres "$REVOKED"; chmod 640 "$REVOKED"; }
+check_revoked_key_rejected() {
+    ensure_agent_key_registered || { echo "addkey failed"; return 1; }
+    # it works before the key is revoked
+    local out; out=$(as_alice_with_agent id_agent - \
+        "pg_sshkey_connect --agent ~/.ssh/id_agent.pub -h 127.0.0.1 -- -tAc 'select 1'" 2>&1) \
+        || { echo "before: $out"; return 1; }
+    local cur; cur=$(journal_mark)
+    cat /home/alice/.ssh/id_agent.pub > "$REVOKED"; chmod 640 "$REVOKED"
+    out=$(as_alice_with_agent id_agent - \
+        "pg_sshkey_connect --agent ~/.ssh/id_agent.pub -h 127.0.0.1 -- -tAc 'select 1'" 2>&1) \
+        && { clear_revocations; echo "a revoked key authenticated"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: key for 'alice' is revoked" || { clear_revocations; return 1; }
+    # and the other keys still work while it is revoked
+    out=$(as_alice "pg_sshkey_connect -h 127.0.0.1 -- -tAc 'select current_user'" 2>&1) \
+        || { clear_revocations; echo "another key was locked out: $out"; return 1; }
+    clear_revocations
+    [[ "$out" == "alice" ]] || { echo "got: $out"; return 1; }
+}
+check_revoked_certificate_rejected() {
+    local cur; cur=$(journal_mark)
+    cat /home/carol/.ssh/id_ed25519.pub > "$REVOKED"; chmod 640 "$REVOKED"
+    local out; out=$(as_carol "pg_sshkey_connect --cert $CAROL_CERT -h 127.0.0.1 -- -tAc 'select 1'" 2>&1) \
+        && { clear_revocations; echo "a revoked certified key authenticated"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: certificate for 'carol' rejected: key is revoked" || { clear_revocations; return 1; }
+    clear_revocations
+}
+check_unreadable_revocation_list_fails_closed() {
+    local cur; cur=$(journal_mark)
+    mv "$REVOKED" "$REVOKED.away"
+    local out; out=$(as_alice "pg_sshkey_connect -h 127.0.0.1 -- -tAc 'select 1'" 2>&1) \
+        && { mv "$REVOKED.away" "$REVOKED"; echo "authenticated with an unreadable revocation list"; return 1; }
+    mv "$REVOKED.away" "$REVOKED"
+    expect_journal "$cur" "cannot read revoked_keys"
+}
+
+# ── security keys ───────────────────────────────────────────────────────────
+SK_HELPER="python3 $SRC/tests/sk_helper.py"
+check_security_key_connect() {
+    pg_sshkey_addkey -a alice /home/alice/.ssh/sk.pub >/dev/null || { echo "addkey failed"; return 1; }
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_alice "
+        tok=\$($SK_HELPER token ~/.ssh) || exit 9
+        PGPASSWORD=\$tok psql -h 127.0.0.1 -U alice -d alice -tAc 'select current_user'
+    " 2>&1) || { echo "$out"; return 1; }
+    [[ "$out" == "alice" ]] || { echo "got: $out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: user 'alice' authenticated with key sk"
+}
+check_security_key_without_presence_rejected() {
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_alice "
+        tok=\$($SK_HELPER token ~/.ssh --flags 0) || exit 9
+        PGPASSWORD=\$tok psql -h 127.0.0.1 -U alice -d alice -tAc 'select 1'
+    " 2>&1) && { echo "a signature with no user presence authenticated"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: authentication failed for 'alice'"
+}
+check_revoked_security_key_rejected() {
+    local cur; cur=$(journal_mark)
+    cat /home/alice/.ssh/sk.pub > "$REVOKED"; chmod 640 "$REVOKED"
+    local out; out=$(as_alice "
+        tok=\$($SK_HELPER token ~/.ssh) || exit 9
+        PGPASSWORD=\$tok psql -h 127.0.0.1 -U alice -d alice -tAc 'select 1'
+    " 2>&1) && { clear_revocations; echo "a revoked security key authenticated"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: key for 'alice' is revoked" || { clear_revocations; return 1; }
+    clear_revocations
+}
+
 echo "=== pam_pg_sshkey e2e ($(. /etc/os-release; echo "$PRETTY_NAME"), $(runuser -u postgres -- psql -tAc 'show server_version')) ==="
 run_check tcp_connect_as_alice
 run_check local_socket_connect_as_alice
@@ -447,4 +516,10 @@ run_check agent_rsa_key_connects
 run_check agent_certificate_connects
 run_check agent_query_and_python_connect
 run_check agent_absent_is_a_clean_error
+run_check revoked_key_rejected
+run_check revoked_certificate_rejected
+run_check unreadable_revocation_list_fails_closed
+run_check security_key_connect
+run_check security_key_without_presence_rejected
+run_check revoked_security_key_rejected
 summary

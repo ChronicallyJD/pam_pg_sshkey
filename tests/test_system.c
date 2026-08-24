@@ -629,19 +629,30 @@ static void test_agent_without_auth_sock_fails(void) {
     rm_dir();
 }
 
-static void test_agent_security_key_type_refused(void) {
-    /* sk-* signatures carry authenticator fields the server does not verify */
+static void test_agent_security_key_types(void) {
+    /*
+     * sk-ecdsa needs an ECDSA verifier the server does not have, so it is
+     * refused on the key type alone.  sk-ssh-ed25519 is supported and gets
+     * past that check, failing later for want of an agent.
+     */
     mk_dir();
     char pub[512], cmd[2048], out[1024];
-    snprintf(pub, sizeof(pub), "%s/sk.pub", g_dir);
+
+    snprintf(pub, sizeof(pub), "%s/sk_ecdsa.pub", g_dir);
+    ASSERT_EQ(fake_pubkey("sk-ecdsa-sha2-nistp256@openssh.com", pub), 0);
+    snprintf(cmd, sizeof(cmd),
+        "SSH_AUTH_SOCK=/nonexistent pg_sshkey_sign --agent %s 2>%s/err", pub, g_dir);
+    ASSERT_EQ(run_capture(cmd, out, sizeof(out)), 1);
+    ASSERT_STR_EQ(out, "");
+    ASSERT_TRUE(stderr_mentions_cert("no ECDSA verifier"));
+
+    snprintf(pub, sizeof(pub), "%s/sk_ed.pub", g_dir);
     ASSERT_EQ(fake_pubkey("sk-ssh-ed25519@openssh.com", pub), 0);
     snprintf(cmd, sizeof(cmd),
         "SSH_AUTH_SOCK=/nonexistent pg_sshkey_sign --agent %s 2>%s/err", pub, g_dir);
-    int rc = run_capture(cmd, out, sizeof(out));
-    ASSERT_EQ(rc, 1);
-    ASSERT_STR_EQ(out, "");
-    /* refused on the key type, before any socket is touched */
-    ASSERT_TRUE(stderr_mentions_cert("FIDO/security key"));
+    ASSERT_EQ(run_capture(cmd, out, sizeof(out)), 1);
+    ASSERT_FALSE(stderr_mentions_cert("no ECDSA verifier"));
+    ASSERT_TRUE(stderr_mentions_cert("Cannot connect to the ssh-agent"));
     rm_dir();
 }
 
@@ -791,7 +802,7 @@ int main(void) {
     RUN(test_sign_cert_not_a_cert_fails);
     RUN(test_sign_cert_unpadded_field_fails);
     RUN(test_agent_without_auth_sock_fails);
-    RUN(test_agent_security_key_type_refused);
+    RUN(test_agent_security_key_types);
     RUN(test_agent_rejects_private_key_and_stray_positional);
     RUN(test_sign_cert_signature_covers_v3_prefix);
     RUN(test_pipeline_two_challenges_two_tokens);

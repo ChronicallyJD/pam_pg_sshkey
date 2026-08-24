@@ -99,6 +99,7 @@ typedef struct {
     const char *authkeys_dir;
     const char *challenge_dir;
     const char *trusted_ca_keys;   /* NULL: certificate tokens refused */
+    const char *revoked_keys;      /* NULL: no revocation list */
     int         debug;
 } mod_opts_t;
 
@@ -108,6 +109,7 @@ parse_opts(mod_opts_t *opts, int argc, const char **argv)
     opts->authkeys_dir  = DEFAULT_AUTHKEYS_DIR;
     opts->challenge_dir = DEFAULT_CHALLENGE_DIR;
     opts->trusted_ca_keys = NULL;
+    opts->revoked_keys  = NULL;
     opts->debug         = 0;
 
     for (int i = 0; i < argc; i++) {
@@ -117,6 +119,8 @@ parse_opts(mod_opts_t *opts, int argc, const char **argv)
             opts->challenge_dir = argv[i] + 14;
         else if (strncmp(argv[i], "trusted_ca_keys=", 16) == 0)
             opts->trusted_ca_keys = argv[i] + 16;
+        else if (strncmp(argv[i], "revoked_keys=", 13) == 0)
+            opts->revoked_keys = argv[i] + 13;
         else if (strcmp(argv[i], "debug") == 0)
             opts->debug = 1;
     }
@@ -327,6 +331,54 @@ load_user_keys(pam_handle_t *pamh, const mod_opts_t *opts, const char *username)
     return keys;
 }
 
+/* ── revocation ──────────────────────────────────────────────────────── */
+/*
+ * Is this key revoked?  Returns 1 revoked, 0 not revoked, -1 unusable list.
+ *
+ * A list that cannot be read is -1 and the caller refuses the login: a
+ * revocation list that silently disappears must not silently readmit every
+ * key it named.  An empty file is a valid list that revokes nothing.
+ */
+static int
+key_is_revoked(pam_handle_t *pamh, const mod_opts_t *opts, EVP_PKEY *key)
+{
+    const char *path = opts->revoked_keys;
+    if (!path || !*path)
+        return 0;                       /* option off */
+
+    struct stat st;
+    if (stat(path, &st) != 0 || access(path, R_OK) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: cannot read revoked_keys %s: %s, refusing "
+                   "(the file must exist and be readable by the postgres user)",
+                   path, strerror(errno));
+        return -1;
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: revoked_keys %s is world/group writable, "
+                   "refusing", path);
+        return -1;
+    }
+
+    key_list_t *revoked = NULL;
+    int n = parse_authorized_keys(path, &revoked);
+    if (n < 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: cannot parse revoked_keys %s, refusing", path);
+        return -1;
+    }
+    int hit = key_in_list(key, revoked);
+    free_key_list(revoked);
+    if (hit)
+        return 1;
+    if (opts->debug)
+        pam_syslog(pamh, LOG_DEBUG,
+                   "pam_pg_sshkey: key is not among the %d revoked key(s) in %s",
+                   n, path);
+    return 0;
+}
+
 /* ── v2 authentication ───────────────────────────────────────────────── */
 static int
 authenticate_v2(pam_handle_t *pamh, const mod_opts_t *opts,
@@ -387,6 +439,16 @@ authenticate_v2(pam_handle_t *pamh, const mod_opts_t *opts,
         free_key_list(keys);
         pam_syslog(pamh, LOG_WARNING,
                    "pam_pg_sshkey: authentication failed for '%s'", username);
+        return PAM_AUTH_ERR;
+    }
+
+    /* revoked keys are refused even though the signature is good */
+    int rev = key_is_revoked(pamh, opts, matched->pkey);
+    if (rev != 0) {
+        free_key_list(keys);
+        if (rev == 1)
+            pam_syslog(pamh, LOG_WARNING,
+                       "pam_pg_sshkey: key for '%s' is revoked", username);
         return PAM_AUTH_ERR;
     }
 
@@ -619,10 +681,24 @@ authenticate_v3(pam_handle_t *pamh, const mod_opts_t *opts,
     memcpy(msg + SIGN_PREFIX_V3_LEN, head, head_len);
     size_t msg_len = SIGN_PREFIX_V3_LEN + head_len;
 
-    key_list_t certified = { cert->key_type, cert->key_id, cert->pkey, NULL };
+    key_list_t certified = { .key_type = cert->key_type,
+                             .comment  = cert->key_id,
+                             .pkey     = cert->pkey,
+                             .sk_application = NULL,
+                             .next     = NULL };
     if (verify_signature_raw(&certified, msg, msg_len, sig_bytes, sig_len) != 0) {
         pam_syslog(pamh, LOG_WARNING,
                    "pam_pg_sshkey: authentication failed for '%s'", username);
+        goto out;
+    }
+
+    /* a certificate does not outrank the revocation list */
+    int rev = key_is_revoked(pamh, opts, cert->pkey);
+    if (rev != 0) {
+        if (rev == 1)
+            pam_syslog(pamh, LOG_WARNING,
+                       "pam_pg_sshkey: certificate for '%s' rejected: "
+                       "key is revoked", username);
         goto out;
     }
 
@@ -858,6 +934,13 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
                                    challenge_bytes, challenge_len,
                                    sig_bytes,       sig_len);
         if (vrc == 0) {
+            int rev = key_is_revoked(pamh, &opts, k->pkey);
+            if (rev != 0) {
+                if (rev == 1)
+                    pam_syslog(pamh, LOG_WARNING,
+                               "pam_pg_sshkey: key for '%s' is revoked", username);
+                break;                       /* authenticated stays 0 */
+            }
             pam_syslog(pamh, LOG_INFO,
                        "pam_pg_sshkey: user '%s' authenticated with key %s",
                        username, k->comment ? k->comment : k->key_type);

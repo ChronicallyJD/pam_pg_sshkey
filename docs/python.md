@@ -39,8 +39,10 @@ passphrase, be an OpenSSH-format RSA key, or live on another machine behind a
 forwarded agent. RSA identities are signed as `rsa-sha2-256`, and an agent
 that answers with `ssh-rsa` raises `KeyError_`, as do a missing
 `SSH_AUTH_SOCK`, an unreachable socket, an identity the agent does not hold,
-an `sk-` FIDO key, an empty signature, and a signature that does not verify
-with the public key you named. The wait for the agent is 60 seconds,
+an `sk-ecdsa` key, an empty signature, and a signature that does not verify
+with the public key you named. An `sk-ssh-ed25519@openssh.com` identity
+works: the token then carries the authenticator's flags and counter, and a
+signature reporting no user presence is refused. The wait for the agent is 60 seconds,
 overridden by `PG_SSHKEY_AGENT_TIMEOUT_MS`. It combines with `cert_path`.
 
 ```python

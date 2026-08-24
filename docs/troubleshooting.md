@@ -29,6 +29,10 @@ of an attempt. Remove it afterwards.
 | Journal: `authentication failed for 'U'` | The signing key is not one of the registered keys | `pg_sshkey_addkey --list U`; check `-i` on the client |
 | Journal: `token timestamp ... expired or clock skew` | Client clock differs from server by more than 60 seconds, or a token was reused after 60 seconds | Synchronise clocks; mint a token per connection |
 | Journal: `replayed token for 'U'` | The same token was presented twice | Mint a token per connection; do not store tokens |
+| Journal: `key for 'U' is revoked` | The key is listed in `revoked_keys` | Intended; remove the line from the file to restore it |
+| Journal: `cannot read revoked_keys` | The list is missing or unreadable by `postgres` | Create it (an empty file revokes nothing) and `chown root:postgres`, `chmod 640` |
+| Journal: `authentication failed` with an `sk-` key | The authenticator reported no user presence, or the key signed for another application | Touch the key when it flashes; check the key was registered from the same `.pub` |
+| `pg_sshkey_sign`: `no ECDSA verifier` | An `sk-ecdsa-sha2-nistp256` key | Use `ssh-keygen -t ed25519-sk` |
 | Journal: `certificate token for 'U' but trusted_ca_keys is not set` | A `--cert` client against a server without the option | Add `trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys` to the module line; see [Configuration](configuration.md#certificates) |
 | Journal: `cannot read trusted_ca_keys ...` or `trusted_ca_keys ... is world/group writable` | CA file ownership or mode | `sudo chown root:postgres /etc/pg_sshkeys/trusted_ca_keys && sudo chmod 640 /etc/pg_sshkeys/trusted_ca_keys` |
 | Journal: `certificate for 'U' rejected: principal 'U' not listed` | The certificate was signed with a different `-n` principal, or none | Re-sign with `-n U` |

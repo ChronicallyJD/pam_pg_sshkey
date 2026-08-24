@@ -50,6 +50,33 @@ enforced; host certificates are refused; CA signatures made with the SHA-1
 principal must be the role name itself. The CA file is subject to the same
 ownership and mode rules as `authorized_keys`.
 
+## Revoked keys
+
+`revoked_keys` is checked after the signature verifies and before the login
+is granted, on every attempt and for every path: a key in an
+`authorized_keys` file, a key certified by a trusted CA, and a key on a
+security key alike. Revoking the key inside a certificate is the only way to
+withdraw that certificate before `valid_before`, and it takes effect on the
+next connection with no reload. A list that cannot be read refuses every
+login rather than readmitting the keys it named, and the file is subject to
+the same ownership and mode rules as `authorized_keys`. The list holds
+keys: there is no revocation by certificate serial or key id, and no KRL
+support.
+
+## Security keys
+
+An `sk-ssh-ed25519@openssh.com` key signs
+`SHA256(application) || flags || counter || SHA256(message)`, and the module
+verifies all of it, so a signature made for another application does not
+authenticate here. The user-presence bit must be set, which is what makes
+the touch a requirement rather than a convention; the module does not
+require user verification (a PIN), and does not check the counter for
+rollback, because a database server sees a fraction of a key's use and would
+reject legitimate logins. `sk-ecdsa-sha2-nistp256@openssh.com` is not
+supported. The private key is on the hardware, so signing goes through an
+agent, and what the tests verify is the signature format rather than any
+particular authenticator.
+
 ## What the module does not do
 
 - It does not encrypt the connection. The token is the PostgreSQL password
@@ -68,8 +95,9 @@ ownership and mode rules as `authorized_keys`.
   the intermediate host can have the agent sign a database token for as long
   as the socket lives, and the tested matrix covers only a local agent.
   Without `--agent` the C tools read an unencrypted private key file and the
-  Python module accepts a passphrase. FIDO security keys (`sk-`) are not
-  supported by either route.
+  Python module accepts a passphrase. An `sk-ssh-ed25519@openssh.com` key
+  works through `--agent` only, because its private key is on the hardware;
+  `sk-ecdsa` is not supported by either route.
 
 ## File permissions
 

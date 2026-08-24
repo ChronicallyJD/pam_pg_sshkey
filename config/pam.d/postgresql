@@ -20,6 +20,15 @@
 #                               unset, certificate tokens are refused.
 #                               Recommended: /etc/pg_sshkeys/trusted_ca_keys
 #
+#   revoked_keys=<file>         Public keys that may not authenticate, in
+#                               authorized_keys format.  Checked after the
+#                               signature verifies, for plain keys, certified
+#                               keys, and security keys alike.  Same ownership
+#                               and mode rules as trusted_ca_keys.  A file that
+#                               cannot be read refuses every login.
+#                               No default: when unset, nothing is revoked.
+#                               Recommended: /etc/pg_sshkeys/revoked_keys
+#
 #   debug                       Enable verbose syslog output.
 
 auth    required    pam_pg_sshkey.so \

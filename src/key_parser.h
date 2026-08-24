@@ -10,6 +10,10 @@
  *   rsa-sha2-512     RSA, alias label, same key, same verification
  *                    (the label names the key, not a digest; see sig_verify.c)
  *   ssh-ed25519      Ed25519
+ *   sk-ssh-ed25519@openssh.com
+ *                    Ed25519 on a FIDO security key.  The signature carries
+ *                    a flags byte and a counter, and covers the application
+ *                    string as well as the message (see sig_verify.c).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -25,6 +29,8 @@ typedef struct key_list {
     char         *key_type;   /* e.g. "ssh-ed25519", "ssh-rsa" */
     char         *comment;    /* optional comment field, may be NULL */
     EVP_PKEY     *pkey;       /* OpenSSL public key, ready to verify */
+    char         *sk_application; /* sk- keys only: the application string
+                                     ("ssh:"), part of what the key signs */
     struct key_list *next;
 } key_list_t;
 
@@ -39,6 +45,20 @@ typedef struct key_list {
  * On file-open error returns -1.
  */
 int parse_authorized_keys(const char *path, key_list_t **out);
+
+/*
+ * Decode an sk-ssh-ed25519@openssh.com public key blob.  On success returns
+ * the Ed25519 key and sets *application to a malloc'd copy of the
+ * application string; NULL on any other key type or a malformed blob.
+ */
+EVP_PKEY *ssh_sk_pubkey_from_blob(const unsigned char *blob, size_t len,
+                                  char **application);
+
+/*
+ * Is `key` one of the keys in `list`?  Compares the public key material,
+ * not the text, so a different comment or label does not matter.
+ */
+int key_in_list(const EVP_PKEY *key, const key_list_t *list);
 
 /*
  * Free a key_list returned by parse_authorized_keys.

@@ -61,8 +61,12 @@ ownership and mode rules as `authorized_keys`.
   name; feed the journal to fail2ban or an equivalent if brute-force attempts
   are a concern. Signature verification makes guessing infeasible, but each
   attempt costs the server a verification.
-- It does not read keys from `ssh-agent`. The C tools need an unencrypted
-  private key file; the Python module accepts a passphrase.
+- It does not hold your private key. With `--agent` the key stays in the
+  ssh-agent and the client only receives a signature, so the key can be
+  passphrase-protected or on another machine behind a forwarded agent.
+  Without `--agent` the C tools read an unencrypted private key file and the
+  Python module accepts a passphrase. FIDO security keys (`sk-`) are not
+  supported by either route.
 
 ## File permissions
 

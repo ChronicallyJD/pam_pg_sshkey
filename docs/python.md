@@ -31,7 +31,19 @@ the connection opens.
 | `version` | `2` | `1` selects the legacy server-nonce token |
 | `challenge_dir` | `/var/run/pg_sshkey` | v1 only: where to create the nonce on a local server |
 | `challenge_cmd` | `None` | v1 only: command that creates the nonce on a remote server and prints it; implies `version=1` |
+| `agent_pubkey` | `None` | Path to the public key of an identity in the ssh-agent at `$SSH_AUTH_SOCK`; the private key is never read. `ValueError` with `key_path`, `version=1`, or `challenge_cmd` |
 | `cert_path` | `None` | Path to an OpenSSH user certificate (`*-cert.pub`) for the key; produces a v3 token `<ts>:<nonce_hex>:<base64_signature>:<base64_cert>`. `ValueError` with `version=1` or `challenge_cmd` |
+
+`agent_pubkey` replaces `key_path`: the agent signs, so the key may carry a
+passphrase, be an OpenSSH-format RSA key, or live on another machine behind a
+forwarded agent. RSA identities are signed as `rsa-sha2-256`, and an agent
+that answers with `ssh-rsa` raises `KeyError_`, as do a missing
+`SSH_AUTH_SOCK`, an unreachable socket, an identity the agent does not hold,
+and an `sk-` FIDO key. It combines with `cert_path`.
+
+```python
+token = get_token(agent_pubkey="~/.ssh/id_ed25519.pub")
+```
 
 `cert_path` needs `trusted_ca_keys` set on the server and a certificate whose
 principals include the role name ([User guide](user-guide.md#connecting-with-a-certificate)).
@@ -49,7 +61,7 @@ cur = conn.cursor()
 cur.execute("SELECT current_user")
 ```
 
-`connect` accepts the `get_token` parameters, including `cert_path`, and
+`connect` accepts the `get_token` parameters, including `agent_pubkey` and `cert_path`, and
 forwards every other keyword argument to `psycopg2.connect`. Passing `password=` raises `ValueError`; the
 function sets it. Each call mints a new token, so call `connect` again rather
 than reusing a token after a disconnect.
@@ -63,7 +75,7 @@ logical  = connect_replication(user="replicator", host="publisher", dbname="mydb
 physical = connect_replication(user="replicator", host="publisher", replication=True)
 ```
 
-`connect_replication` accepts `cert_path` as well, and sets `replication=` and the matching psycopg2
+`connect_replication` accepts `agent_pubkey` and `cert_path` as well, and sets `replication=` and the matching psycopg2
 `connection_factory`: `"database"` (the default) gives a
 `LogicalReplicationConnection`; `True`, `"true"`, `"on"`, `"yes"`, or `"1"`
 gives a `PhysicalReplicationConnection`. An explicit `connection_factory=` is
@@ -75,7 +87,7 @@ All errors raised by the module derive from `PamPgSshKeyError`:
 
 | Exception | Raised when |
 | --- | --- |
-| `KeyError_` | The key file is missing, unreadable, encrypted without a passphrase, of an unsupported type, or needs `bcrypt`; or `cert_path` cannot be read or is not a `*-cert-v01@openssh.com` certificate |
+| `KeyError_` | The key file is missing, unreadable, encrypted without a passphrase, of an unsupported type, or needs `bcrypt`; or `cert_path` cannot be read or is not a `*-cert-v01@openssh.com` certificate; or an ssh-agent signature could not be obtained |
 | `ChallengeError` | A v1 nonce could not be created, or `challenge_cmd` failed or printed something other than a 64-character hex nonce |
 
 Messages include the command to fix the problem. The module never lets a raw

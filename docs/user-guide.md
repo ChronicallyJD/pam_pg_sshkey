@@ -86,6 +86,38 @@ pg_sshkey_query -h dbserver -U alice -q 'SELECT now()' mydb
 `pg_sshkey_query` uses psycopg2 and prints the rows. It takes the same
 connection options as `pg_sshkey_connect`.
 
+## Connecting through an ssh-agent
+
+`--agent` signs with a key held by the ssh-agent at `$SSH_AUTH_SOCK` instead
+of reading a private key file. This is the only way to use a
+passphrase-protected key or an OpenSSH-format RSA key, and it works over a
+forwarded agent, so the key can stay on your laptop while you connect from a
+jump host.
+
+Add the key to the agent, then name its public key:
+
+```sh
+ssh-add ~/.ssh/id_ed25519
+pg_sshkey_connect --agent ~/.ssh/id_ed25519.pub -h dbserver -U alice mydb
+pg_sshkey_query --agent ~/.ssh/id_ed25519.pub -h dbserver -U alice -q 'SELECT 1'
+```
+
+`--agent` takes the public key, not the private one, and replaces `-i`. It
+combines with `--cert`:
+
+```sh
+pg_sshkey_connect --agent ~/.ssh/id_ed25519.pub --cert ~/.ssh/id_ed25519-cert.pub \
+    -h dbserver -U alice mydb
+```
+
+The registered key is still the public key of the identity in the agent, so
+`pg_sshkey_addkey` and the certificate rules are unchanged. RSA keys work:
+the client asks the agent for an `rsa-sha2-256` signature, and an agent older
+than OpenSSH 7.2, which can only answer with SHA-1, is refused. FIDO security
+keys (`sk-ssh-ed25519@openssh.com`) are refused, because their signature
+carries authenticator fields the module does not verify. `--agent` does not
+work with `--v1`.
+
 ## Connecting with a certificate
 
 A key certified by a trusted certificate authority needs no `authorized_keys`

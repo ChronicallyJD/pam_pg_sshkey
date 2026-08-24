@@ -125,14 +125,27 @@ gen alice id_ed25519 -t ed25519
 gen alice id_wrong   -t ed25519
 gen alice id_rsa_pem -t rsa -b 2048 -m PEM
 gen bob   id_ed25519 -t ed25519
+# A passphrase-protected key: usable only through an ssh-agent.  The
+# passphrase is fixed so the agent checks can add it non-interactively.
+runuser -l alice -c "mkdir -p -m 700 ~/.ssh; [ -f ~/.ssh/id_locked ] || ssh-keygen -q -t ed25519 -N 'e2e-passphrase' -C id_locked -f ~/.ssh/id_locked"
 gen carol id_ed25519 -t ed25519
 
 # alice's ed25519 key is registered; id_wrong, id_rsa_pem, bob's and carol's
 # keys are not (id_rsa_pem is registered by the rsa check itself; carol
 # authenticates with a certificate only).
 pg_sshkey_addkey alice /home/alice/.ssh/id_ed25519.pub >/dev/null
+pg_sshkey_addkey -a alice /home/alice/.ssh/id_locked.pub >/dev/null
 pg_sshkey_addkey --remove bob   >/dev/null 2>&1 || true
 pg_sshkey_addkey --remove carol >/dev/null 2>&1 || true
+
+# ── askpass helper for the ssh-agent checks ─────────────────────────────────
+# ssh-add reads the passphrase from this script when SSH_ASKPASS_REQUIRE=force.
+# A file, not an inline string: quoting it through runuser mangles it.
+cat > /usr/local/bin/e2e-askpass <<'ASKPASS'
+#!/bin/sh
+printf '%s\n' "e2e-passphrase"
+ASKPASS
+chmod 755 /usr/local/bin/e2e-askpass
 
 # ── certificate authorities ──────────────────────────────────────────────────
 # Private CA keys live under /root (outside authorized_keys_dir so the key

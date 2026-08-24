@@ -13,6 +13,7 @@ connecting from the shell and from Python, and operating it securely.
 | Build and install the module on a server | [Installation](installation.md) |
 | Tell PostgreSQL and PAM to use it | [Configuration](configuration.md) |
 | Register a key and connect | [User guide](user-guide.md) |
+| Log in with a CA-signed certificate instead of a registered key | [User guide](user-guide.md#connecting-with-a-certificate) |
 | Authenticate from a Python application | [Python](python.md) |
 | Run a logical replication subscriber without a stored password | [Replication](replication.md) |
 | Look up a token format, a tool option, or a log message | [Reference](reference.md) |

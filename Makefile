@@ -154,6 +154,8 @@ test check: all $(TEST_BINS)
 	@echo ""
 	@echo "=== test_pg_sshkey_query ===";  $(PYTHON) $T/test_pg_sshkey_query.py
 	@echo ""
+	@echo "=== test_addkey ===";          PAM_PG_SSHKEY_BUILDDIR=$(CURDIR) $T/test_addkey.sh
+	@echo ""
 	@echo "=== test_docs ===";            $T/test_docs.sh
 	@echo ""
 	@echo "All test suites complete."

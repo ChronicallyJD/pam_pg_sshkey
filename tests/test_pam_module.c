@@ -1397,6 +1397,102 @@ test_revocation_names_one_key_not_all(void)
 }
 
 static void
+test_unparseable_revocation_list_fails_closed(void)
+{
+    /*
+     * A file the module cannot read as a list of keys is not an empty list.
+     * An OpenSSH KRL, a cert-authority line, a certificate, a key type this
+     * module does not know: each would silently revoke nothing, which is
+     * the one thing a revocation list must never do.
+     */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(install_pubkey(&e, "alice", "id_ed25519", NULL, 0), 0);
+    enable_revocations(&e, NULL, NULL);          /* empty: a login works */
+
+    char tok[8192], cmd[PATH_MAX * 3];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+
+    /* the same key, but written the way ssh-keygen -k writes a KRL */
+    snprintf(cmd, sizeof(cmd), "ssh-keygen -q -k -f '%s' '%s/id_ed25519.pub' >/dev/null 2>&1",
+             e.revoked_file, e.root);
+    ASSERT_EQ(system(cmd), 0);
+    chmod(e.revoked_file, 0640);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("revoked_keys");
+    ASSERT_EQ(dir_entry_count(e.chal), 1);       /* only the first login's nonce */
+
+    /* a cert-authority prefix: also not a plain key line */
+    snprintf(cmd, sizeof(cmd), "sed 's/^/cert-authority /' '%s/id_ed25519.pub' > '%s'",
+             e.root, e.revoked_file);
+    ASSERT_EQ(system(cmd), 0);
+    chmod(e.revoked_file, 0640);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+
+    /* a directory is not a list either */
+    ASSERT_EQ(unlink(e.revoked_file), 0);
+    ASSERT_EQ(mkdir(e.revoked_file, 0750), 0);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    ASSERT_EQ(rmdir(e.revoked_file), 0);
+
+    /* comments and blank lines around a real key are fine */
+    snprintf(cmd, sizeof(cmd),
+             "{ echo '# revoked 2026-08-24'; echo; cat '%s/id_ed25519.pub'; } > '%s'",
+             e.root, e.revoked_file);
+    ASSERT_EQ(system(cmd), 0);
+    chmod(e.revoked_file, 0640);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    ASSERT_LOGGED("key for 'alice' is revoked");
+    env_teardown(&e);
+}
+
+static void
+test_revoked_ca_key_refuses_its_certificates(void)
+{
+    /* revoking a CA withdraws every certificate it signed */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+
+    enable_revocations(&e, "ca", NULL);          /* the CA, not the user key */
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: signing CA is revoked");
+    env_teardown(&e);
+}
+
+static void
+test_same_file_for_ca_and_revocation_refused(void)
+{
+    /*
+     * Pointing both options at one file would make every revoked key a CA
+     * able to certify any role name, which is the opposite of revoking it.
+     */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    snprintf(e.revoked_file, sizeof(e.revoked_file), "%s", e.ca_file);
+    write_services(&e);
+
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("are the same file");
+    env_teardown(&e);
+}
+
+static void
 test_security_key_authenticates(void)
 {
     /*
@@ -1448,18 +1544,63 @@ static void
 test_security_key_signature_is_bound_to_its_application(void)
 {
     /*
-     * The application string is part of what the key signs, so a signature
-     * made for another application must not open this door.
+     * The application string is part of what the key signs, and it comes
+     * from the registered key rather than from the token.  The key here is
+     * scoped to "ssh:corp", so a signature made for the default "ssh:" must
+     * not open this door: a module that ignored the field and assumed the
+     * default would let it through.
+     */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(sk_keygen(&e, "--application ssh:corp"), 0);
+    ASSERT_EQ(sk_install(&e, "alice"), 0);
+
+    char tok[8192];
+    /* the key's own application authenticates */
+    ASSERT_EQ(sk_token(&e, NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+
+    /* the default application, which this key is not scoped to, does not */
+    ASSERT_EQ(sk_token(&e, "--application-override 'ssh:'", tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    ASSERT_LOGGED("authentication failed for 'alice'");
+
+    /* and neither does a third one */
+    ASSERT_EQ(sk_token(&e, "--application-override 'ssh:other'", tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    env_teardown(&e);
+}
+
+static void
+test_security_key_signature_length_is_exact(void)
+{
+    /*
+     * 69 bytes: 64 raw, one flags byte, four counter bytes.  A signature
+     * field of any other length must be refused before it is unpacked.
      */
     env_t e; env_setup(&e);
     ASSERT_EQ(sk_keygen(&e, NULL), 0);
     ASSERT_EQ(sk_install(&e, "alice"), 0);
 
-    char tok[8192];
-    ASSERT_EQ(sk_token(&e, "--application-override 'ssh:other'", tok, sizeof(tok)), 0);
-    int rc = authenticate(&e, "alice", tok, NULL);
-    ASSERT_EQ(rc, PAM_AUTH_ERR);
-    ASSERT_LOGGED("authentication failed for 'alice'");
+    char tok[8192], mangled[8192], cmd[PATH_MAX * 3];
+    ASSERT_EQ(sk_token(&e, NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+
+    /* one byte too many, then the tail cut off entirely */
+    const char *ops[] = { "b += b'\\0'", "b = b[:64]" };
+    for (size_t i = 0; i < 2; i++) {
+        ASSERT_EQ(sk_token(&e, NULL, tok, sizeof(tok)), 0);
+        snprintf(cmd, sizeof(cmd),
+            "python3 -c \"import base64,sys;t=sys.argv[1].split(':');"
+            "b=bytearray(base64.b64decode(t[2]));%s;"
+            "print(t[0]+':'+t[1]+':'+base64.b64encode(bytes(b)).decode())\" '%s'",
+            ops[i], tok);
+        ASSERT_EQ(run_capture(cmd, mangled, sizeof(mangled)), 0);
+        int rc = authenticate(&e, "alice", mangled, NULL);
+        ASSERT_EQ(rc, PAM_AUTH_ERR);
+        ASSERT_LOGGED("authentication failed for 'alice'");
+    }
     env_teardown(&e);
 }
 
@@ -1887,6 +2028,7 @@ main(void)
     RUN(test_security_key_authenticates);
     RUN(test_security_key_without_user_presence_refused);
     RUN(test_security_key_signature_is_bound_to_its_application);
+    RUN(test_security_key_signature_length_is_exact);
     RUN(test_security_key_counter_and_flags_are_signed);
     RUN(test_security_key_ecdsa_type_is_not_accepted);
     RUN(test_revoked_security_key_refused);
@@ -1895,6 +2037,9 @@ main(void)
     RUN(test_unreadable_revocation_list_fails_closed);
     RUN(test_group_writable_revocation_list_refused);
     RUN(test_revocation_names_one_key_not_all);
+    RUN(test_unparseable_revocation_list_fails_closed);
+    RUN(test_revoked_ca_key_refuses_its_certificates);
+    RUN(test_same_file_for_ca_and_revocation_refused);
     RUN(test_agent_ed25519_authenticates_without_the_private_key_file);
     RUN(test_agent_rsa_key_authenticates);
     RUN(test_agent_passphrase_protected_key_authenticates);

@@ -1294,7 +1294,10 @@ class TestSkAgentSigning(_FakeAgentFixture):
     hardware and no ssh binaries are involved; the fake agent signs the way
     tests/sk_helper.py does."""
 
-    APPLICATION = "ssh:"
+    # Not the default "ssh:".  Every check here then reads the application
+    # out of the public key blob, so a module that ignored the field and
+    # assumed the default fails the whole class instead of passing it.
+    APPLICATION = "ssh:corp"
     TS = 1700000000
     NONCE = "0123456789abcdef" * 4
 
@@ -1303,6 +1306,15 @@ class TestSkAgentSigning(_FakeAgentFixture):
         self.sk_key = Ed25519PrivateKey.generate()
         self.sk_pub = write_sk_pubkey(os.path.join(self.dir, "id_sk.pub"),
                                       self.sk_key, self.APPLICATION)
+
+    def serve(self, responder) -> FakeAgent:
+        """start_agent, but usable more than once in a check: the previous
+        agent is closed and its socket path freed first."""
+        agent = getattr(self, "agent", None)
+        if agent is not None:
+            agent.close()
+            os.unlink(self.sock)
+        return self.start_agent(responder)
 
     def sk_responder(self, key=None, application=None, **kw):
         """Answers the sign request the way a security key does."""
@@ -1377,14 +1389,70 @@ class TestSkAgentSigning(_FakeAgentFixture):
             get_token(agent_pubkey=self.sk_pub)
         self.assertIn("does not verify", str(ctx.exception))
 
-    def test_wrong_application_is_refused(self):
+    def test_signature_is_bound_to_the_keys_application(self):
         """The application string is hashed into what the key signs, and it
-        comes from the public key blob, so a reply signed over another one
-        cannot verify."""
-        self.start_agent(self.sk_responder(application="ssh:other"))
+        comes from the public key blob rather than from the reply.  This key
+        is scoped to "ssh:corp", so a signature made for the default "ssh:"
+        must not pass: a module that ignored the field and assumed the
+        default would take it.  tests/test_pam_module.c makes the same claim
+        in test_security_key_signature_is_bound_to_its_application."""
+        # the key's own application signs a token
+        self.serve(self.sk_responder())
+        self.assertTrue(TOKEN_V2_RE.match(get_token(agent_pubkey=self.sk_pub)))
+
+        # the default application, which this key is not scoped to, does not,
+        # and neither does a third one
+        for other in ("ssh:", "ssh:other"):
+            with self.subTest(application=other):
+                self.serve(self.sk_responder(application=other))
+                with self.assertRaises(KeyError_) as ctx:
+                    get_token(agent_pubkey=self.sk_pub)
+                self.assertIn("does not verify", str(ctx.exception))
+
+    def test_default_application_key_refuses_another_application(self):
+        """The binding holds in both directions: a key scoped to the default
+        "ssh:" takes a signature made for "ssh:" and refuses one made for
+        "ssh:corp".  Without this a module could hard-code either string and
+        still pass."""
+        pub = write_sk_pubkey(os.path.join(self.dir, "id_sk_default.pub"),
+                              self.sk_key, "ssh:")
+        self.serve(self.sk_responder(application="ssh:"))
+        self.assertTrue(TOKEN_V2_RE.match(get_token(agent_pubkey=pub)))
+
+        self.serve(self.sk_responder(application="ssh:corp"))
         with self.assertRaises(KeyError_) as ctx:
-            get_token(agent_pubkey=self.sk_pub)
+            get_token(agent_pubkey=pub)
         self.assertIn("does not verify", str(ctx.exception))
+
+    def test_flags_and_counter_come_from_the_reply(self):
+        """Both trailing bytes are hashed into what the key signs, and both
+        are read from the reply.  A key that reports user verification as well
+        as presence sends flags 0x05, and the counter is whatever the
+        authenticator is at; a module that assumed 0x01, or a fixed counter,
+        would refuse a signature the server accepts."""
+        self.serve(self.sk_responder(flags=0x05, counter=0x12345678))
+        token = get_token(agent_pubkey=self.sk_pub)
+        ts, nonce, sig_b64 = token.split(":")
+        sig = base64.b64decode(sig_b64)
+        self.assertEqual(len(sig), 69, sig.hex())
+        self.assertEqual(sig[64], 0x05)
+        self.assertEqual(struct.unpack(">I", sig[65:69])[0], 0x12345678)
+        message = _SIGN_PREFIX_V2 + f"{ts}:{nonce}".encode("ascii")
+        self.sk_key.public_key().verify(
+            sig[:64],
+            sk_signed_data(self.APPLICATION, 0x05, 0x12345678, message))
+
+    def test_tail_that_disagrees_with_the_signed_bytes_is_refused(self):
+        """The flags and the counter travel in the token and the server
+        verifies with the bytes the reply carries, so a tail that differs from
+        what the key signed cannot verify.  Either field alone breaks it."""
+        for name, tail in (("flags", bytes([0x05]) + struct.pack(">I", 7)),
+                           ("counter", bytes([0x01]) + struct.pack(">I", 8))):
+            with self.subTest(field=name):
+                self.serve(self.sk_responder(flags=0x01, counter=7, tail=tail))
+                with self.assertRaises(KeyError_) as ctx:
+                    get_token(agent_pubkey=self.sk_pub)
+                self.assertIn("does not verify", str(ctx.exception))
 
 
 class TestUnsetSentinel(unittest.TestCase):

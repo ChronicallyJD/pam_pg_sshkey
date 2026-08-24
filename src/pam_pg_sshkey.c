@@ -339,6 +339,24 @@ load_user_keys(pam_handle_t *pamh, const mod_opts_t *opts, const char *username)
  * revocation list that silently disappears must not silently readmit every
  * key it named.  An empty file is a valid list that revokes nothing.
  */
+/* Lines that should have parsed as keys: not blank, not a comment. */
+static int
+count_key_lines(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int n = 0;
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '\n' || *p == '\r' || *p == '#') continue;
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
 static int
 key_is_revoked(pam_handle_t *pamh, const mod_opts_t *opts, EVP_PKEY *key)
 {
@@ -352,6 +370,12 @@ key_is_revoked(pam_handle_t *pamh, const mod_opts_t *opts, EVP_PKEY *key)
                    "pam_pg_sshkey: cannot read revoked_keys %s: %s, refusing "
                    "(the file must exist and be readable by the postgres user)",
                    path, strerror(errno));
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: revoked_keys %s is not a regular file, "
+                   "refusing", path);
         return -1;
     }
     if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
@@ -368,6 +392,25 @@ key_is_revoked(pam_handle_t *pamh, const mod_opts_t *opts, EVP_PKEY *key)
                    "pam_pg_sshkey: cannot parse revoked_keys %s, refusing", path);
         return -1;
     }
+
+    /*
+     * Every line that is not blank or a comment must have parsed.  A file
+     * the module cannot read as keys is not an empty list: an OpenSSH KRL,
+     * a cert-authority line, or a key type this module does not know would
+     * otherwise revoke nothing at all, silently.
+     */
+    int want = count_key_lines(path);
+    if (want < 0 || n < want) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: revoked_keys %s has %d line(s) but only %d "
+                   "parsed as keys, refusing (the file must be in "
+                   "authorized_keys format, one public key per line; a key "
+                   "revocation list from ssh-keygen -k is not)",
+                   path, want, n);
+        free_key_list(revoked);
+        return -1;
+    }
+
     int hit = key_in_list(key, revoked);
     free_key_list(revoked);
     if (hit)
@@ -592,6 +635,20 @@ authenticate_v3(pam_handle_t *pamh, const mod_opts_t *opts,
         goto out;
     }
 
+    /*
+     * One file cannot be both lists: every revoked key would become a CA
+     * able to certify any role name.  Refuse the configuration rather than
+     * act on it.
+     */
+    if (opts->revoked_keys && opts->trusted_ca_keys &&
+        strcmp(opts->revoked_keys, opts->trusted_ca_keys) == 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: trusted_ca_keys and revoked_keys are the "
+                   "same file (%s), refusing: every revoked key would be a "
+                   "trusted CA", opts->trusted_ca_keys);
+        goto out;
+    }
+
     cas = load_trusted_cas(pamh, opts, username);
     if (!cas) goto out;
 
@@ -699,6 +756,15 @@ authenticate_v3(pam_handle_t *pamh, const mod_opts_t *opts,
             pam_syslog(pamh, LOG_WARNING,
                        "pam_pg_sshkey: certificate for '%s' rejected: "
                        "key is revoked", username);
+        goto out;
+    }
+    /* revoking a CA withdraws every certificate it signed */
+    rev = key_is_revoked(pamh, opts, cert->ca_pkey);
+    if (rev != 0) {
+        if (rev == 1)
+            pam_syslog(pamh, LOG_WARNING,
+                       "pam_pg_sshkey: certificate for '%s' rejected: "
+                       "signing CA is revoked", username);
         goto out;
     }
 

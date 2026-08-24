@@ -22,6 +22,7 @@ Usage:
 
   sk_helper.py token <dir> [--flags 1] [--counter 7] [--at TS]
                            [--nonce HEX] [--application-override X]
+                           [--cert FILE]
       Prints a v2 token whose signature field is the security key's
       signature: base64(sig64 || flags || counter).
 
@@ -56,6 +57,9 @@ def sshstr(b: bytes) -> bytes:
 
 
 def keygen(args) -> int:
+    if not os.path.isdir(args.dir):
+        sys.stderr.write(f"sk_helper.py: not a directory: {args.dir}\n")
+        return 1
     key = Ed25519PrivateKey.generate()
     raw_priv = key.private_bytes(**_RAW_PRIV)
     raw_pub = key.public_key().public_bytes(**_RAW_PUB)
@@ -76,6 +80,13 @@ def keygen(args) -> int:
 
 
 def token(args) -> int:
+    if not os.path.exists(os.path.join(args.dir, "sk")):
+        sys.stderr.write(
+            f"sk_helper.py: no key in {args.dir}; run 'sk_helper.py keygen' first\n")
+        return 1
+    if not 0 <= args.counter <= 0xffffffff:
+        sys.stderr.write("sk_helper.py: --counter must fit in 32 bits\n")
+        return 1
     with open(os.path.join(args.dir, "sk"), "rb") as f:
         key = Ed25519PrivateKey.from_private_bytes(f.read())
     with open(os.path.join(args.dir, "sk.application")) as f:
@@ -117,7 +128,7 @@ def main() -> int:
     t = sub.add_parser("token")
     t.add_argument("dir")
     t.add_argument("--flags", type=lambda v: int(v, 0), default=0x01)
-    t.add_argument("--counter", type=int, default=7)
+    t.add_argument("--counter", type=lambda v: int(v, 0), default=7)
     t.add_argument("--at", type=int, default=None)
     t.add_argument("--nonce", default=None)
     t.add_argument("--application-override", default=None)

@@ -25,11 +25,14 @@ of an attempt. Remove it afterwards.
 | Journal: `no authorized_keys for 'U'` | No key registered for that role name | `sudo pg_sshkey_addkey U key.pub` |
 | Journal: `cannot read authorized_keys for 'U' (permission denied, ...)` | File not readable by `postgres`, usually `U:U 0600` | Run the `chown` and `chmod` printed on the next journal line, or re-register with `pg_sshkey_addkey` |
 | Journal: `authorized_keys for 'U' is world/group writable, refusing` | Mode too loose | `chmod 640` |
-| Journal: `no valid keys in ...` | File has no `ssh-ed25519` or `ssh-rsa` line | Register a supported key; ECDSA and sk- keys are not supported |
+| Journal: `no valid keys in ...` | File has no `ssh-ed25519`, `ssh-rsa`, or `sk-ssh-ed25519@openssh.com` line | Register a supported key; ECDSA and `sk-ecdsa` are not supported |
 | Journal: `authentication failed for 'U'` | The signing key is not one of the registered keys | `pg_sshkey_addkey --list U`; check `-i` on the client |
 | Journal: `token timestamp ... expired or clock skew` | Client clock differs from server by more than 60 seconds, or a token was reused after 60 seconds | Synchronise clocks; mint a token per connection |
 | Journal: `replayed token for 'U'` | The same token was presented twice | Mint a token per connection; do not store tokens |
 | Journal: `key for 'U' is revoked` | The key is listed in `revoked_keys` | Intended; remove the line from the file to restore it |
+| Journal: `has N line(s) but only M parsed as keys` | `revoked_keys` is not in `authorized_keys` format (a `ssh-keygen -k` revocation list, a `cert-authority` prefix, an unsupported key type) | Write one public key per line; comments and blank lines are fine |
+| Journal: `trusted_ca_keys and revoked_keys are the same file` | Both options name one path | Use two files |
+| Journal: `certificate for 'U' rejected: signing CA is revoked` | The CA key is listed in `revoked_keys` | Intended after a CA compromise; issue a new CA |
 | Journal: `cannot read revoked_keys` | The list is missing or unreadable by `postgres` | Create it (an empty file revokes nothing) and `chown root:postgres`, `chmod 640` |
 | Journal: `authentication failed` with an `sk-` key | The authenticator reported no user presence, or the key signed for another application | Touch the key when it flashes; check the key was registered from the same `.pub` |
 | `pg_sshkey_sign`: `no ECDSA verifier` | An `sk-ecdsa-sha2-nistp256` key | Use `ssh-keygen -t ed25519-sk` |

@@ -9,7 +9,13 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 restore_chal_dir() { chown postgres:postgres "$CHAL_DIR"; chmod 1733 "$CHAL_DIR"; }
-trap restore_chal_dir EXIT
+# A revocation list left behind by an interrupted check would lock users out
+# of every check after it, so it is emptied on the way out as well.
+restore_state() {
+    restore_chal_dir
+    : > /etc/pg_sshkeys/revoked_keys 2>/dev/null || true
+}
+trap restore_state EXIT
 
 PSQL_TCP="psql -h 127.0.0.1 -U alice -d alice -tA"
 PSQL_TCP_CAROL="psql -h 127.0.0.1 -U carol -d carol -tA"
@@ -451,8 +457,12 @@ check_unreadable_revocation_list_fails_closed() {
 
 # ── security keys ───────────────────────────────────────────────────────────
 SK_HELPER="python3 $SRC/tests/sk_helper.py"
+ensure_sk_key_registered() {
+    grep -qf /home/alice/.ssh/sk.pub /etc/pg_sshkeys/alice/authorized_keys 2>/dev/null \
+        || pg_sshkey_addkey -a alice /home/alice/.ssh/sk.pub >/dev/null
+}
 check_security_key_connect() {
-    pg_sshkey_addkey -a alice /home/alice/.ssh/sk.pub >/dev/null || { echo "addkey failed"; return 1; }
+    ensure_sk_key_registered || { echo "addkey failed"; return 1; }
     local cur; cur=$(journal_mark)
     local out; out=$(as_alice "
         tok=\$($SK_HELPER token ~/.ssh) || exit 9
@@ -462,6 +472,14 @@ check_security_key_connect() {
     expect_journal "$cur" "pam_pg_sshkey: user 'alice' authenticated with key sk"
 }
 check_security_key_without_presence_rejected() {
+    ensure_sk_key_registered || { echo "addkey failed"; return 1; }
+    # the same key with the bit set logs in, so the refusal is the bit and
+    # not a key the server never knew about
+    local ok; ok=$(as_alice "
+        tok=\$($SK_HELPER token ~/.ssh) || exit 9
+        PGPASSWORD=\$tok psql -h 127.0.0.1 -U alice -d alice -tAc 'select current_user'
+    " 2>&1) || { echo "the key does not work at all: $ok"; return 1; }
+    [[ "$ok" == "alice" ]] || { echo "got: $ok"; return 1; }
     local cur; cur=$(journal_mark)
     local out; out=$(as_alice "
         tok=\$($SK_HELPER token ~/.ssh --flags 0) || exit 9
@@ -469,7 +487,20 @@ check_security_key_without_presence_rejected() {
     " 2>&1) && { echo "a signature with no user presence authenticated"; return 1; }
     expect_journal "$cur" "pam_pg_sshkey: authentication failed for 'alice'"
 }
+check_security_key_counter_is_not_checked() {
+    # documented: the module does not track the authenticator's counter, so
+    # a lower counter than a previous login still authenticates
+    ensure_sk_key_registered || { echo "addkey failed"; return 1; }
+    local out; out=$(as_alice "
+        hi=\$($SK_HELPER token ~/.ssh --counter 900) || exit 9
+        PGPASSWORD=\$hi psql -h 127.0.0.1 -U alice -d alice -tAc 'select 1' >/dev/null || exit 8
+        lo=\$($SK_HELPER token ~/.ssh --counter 1) || exit 9
+        PGPASSWORD=\$lo psql -h 127.0.0.1 -U alice -d alice -tAc 'select current_user'
+    " 2>&1) || { echo "$out"; return 1; }
+    [[ "$out" == "alice" ]] || { echo "got: $out"; return 1; }
+}
 check_revoked_security_key_rejected() {
+    ensure_sk_key_registered || { echo "addkey failed"; return 1; }
     local cur; cur=$(journal_mark)
     cat /home/alice/.ssh/sk.pub > "$REVOKED"; chmod 640 "$REVOKED"
     local out; out=$(as_alice "
@@ -521,5 +552,6 @@ run_check revoked_certificate_rejected
 run_check unreadable_revocation_list_fails_closed
 run_check security_key_connect
 run_check security_key_without_presence_rejected
+run_check security_key_counter_is_not_checked
 run_check revoked_security_key_rejected
 summary

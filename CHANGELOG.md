@@ -17,11 +17,21 @@ covers it; see [docs/testing.md](docs/testing.md).
   the key inside a certificate is the way to withdraw that certificate
   before it expires. A list that cannot be read refuses every login rather
   than readmitting the keys it named; an empty file revokes nothing. The
-  file must be readable by `postgres` and not group or world writable. The
-  list holds keys: there is no revocation by certificate serial or key id.
+  file must be readable by `postgres`, be a regular file, and not be group or
+  world writable, and every line that is not blank or a comment must parse as
+  a public key: a file the module cannot read that way, such as a revocation
+  list from `ssh-keygen -k`, refuses every login rather than revoking
+  nothing. Revoking a CA key withdraws every certificate it signed. One file
+  cannot serve as both `revoked_keys` and `trusted_ca_keys`; the module
+  refuses that configuration rather than turn every revoked key into a
+  trusted CA. The list holds keys: there is no revocation by certificate
+  serial or key id.
   Tests: `test_pam_module` (`test_revoked_key_refused`,
   `test_revoked_certified_key_refused`, `test_revoked_security_key_refused`,
   `test_unreadable_revocation_list_fails_closed`,
+  `test_unparseable_revocation_list_fails_closed`,
+  `test_revoked_ca_key_refuses_its_certificates`,
+  `test_same_file_for_ca_and_revocation_refused`,
   `test_group_writable_revocation_list_refused`,
   `test_revocation_names_one_key_not_all`); e2e `revoked_key_rejected`,
   `revoked_certificate_rejected`,
@@ -44,11 +54,18 @@ covers it; see [docs/testing.md](docs/testing.md).
   `test_security_key_without_user_presence_refused`,
   `test_security_key_signature_is_bound_to_its_application`,
   `test_security_key_counter_and_flags_are_signed`,
-  `test_security_key_ecdsa_type_is_not_accepted`);
+  `test_security_key_ecdsa_type_is_not_accepted`,
+  `test_security_key_signature_length_is_exact`);
   `test_ssh_agent` (`test_security_key_signature_is_passed_through_with_its_tail`);
   `test_system` (`test_agent_security_key_types`);
   `test_python_module` (`TestSkAgentSigning`, seven tests); e2e
-  `security_key_connect`, `security_key_without_presence_rejected`.
+  `security_key_connect`, `security_key_without_presence_rejected`,
+  `security_key_counter_is_not_checked`.
+
+- `tests/test_addkey.sh` covers `pg_sshkey_addkey`, which had no test of its
+  own. It found the tool reporting the wrong key count for a security key,
+  refusing a literal `sk-` key string, and refusing the standard input form
+  its own usage text advertises; all three are fixed.
 
 - Signing through an `ssh-agent`. `pg_sshkey_sign --agent <public_key.pub>`,
   `pg_sshkey_connect --agent FILE`, `pg_sshkey_query --agent FILE`, and

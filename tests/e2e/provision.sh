@@ -72,17 +72,25 @@ make -C "$SRC" install-conf >/dev/null
 # install-conf ships the auth line without trusted_ca_keys; the e2e checks
 # need it.  Appended once, after the challenge_dir continuation line.
 PAMCONF=/etc/pam.d/postgresql
-# install-conf ships the auth line with neither option; the e2e checks need
-# both.  One edit adds them together: appending them separately would leave
-# the second sed without the challenge_dir line it anchors on.
-if ! grep -qE '^[^#]*trusted_ca_keys=' "$PAMCONF"; then
-    log "adding trusted_ca_keys and revoked_keys to $PAMCONF"
-    sed -i 's|^\([[:space:]]*challenge_dir=[^[:space:]]*\)[[:space:]]*$|\1 \\\n            trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys \\\n            revoked_keys=/etc/pg_sshkeys/revoked_keys|' "$PAMCONF"
-fi
-for opt in trusted_ca_keys revoked_keys; do
+# install-conf ships the auth line with none of the optional settings, and
+# editing it in place proved brittle.  The stanza is written whole instead,
+# so the result is the same whatever a warm container started with.
+cat > "$PAMCONF" <<PAMEOF
+#%PAM-1.0
+# written by tests/e2e/provision.sh
+auth    required    pam_pg_sshkey.so \\
+            authorized_keys_dir=/etc/pg_sshkeys \\
+            challenge_dir=$CHAL_DIR \\
+            trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys \\
+            revoked_keys=/etc/pg_sshkeys/revoked_keys
+
+account required    pam_permit.so
+PAMEOF
+for opt in authorized_keys_dir challenge_dir trusted_ca_keys revoked_keys; do
     grep -qE "^[^#]*$opt=" "$PAMCONF" \
-        || { echo "provision: could not add $opt to $PAMCONF" >&2; exit 1; }
+        || { echo "provision: $opt missing from $PAMCONF" >&2; exit 1; }
 done
+
 install -d -m 1733 -o postgres -g postgres "$CHAL_DIR"
 chown postgres:postgres "$CHAL_DIR"; chmod 1733 "$CHAL_DIR"
 
@@ -174,8 +182,10 @@ fi
 chown root:postgres "$TRUSTED_CA_KEYS"; chmod 640 "$TRUSTED_CA_KEYS"
 
 # ── revocation list: present and empty, so the checks can fill it ───────────
+# Truncated on every run: a list left populated by an interrupted check
+# would quietly lock users out of the next one.
 REVOKED_KEYS=/etc/pg_sshkeys/revoked_keys
-[[ -f "$REVOKED_KEYS" ]] || : > "$REVOKED_KEYS"
+: > "$REVOKED_KEYS"
 chown root:postgres "$REVOKED_KEYS"; chmod 640 "$REVOKED_KEYS"
 
 # ── a software security key for the sk checks ──────────────────────────────

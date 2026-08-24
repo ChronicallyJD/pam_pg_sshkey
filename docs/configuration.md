@@ -90,9 +90,23 @@ writable, with the same ownership as the CA file. If it cannot be read every
 login is refused: a revocation list that vanishes must not readmit the keys
 it named. An empty file is a valid list that revokes nothing.
 
-Add a key with `cat key.pub >> /etc/pg_sshkeys/revoked_keys`. The list holds
-keys, not certificates: revoking the key inside a certificate stops that
-certificate, and there is no way to revoke by serial or key id.
+Add a key with `cat key.pub >> /etc/pg_sshkeys/revoked_keys`. Blank lines
+and `#` comments are ignored, so a date and a reason can sit next to each
+entry, and listing a key twice is harmless. Every other line must parse as a
+public key: a file the module cannot read that way, such as a key revocation
+list from `ssh-keygen -k`, refuses every login rather than revoking nothing,
+and the log says how many lines parsed.
+
+There is no command that lists the file; read it, and confirm a revocation
+took effect by attempting a login and looking for
+`key for 'U' is revoked` in the journal.
+
+The list holds keys, not certificates. Revoking the key inside a certificate
+stops that certificate, and revoking a CA key stops every certificate it
+signed, which is the fastest answer to a compromised CA. There is no
+revocation by certificate serial or key id. The file may not be the same one
+named by `trusted_ca_keys`: the module refuses that configuration, because
+every revoked key would become a trusted CA.
 
 ### Security keys
 

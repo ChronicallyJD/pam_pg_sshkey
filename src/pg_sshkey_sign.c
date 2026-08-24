@@ -42,6 +42,8 @@
 #include <openssl/buffer.h>
 #include <openssl/err.h>
 
+#include "ssh_agent.h"
+
 /* Domain prefix, must match sig_verify.c */
 static const unsigned char SIGN_PREFIX[]   = "pg-sshkey-v1";
 static const size_t        SIGN_PREFIX_LEN = 13; /* 12 chars + NUL */
@@ -516,6 +518,7 @@ usage(const char *argv0)
 {
     fprintf(stderr,
         "Usage: %s [--at <unix_ts>] [--nonce <hex64>] <private_key_path>\n"
+        "       %s --agent <public_key.pub> [--cert <cert.pub>]\n"
         "       %s --cert <cert.pub> [--at <unix_ts>] [--nonce <hex64>] <private_key_path>\n"
         "       %s <challenge_hex> <private_key_path>        (v1, legacy)\n"
         "\n"
@@ -526,6 +529,10 @@ usage(const char *argv0)
         "--cert (v3): prints <unix_ts>:<nonce_hex>:<base64_signature>:<base64_cert>.\n"
         "  <cert.pub> is an OpenSSH user certificate (ssh-keygen -s) for the\n"
         "  private key; the server checks it against trusted_ca_keys.\n"
+        "--agent: signs through the ssh-agent at $SSH_AUTH_SOCK using the\n"
+        "  identity whose public key is in <public_key.pub>.  The private key\n"
+        "  is never read, so passphrase-protected keys, OpenSSH-format RSA\n"
+        "  keys, and forwarded agents work.  Not available with v1.\n"
         "v1: prints <challenge_hex>:<base64_signature> for a nonce created\n"
         "  on the server by pg_sshkey_challenge.\n"
         "\n"
@@ -534,7 +541,7 @@ usage(const char *argv0)
         "  ~/.ssh/id_rsa              OpenSSH RSA, convert first:\n"
         "                               openssl pkey -in ~/.ssh/id_rsa -out key.pem\n"
         "  key.pem                    PKCS#8 or traditional PEM (any type)\n",
-        argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0);
 }
 
 static int
@@ -547,18 +554,33 @@ is_hex64_lower(const char *s)
     return n == 64;
 }
 
-/* sign msg with the key at path; print "<head>:<b64sig>[:<tail>]\n"; 0 on success */
+/*
+ * Sign msg and print "<head>:<b64sig>[:<tail>]\n"; 0 on success.
+ * With agent_pubkey set the private key is never read: the signature comes
+ * from the ssh-agent identity whose public blob that file holds.
+ */
 static int
-sign_and_print(const char *privkey_path, const unsigned char *msg, size_t msg_len,
+sign_and_print(const char *privkey_path, const char *agent_pubkey,
+               const unsigned char *msg, size_t msg_len,
                const char *head, const char *tail)
 {
-    EVP_PKEY *pkey = load_private_key(privkey_path);
-    if (!pkey)
-        return 1;
-
     size_t sig_len = 0;
-    unsigned char *sig = sign_message(pkey, msg, msg_len, &sig_len);
-    EVP_PKEY_free(pkey);
+    unsigned char *sig = NULL;
+
+    if (agent_pubkey) {
+        size_t blob_len = 0;
+        unsigned char *blob = ssh_pubkey_blob_from_file(agent_pubkey, &blob_len);
+        if (!blob)
+            return 1;
+        sig = ssh_agent_sign(blob, blob_len, msg, msg_len, &sig_len);
+        free(blob);
+    } else {
+        EVP_PKEY *pkey = load_private_key(privkey_path);
+        if (!pkey)
+            return 1;
+        sig = sign_message(pkey, msg, msg_len, &sig_len);
+        EVP_PKEY_free(pkey);
+    }
     if (!sig) {
         fprintf(stderr, "Signing failed\n");
         return 1;
@@ -584,6 +606,7 @@ int main(int argc, char *argv[])
     long        at         = -1;
     const char *nonce_opt  = NULL;
     const char *cert_path  = NULL;
+    const char *agent_pubkey = NULL;
     const char *positional[2] = { NULL, NULL };
     int         npos       = 0;
 
@@ -596,6 +619,8 @@ int main(int argc, char *argv[])
             if (!is_hex64_lower(nonce_opt)) { fprintf(stderr, "--nonce must be 64 lowercase hex chars\n"); return 1; }
         } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
             cert_path = argv[++i];
+        } else if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) {
+            agent_pubkey = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]); return 1;
         } else if (argv[i][0] == '-' && argv[i][1] == '-') {
@@ -610,6 +635,7 @@ int main(int argc, char *argv[])
     if (npos == 2) {
         /* ── v1: sign a server-issued challenge ── */
         if (at >= 0 || nonce_opt || cert_path) { fprintf(stderr, "--at/--nonce/--cert apply to v2 and v3 only\n"); return 1; }
+        if (agent_pubkey) { fprintf(stderr, "--agent cannot be combined with a v1 challenge\n"); return 1; }
         const char *challenge_hex = positional[0];
         const char *privkey_path  = positional[1];
 
@@ -627,11 +653,20 @@ int main(int argc, char *argv[])
         }
         memcpy(msg, SIGN_PREFIX, SIGN_PREFIX_LEN);
         memcpy(msg + SIGN_PREFIX_LEN, challenge_bytes, challenge_len);
-        return sign_and_print(privkey_path, msg, SIGN_PREFIX_LEN + challenge_len,
+        return sign_and_print(privkey_path, NULL, msg,
+                              SIGN_PREFIX_LEN + challenge_len,
                               challenge_hex, NULL);
     }
 
-    if (npos != 1) { usage(argv[0]); return 1; }
+    if (agent_pubkey) {
+        if (npos != 0) {
+            fprintf(stderr,
+                "--agent takes the PUBLIC key file; do not also pass a private key\n");
+            return 1;
+        }
+    } else if (npos != 1) {
+        usage(argv[0]); return 1;
+    }
 
     /* ── v2 / v3: issue our own challenge ── */
     const char *privkey_path = positional[0];
@@ -661,7 +696,8 @@ int main(int argc, char *argv[])
     size_t               prefix_len = cert_b64 ? SIGN_PREFIX_V3_LEN : SIGN_PREFIX_V2_LEN;
     memcpy(msg, prefix, prefix_len);
     memcpy(msg + prefix_len, head, head_len);
-    int rc = sign_and_print(privkey_path, msg, prefix_len + head_len, head, cert_b64);
+    int rc = sign_and_print(privkey_path, agent_pubkey, msg,
+                            prefix_len + head_len, head, cert_b64);
     free(cert_b64);
     return rc;
 }

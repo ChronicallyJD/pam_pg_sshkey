@@ -31,6 +31,8 @@ Usage:
   -p, --port PORT         Port                       (default: 5432)
   -d, --dbname DBNAME     Database name              (default: username)
   -i, --identity FILE     SSH private key            (default: ~/.ssh/id_ed25519)
+      --agent FILE        Sign through the ssh-agent holding the identity whose
+                          public key is FILE; the private key is never read
       --cert FILE         OpenSSH user certificate for the key (v3 token)
       --v1                Legacy token (server-issued nonce file)
   -c, --challenge-dir DIR (--v1) Challenge nonce dir  (default: /var/run/pg_sshkey)
@@ -121,7 +123,8 @@ def generate_challenge(challenge_dir: str, verbose: bool) -> str:
 
 
 def sign_challenge(challenge: str | None, key_path: str, verbose: bool,
-                   cert_path: str | None = None) -> str:
+                   cert_path: str | None = None,
+                   agent_pubkey: str | None = None) -> str:
     """
     Run pg_sshkey_sign to produce a signed token.
 
@@ -134,10 +137,13 @@ def sign_challenge(challenge: str | None, key_path: str, verbose: bool,
     """
     if cert_path and challenge:
         raise RuntimeError("--cert cannot be combined with --v1")
+    if agent_pubkey and challenge:
+        raise RuntimeError("--agent cannot be combined with --v1")
     if verbose:
-        print(f"[pg_sshkey_query] signing with {key_path}", file=sys.stderr)
+        where = f"the ssh-agent identity {agent_pubkey}" if agent_pubkey else key_path
+        print(f"[pg_sshkey_query] signing with {where}", file=sys.stderr)
 
-    if not Path(key_path).exists():
+    if not agent_pubkey and not Path(key_path).exists():
         raise RuntimeError(
             f"SSH key not found: {key_path}\n\n"
             f"Generate one with:\n"
@@ -147,18 +153,28 @@ def sign_challenge(challenge: str | None, key_path: str, verbose: bool,
         )
 
     argv = [_find_tool("pg_sshkey_sign")]
+    if agent_pubkey:
+        if not Path(agent_pubkey).exists():
+            raise RuntimeError(
+                f"Public key not found: {agent_pubkey}\n\n"
+                f"--agent takes the PUBLIC key file of an identity held by the "
+                f"agent, for example ~/.ssh/id_ed25519.pub"
+            )
+        argv += ["--agent", agent_pubkey]
     if cert_path:
         if not Path(cert_path).exists():
             raise RuntimeError(f"Certificate not found: {cert_path}")
         argv += ["--cert", cert_path]
-    argv += ([challenge] if challenge else []) + [key_path]
+    argv += ([challenge] if challenge else [])
+    if not agent_pubkey:
+        argv += [key_path]
     result = subprocess.run(
         argv,
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        if "certificate" in result.stderr:
+        if agent_pubkey or "certificate" in result.stderr:
             raise RuntimeError(
                 f"pg_sshkey_sign failed (exit {result.returncode}).\n"
                 f"stderr: {result.stderr.strip()}"
@@ -386,6 +402,13 @@ examples:
         help="SSH private key file (default: ~/.ssh/id_ed25519)",
     )
     parser.add_argument(
+        "--agent",
+        default=None,
+        metavar="FILE",
+        help="Sign through the ssh-agent at $SSH_AUTH_SOCK with the identity "
+             "whose public key is FILE; the private key is never read",
+    )
+    parser.add_argument(
         "--cert",
         default=None,
         metavar="FILE",
@@ -450,7 +473,10 @@ def main() -> int:
         print(f"[pg_sshkey_query] username:      {args.username}", file=sys.stderr)
         print(f"[pg_sshkey_query] database:      {dbname}", file=sys.stderr)
         print(f"[pg_sshkey_query] host:          {args.host or '<local socket>'}", file=sys.stderr)
-        print(f"[pg_sshkey_query] key:           {identity}", file=sys.stderr)
+        if args.agent:
+            print(f"[pg_sshkey_query] key:           {args.agent} (ssh-agent)", file=sys.stderr)
+        else:
+            print(f"[pg_sshkey_query] key:           {identity}", file=sys.stderr)
         if args.cert:
             print(f"[pg_sshkey_query] cert:          {args.cert}", file=sys.stderr)
         print(f"[pg_sshkey_query] challenge dir: {args.challenge_dir}", file=sys.stderr)
@@ -459,13 +485,21 @@ def main() -> int:
     try:
         if args.cert and args.v1:
             raise RuntimeError("--cert cannot be combined with --v1")
+        if args.agent and args.v1:
+            raise RuntimeError("--agent cannot be combined with --v1")
+        if args.agent and args.identity:
+            raise RuntimeError(
+                "--agent replaces -i/--identity; pass only one.\n"
+                "--agent takes the PUBLIC key of an identity the agent holds."
+            )
 
         # Step 1 (--v1 only): create the nonce in the SERVER's challenge dir.
         # v2 tokens carry their own timestamp + nonce, so there is nothing to do.
         challenge = generate_challenge(args.challenge_dir, args.verbose) if args.v1 else None
 
         # Step 2: sign (v2: pg_sshkey_sign issues the challenge itself)
-        token = sign_challenge(challenge, identity, args.verbose, cert_path=args.cert)
+        token = sign_challenge(challenge, identity, args.verbose,
+                               cert_path=args.cert, agent_pubkey=args.agent)
 
         # Step 3: connect and run the query
         # The token is passed as password= BEFORE the connection opens.

@@ -11,6 +11,7 @@ src/*.o
 tests/test_challenge_store
 tests/test_key_parser
 tests/test_sig_verify
+tests/test_ssh_agent
 tests/test_ssh_cert
 tests/test_integration
 tests/test_system

@@ -5,6 +5,45 @@ Notable changes to pam_pg_sshkey are recorded here. The format follows
 [Semantic Versioning](https://semver.org/). Each entry names the test that
 covers it; see [docs/testing.md](docs/testing.md).
 
+## [Unreleased]
+
+### Added
+
+- Signing through an `ssh-agent`. `pg_sshkey_sign --agent <public_key.pub>`,
+  `pg_sshkey_connect --agent FILE`, `pg_sshkey_query --agent FILE`, and
+  `agent_pubkey=` in `get_token`, `connect`, and `connect_replication` ask
+  the agent at `$SSH_AUTH_SOCK` to sign, so the private key is never read.
+  A passphrase-protected key, an OpenSSH-format RSA key, and a key on
+  another machine behind a forwarded agent all work; none of them could be
+  used from the C tools before. `--agent` takes the public key file and
+  replaces the private key argument, combines with `--cert`, and is not
+  available with v1. RSA identities are signed as `rsa-sha2-256`, because
+  the module verifies RSA with SHA-256; an agent that answers with the
+  SHA-1 `ssh-rsa` algorithm is refused, as are `sk-` FIDO keys, whose
+  signature carries authenticator fields the module does not verify. The
+  server is unchanged: an agent signature is an ordinary v2 or v3 token.
+  The client verifies the agent's answer against the public key it was given
+  before printing a token, refuses an empty signature, waits at most 60
+  seconds for the agent, survives an agent that closes the socket mid
+  exchange, and replaces any byte outside printable ASCII in agent-supplied
+  text before printing it, so a forwarded agent cannot repaint the terminal.
+  `-i` together with `--agent` is refused rather than silently ignored.
+  Tests: `test_ssh_agent` (six tests driving a hostile agent under
+  AddressSanitizer: the timeout, oversize and truncated replies, an empty
+  signature, a wrong algorithm name on a valid signature, a signature by
+  another key, and a refusal followed by a close);
+  `test_pam_module` (six tests against a real `ssh-agent`, including
+  an Ed25519 key deleted from disk after `ssh-add` and a
+  passphrase-protected key that no other route can use),
+  `test_system` (`test_agent_without_auth_sock_fails`,
+  `test_agent_security_key_type_refused`,
+  `test_agent_rejects_private_key_and_stray_positional`),
+  `test_python_module` (`TestAgentSigning`, `TestAgentErrors`, 15 tests),
+  `test_pg_sshkey_query` (five forwarding and refusal tests); e2e
+  `agent_connect_as_alice`, `agent_passphrase_key_connects`,
+  `agent_rsa_key_connects`, `agent_certificate_connects`,
+  `agent_query_and_python_connect`, `agent_absent_is_a_clean_error`.
+
 ## [1.2.0] - 2026-08-24
 
 ### Added

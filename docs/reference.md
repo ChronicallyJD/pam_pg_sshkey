@@ -26,6 +26,7 @@ apart by the number of colons (one, two, or three). A token of 8192 bytes
 ```text
 pg_sshkey_sign [--at <unix_ts>] [--nonce <hex64>] <private_key>                    v2
 pg_sshkey_sign --cert <cert.pub> [--at <unix_ts>] [--nonce <hex64>] <private_key>  v3
+pg_sshkey_sign --agent <pubkey.pub> [--cert <cert.pub>] [--at <ts>] [--nonce <hex>]  v2 or v3
 pg_sshkey_sign <nonce_hex> <private_key>                                            v1
 ```
 
@@ -37,6 +38,19 @@ public key is refused with `... is not an OpenSSH certificate` and a missing
 file with `Cannot read certificate PATH: ...`. Accepted key files:
 OpenSSH Ed25519 (unencrypted), PKCS#8 PEM (Ed25519 or RSA), traditional PEM
 (RSA). Exit status 1 on any error, with the reason on standard error.
+
+`--agent` signs through the ssh-agent listening on `$SSH_AUTH_SOCK` using the
+identity whose public key is in the named file, and takes no private key
+argument, and cannot be combined with `-i`. The private key is never read,
+so a passphrase-protected key, an OpenSSH-format RSA key, and a forwarded
+agent all work. The client verifies the agent's signature against that public
+key before printing the token, and waits at most 60 seconds for the agent
+(`PG_SSHKEY_AGENT_TIMEOUT_MS` overrides that). For an RSA key the
+client asks the agent for `rsa-sha2-256`, because the module verifies RSA
+with SHA-256; an agent that answers with `ssh-rsa` is refused. `sk-` key
+types (FIDO security keys) are refused: their signature carries
+authenticator fields the module does not verify. `--agent` is not available
+with a v1 challenge.
 
 ## pg_sshkey_connect
 
@@ -51,6 +65,7 @@ pg_sshkey_connect [options] [dbname] [-- psql arguments]
 | `-p`, `--port PORT` | `$PGPORT`, then 5432 | Port |
 | `-d`, `--dbname NAME` | `$PGDATABASE`, then the user name | Database |
 | `-i`, `--identity FILE` | `~/.ssh/id_ed25519` | Private key |
+| `--agent FILE` | none | Sign through the ssh-agent holding the identity whose public key is `FILE`; replaces `-i` |
 | `--cert FILE` | none | OpenSSH user certificate for the key; produces a v3 token. `<identity>-cert.pub` is not picked up automatically |
 | `-v`, `--verbose` | off | Print each step to standard error |
 | `--sign-bin PATH` | from `PATH` | Location of `pg_sshkey_sign` |
@@ -67,7 +82,7 @@ Everything after `--` is passed to `psql`.
 pg_sshkey_query [options] [dbname]
 ```
 
-Takes `-U`, `-h`, `-p`, `-d`, `-i`, `-v`, `--cert`, `--v1`, and `-c` with the
+Takes `-U`, `-h`, `-p`, `-d`, `-i`, `-v`, `--agent`, `--cert`, `--v1`, and `-c` with the
 meanings above, plus `-q`, `--query SQL` (default `SELECT 1`). Prints the result rows,
 or one `error:` line and exit status 1. Helper tools are found on `PATH` or
 beside the script.

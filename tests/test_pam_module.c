@@ -24,6 +24,9 @@
  *   PAM_TEST_KEEP=1          keep per-test temp dirs for inspection
  *   PAM_TEST_DEBUG=1         add `debug` to the module line (logs to syslog)
  *
+ * The harness defines pam_syslog() itself (linked with -rdynamic) so every
+ * line the module logs is captured and can be asserted with ASSERT_LOGGED.
+ *
  * Runs unprivileged.  Never skips: a missing .so is a failure.
  *
  * SPDX-License-Identifier: MIT
@@ -45,6 +48,56 @@
 
 #include <security/pam_appl.h>
 
+/* ── log capture ──────────────────────────────────────────────────────── */
+/*
+ * The module logs through pam_syslog().  The harness is linked with
+ * -rdynamic and defines pam_syslog itself, so the dynamic linker binds the
+ * module's calls here (the executable's symbols win over libpam's for a
+ * dlopen'ed library).  Each line is kept in a ring so tests can assert the
+ * exact message the module emitted; it is also forwarded to syslog.
+ */
+#include <stdarg.h>
+#include <syslog.h>
+
+#define LOG_RING 64
+static char g_log[LOG_RING][1024];
+static int  g_log_n;
+
+void
+pam_syslog(const pam_handle_t *pamh, int priority, const char *fmt, ...)
+{
+    (void)pamh;
+    va_list ap;
+    va_start(ap, fmt);
+    if (g_log_n < LOG_RING)
+        vsnprintf(g_log[g_log_n++], sizeof(g_log[0]), fmt, ap);
+    va_end(ap);
+    va_start(ap, fmt);
+    vsyslog(priority, fmt, ap);
+    va_end(ap);
+}
+
+static void log_reset(void) { g_log_n = 0; }
+
+/* 1 iff some line logged since the last authenticate() contains needle */
+static int
+log_contains(const char *needle)
+{
+    for (int i = 0; i < g_log_n; i++)
+        if (strstr(g_log[i], needle)) return 1;
+    return 0;
+}
+
+static void
+log_dump(void)
+{
+    for (int i = 0; i < g_log_n; i++) fprintf(stderr, "      log: %s\n", g_log[i]);
+}
+
+/* ASSERT_LOGGED: the module emitted a line containing needle */
+#define ASSERT_LOGGED(needle) \
+    do { if (!log_contains(needle)) { _TF_FAIL("no log line contains \"%s\"", needle); log_dump(); } } while (0)
+
 /* ── global paths ─────────────────────────────────────────────────────── */
 
 static char g_so[PATH_MAX];
@@ -61,6 +114,7 @@ typedef struct {
     char confdir[PATH_MAX];   /* root/pam.d  */
     char keys[PATH_MAX];      /* root/keys   */
     char chal[PATH_MAX];      /* root/chal   */
+    char ca_file[PATH_MAX];   /* root/trusted_ca_keys, "" when the option is off */
 } env_t;
 
 static env_t *g_live_env = NULL;   /* for atexit cleanup on abort */
@@ -94,11 +148,17 @@ write_services(const env_t *e)
     char path[PATH_MAX], body[PATH_MAX * 2];
     const char *dbg = getenv("PAM_TEST_DEBUG") ? " debug" : "";
 
+    char ca_opt[PATH_MAX + 32] = "";
+    if (e->ca_file[0])
+        snprintf(ca_opt, sizeof(ca_opt), " trusted_ca_keys=%s", e->ca_file);
+
+    /* The cert tests add trusted_ca_keys=; every other test keeps the
+       shipped shape of the line. */
     snprintf(body, sizeof(body),
              "#%%PAM-1.0\n"
-             "auth    required  %s authorized_keys_dir=%s challenge_dir=%s%s\n"
+             "auth    required  %s authorized_keys_dir=%s challenge_dir=%s%s%s\n"
              "account required  pam_permit.so\n",
-             g_so, e->keys, e->chal, dbg);
+             g_so, e->keys, e->chal, ca_opt, dbg);
     snprintf(path, sizeof(path), "%s/%s", e->confdir, SERVICE_AUTH);
     write_file(path, body, 0644);
 
@@ -131,6 +191,7 @@ env_setup(env_t *e)
     mkdir(e->keys,    0755);
     mkdir(e->chal,    01733);
     chmod(e->chal,    01733);   /* mkdir honours umask; force the real mode */
+    e->ca_file[0] = '\0';
 
     write_services(e);
     g_live_env = e;
@@ -328,6 +389,7 @@ authenticate(const env_t *e, const char *user, const char *token, int *acct_rc)
     struct pam_conv conv = { pg_style_conv, (void *)token };
     pam_handle_t *pamh = NULL;
     g_echo_off_calls = 0;
+    log_reset();
     if (acct_rc) *acct_rc = -1;
 
     int rc = pam_start_confdir(SERVICE_AUTH, "pgsql@", &conv, e->confdir, &pamh);
@@ -763,6 +825,459 @@ test_v2_unrecordable_nonce_fails_closed(void)
     env_teardown(&e);
 }
 
+/* ── v3: OpenSSH user certificates ───────────────────────────────────── */
+
+/*
+ * Write <root>/trusted_ca_keys from the named CA public keys (0640) and
+ * turn the option on in the service file.  Called only by cert tests.
+ */
+static void
+enable_certs(env_t *e, const char *ca1, const char *ca2)
+{
+    char cmd[PATH_MAX * 3];
+    snprintf(e->ca_file, sizeof(e->ca_file), "%s/trusted_ca_keys", e->root);
+    if (ca2)
+        snprintf(cmd, sizeof(cmd), "cat '%s/%s.pub' '%s/%s.pub' > '%s'",
+                 e->root, ca1, e->root, ca2, e->ca_file);
+    else
+        snprintf(cmd, sizeof(cmd), "cat '%s/%s.pub' > '%s'",
+                 e->root, ca1, e->ca_file);
+    if (system(cmd) != 0) { fprintf(stderr, "enable_certs failed\n"); exit(2); }
+    chmod(e->ca_file, 0640);
+    write_services(e);
+}
+
+/* ssh-keygen -s <root>/<ca> <args> <root>/<key>.pub  ->  <root>/<key>-cert.pub */
+static int
+gen_cert(const env_t *e, const char *ca, const char *key, const char *args)
+{
+    char cmd[PATH_MAX * 3];
+    snprintf(cmd, sizeof(cmd),
+             "ssh-keygen -q -s '%s/%s' %s '%s/%s.pub' </dev/null >/dev/null 2>&1",
+             e->root, ca, args, e->root, key);
+    return system(cmd) == 0 ? 0 : -1;
+}
+
+/* Sign with <key> and attach <certkey>-cert.pub.  `extra` as in make_token_v2. */
+static int
+make_token_v3(const env_t *e, const char *key, const char *certkey,
+              const char *extra, char *tok, size_t tok_sz)
+{
+    char cmd[PATH_MAX * 3];
+    snprintf(cmd, sizeof(cmd), "'%s' --cert '%s/%s-cert.pub' %s '%s/%s' 2>/dev/null",
+             g_sign_bin, e->root, certkey, extra ? extra : "", e->root, key);
+    if (run_capture(cmd, tok, tok_sz) != 0) return -1;
+    int n = 0;
+    for (const char *p = tok; *p; p++) if (*p == ':') n++;
+    return n == 3 ? 0 : -1;
+}
+
+static void
+test_cert_ed25519_authenticates_without_authorized_keys(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519", "-I alice-key -n alice -V -1m:+5m"), 0);
+    enable_certs(&e, "ca", NULL);
+    /* no keys/alice/authorized_keys at all */
+
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int acct = -1;
+    int rc = authenticate(&e, "alice", tok, &acct);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_EQ(g_echo_off_calls, 1);
+    ASSERT_EQ(acct, PAM_SUCCESS);
+    ASSERT_LOGGED("user 'alice' authenticated with certificate 'alice-key' serial 0");
+    env_teardown(&e);
+}
+
+/* CA + user key + cert for principal alice, valid for five minutes.
+   The option is left off; the test decides which CA file to trust. */
+static void
+cert_fixture(env_t *e)
+{
+    ASSERT_EQ(gen_ed25519(e, "ca"), 0);
+    ASSERT_EQ(gen_ed25519(e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_cert(e, "ca", "id_ed25519", "-I alice-key -n alice -V -1m:+5m"), 0);
+}
+
+static void
+test_cert_refused_when_trusted_ca_keys_unset(void)
+{
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    /* service line unchanged: no trusted_ca_keys= */
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate token for 'alice' but trusted_ca_keys is not set");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);        /* nonce not recorded */
+    env_teardown(&e);
+}
+
+static void
+test_oversized_token_refused_before_parsing(void)
+{
+    /* every field under MAX_TOKEN_LEN, the whole token over it */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    static char tok[16384];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    size_t len = strlen(tok);
+    ASSERT_TRUE(len < 2000);
+    /* grow the signature field to ~8000 chars: still under MAX_TOKEN_LEN by
+       itself, but the whole token is over it */
+    char *sig = strchr(strchr(tok, ':') + 1, ':') + 1;
+    memmove(sig + 8000, sig, strlen(sig) + 1);
+    memset(sig, 'A', 8000);                  /* base64 alphabet, group aligned */
+    ASSERT_TRUE(strlen(tok) >= 8192);
+    ASSERT_TRUE(strlen(strrchr(tok, ':') + 1) < 8192);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("malformed token for 'alice'");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_with_control_characters_refused(void)
+{
+    /*
+     * ssh-keygen accepts newlines in the key id and in option names.  A
+     * client could use one to forge an "authenticated with certificate"
+     * journal line.  The parser refuses any byte outside printable ASCII,
+     * so nothing attacker-written reaches syslog.
+     */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+
+    /* trusted CA, newline in the key id: would be logged on success */
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519",
+        "-I \"$(printf 'alice-key\\nFORGED')\" -n alice -V -1m:+5m"), 0);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: malformed certificate");
+    ASSERT_FALSE(log_contains("FORGED"));
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+
+    /* untrusted CA, newline in a critical option name: logged before any
+       signature check unless the parser refuses it */
+    ASSERT_EQ(gen_ed25519(&e, "other_ca"), 0);
+    ASSERT_EQ(gen_cert(&e, "other_ca", "id_ed25519",
+        "-I alice-key -n alice -V -1m:+5m -O \"$(printf 'critical:evil\\nFORGED')\""), 0);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: malformed certificate");
+    ASSERT_FALSE(log_contains("FORGED"));
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_from_untrusted_ca_refused(void)
+{
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    ASSERT_EQ(gen_ed25519(&e, "other_ca"), 0);
+    enable_certs(&e, "other_ca", NULL);           /* the signing CA is not listed */
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: not signed by a trusted CA");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_expired_refused(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    /* valid window ended one minute ago */
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519", "-I alice-key -n alice -V -10m:-1m"), 0);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: expired");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_not_yet_valid_refused(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519", "-I alice-key -n alice -V +10m:+20m"), 0);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: not yet valid");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_wrong_principal_refused(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519", "-I bob-key -n bob,alicia -V -1m:+5m"), 0);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: principal 'alice' not listed");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    /* the same token is good for a listed principal */
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "bob", tok, NULL);
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    env_teardown(&e);
+}
+
+static void
+test_cert_without_principals_refused(void)
+{
+    /* ssh-keygen with no -n writes an empty principal list; sshd with
+       TrustedUserCAKeys refuses such a certificate and so does the module. */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519", "-I any-key -V -1m:+5m"), 0);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: principal 'alice' not listed");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_host_cert_refused(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519", "-h -I alice-key -n alice -V -1m:+5m"), 0);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: not a user certificate");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_with_critical_option_refused(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519",
+                       "-I alice-key -n alice -V -1m:+5m -O source-address=127.0.0.1/32"), 0);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: unsupported critical option source-address");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_tampered_byte_refused(void)
+{
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+
+    /* base64 char 60 of the cert lies inside the CA-signed nonce field */
+    char *cert = strrchr(tok, ':') + 1;
+    ASSERT_TRUE(strlen(cert) > 60);
+    cert[60] = (cert[60] == 'A') ? 'B' : 'A';
+
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: invalid CA signature");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_token_signed_by_other_key_refused(void)
+{
+    /* a genuine, trusted certificate presented with a signature from a
+       private key other than the one it certifies */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    ASSERT_EQ(gen_ed25519(&e, "id_other"), 0);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_other", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("authentication failed for 'alice'");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_cert_replay_and_timestamp_window(void)
+{
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192], extra[64];
+
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("replayed token for 'alice' (nonce already used)");
+
+    snprintf(extra, sizeof(extra), "--at %ld", (long)time(NULL) - 120);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", extra, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    /* a second may tick between signing and the module's time(NULL) */
+    ASSERT_TRUE(log_contains("token timestamp for 'alice' is -120 s from server time") ||
+                log_contains("token timestamp for 'alice' is -121 s from server time"));
+
+    snprintf(extra, sizeof(extra), "--at %ld", (long)time(NULL) + 300);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", extra, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_TRUE(log_contains("token timestamp for 'alice' is 300 s from server time") ||
+                log_contains("token timestamp for 'alice' is 299 s from server time"));
+
+    snprintf(extra, sizeof(extra), "--at %ld", (long)time(NULL) + 30);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", extra, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_SUCCESS);
+
+    ASSERT_EQ(dir_entry_count(e.chal), 2);        /* only the two accepted nonces */
+    env_teardown(&e);
+}
+
+static void
+test_cert_rsa_key_under_ed25519_ca(void)
+{
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
+    ASSERT_EQ(gen_rsa_pem(&e, "id_rsa"), 0);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_rsa", "-I alice-rsa -n alice -V -1m:+5m -z 42"), 0);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_rsa", "id_rsa", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_LOGGED("user 'alice' authenticated with certificate 'alice-rsa' serial 42");
+    env_teardown(&e);
+}
+
+static void
+test_cert_ed25519_key_under_rsa_ca(void)
+{
+    /* ssh-keygen signs with rsa-sha2-512 by default for an RSA CA */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_rsa_pem(&e, "ca_rsa"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_cert(&e, "ca_rsa", "id_ed25519", "-I alice-key -n alice -V -1m:+5m"), 0);
+    enable_certs(&e, "ca_rsa", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_LOGGED("user 'alice' authenticated with certificate 'alice-key' serial 0");
+
+    /* ssh-rsa (SHA-1) CA signatures are refused */
+    ASSERT_EQ(gen_cert(&e, "ca_rsa", "id_ed25519", "-t ssh-rsa -I alice-key -n alice -V -1m:+5m"), 0);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: unsupported signature algorithm ssh-rsa");
+    ASSERT_EQ(dir_entry_count(e.chal), 1);           /* only the earlier success recorded a nonce */
+    env_teardown(&e);
+}
+
+static void
+test_cert_group_writable_ca_file_refused(void)
+{
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    chmod(e.ca_file, 0660);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("trusted_ca_keys");
+    ASSERT_LOGGED("is world/group writable, refusing");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+
+    /* same token, correct mode: proves the refusal was the mode */
+    chmod(e.ca_file, 0640);
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    env_teardown(&e);
+}
+
+static void
+test_v1_and_v2_still_pass_with_trusted_ca_keys_set(void)
+{
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
+
+    char hex[65], tok[8192];
+    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_LOGGED("user 'alice' authenticated with key id_ed25519");
+
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_LOGGED("user 'alice' authenticated with key id_ed25519");
+
+    /* and a v3 token for a user with no authorized_keys still works alongside */
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519", "-I carol-key -n carol -V -1m:+5m"), 0);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "carol", tok, NULL);
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    env_teardown(&e);
+}
+
 /* ── main ─────────────────────────────────────────────────────────────── */
 
 int
@@ -809,5 +1324,23 @@ main(void)
     RUN(test_v2_nonce_cannot_be_reused_with_a_new_timestamp);
     RUN(test_v2_works_with_private_0700_marker_dir);
     RUN(test_v2_unrecordable_nonce_fails_closed);
+    RUN(test_cert_ed25519_authenticates_without_authorized_keys);
+    RUN(test_cert_refused_when_trusted_ca_keys_unset);
+    RUN(test_oversized_token_refused_before_parsing);
+    RUN(test_cert_with_control_characters_refused);
+    RUN(test_cert_from_untrusted_ca_refused);
+    RUN(test_cert_expired_refused);
+    RUN(test_cert_not_yet_valid_refused);
+    RUN(test_cert_wrong_principal_refused);
+    RUN(test_cert_without_principals_refused);
+    RUN(test_host_cert_refused);
+    RUN(test_cert_with_critical_option_refused);
+    RUN(test_cert_tampered_byte_refused);
+    RUN(test_cert_token_signed_by_other_key_refused);
+    RUN(test_cert_replay_and_timestamp_window);
+    RUN(test_cert_rsa_key_under_ed25519_ca);
+    RUN(test_cert_ed25519_key_under_rsa_ca);
+    RUN(test_cert_group_writable_ca_file_refused);
+    RUN(test_v1_and_v2_still_pass_with_trusted_ca_keys_set);
     return SUMMARY();
 }

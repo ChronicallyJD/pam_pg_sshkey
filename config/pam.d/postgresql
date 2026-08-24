@@ -10,6 +10,16 @@
 #   challenge_dir=<dir>         Where challenge nonces are stored.
 #                               Default: /var/run/pg_sshkey
 #
+#   trusted_ca_keys=<file>      OpenSSH CA public keys, one per line
+#                               (authorized_keys format, ssh-ed25519 or ssh-rsa).
+#                               A user whose key carries a certificate signed
+#                               by one of these CAs (pg_sshkey_connect --cert)
+#                               authenticates without an authorized_keys file.
+#                               The file must be owned root:postgres, mode 0640,
+#                               not group or world writable. No default: when
+#                               unset, certificate tokens are refused.
+#                               Recommended: /etc/pg_sshkeys/trusted_ca_keys
+#
 #   debug                       Enable verbose syslog output.
 
 auth    required    pam_pg_sshkey.so \

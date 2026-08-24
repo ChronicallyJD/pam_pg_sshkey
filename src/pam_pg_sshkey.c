@@ -46,7 +46,7 @@
  *
  * Build:
  *   gcc -shared -fPIC -o pam_pg_sshkey.so pam_pg_sshkey.c challenge_store.c \
- *       key_parser.c sig_verify.c \
+ *       key_parser.c sig_verify.c ssh_cert.c \
  *       $(pkg-config --cflags --libs libcrypto) -lpam
  *
  * Install:
@@ -56,8 +56,13 @@
  * /etc/pam.d/postgresql:
  *   auth  required  pam_pg_sshkey.so  authorized_keys_dir=/etc/pg_sshkeys \
  *                                     challenge_dir=/var/run/pg_sshkey       \
+ *                                     trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys \
  *                                     debug
  *   account required pam_permit.so
+ *
+ * trusted_ca_keys is optional.  When set, a v3 token carrying an OpenSSH
+ * user certificate signed by one of the listed CA keys authenticates the
+ * user without an authorized_keys file (see authenticate_v3).
  *
  * SPDX-License-Identifier: MIT
  */
@@ -81,17 +86,19 @@
 #include "challenge_store.h"
 #include "key_parser.h"
 #include "sig_verify.h"
+#include "ssh_cert.h"
 
 /* ── Module defaults ─────────────────────────────────────────────────── */
 #define DEFAULT_AUTHKEYS_DIR   "/etc/pg_sshkeys"
 #define DEFAULT_CHALLENGE_DIR  "/var/run/pg_sshkey"
-#define MAX_TOKEN_LEN          4096
+#define MAX_TOKEN_LEN          8192   /* RSA certificates are large */
 #define MAX_PATH_LEN           512
 
 /* ── Option parsing ──────────────────────────────────────────────────── */
 typedef struct {
     const char *authkeys_dir;
     const char *challenge_dir;
+    const char *trusted_ca_keys;   /* NULL: certificate tokens refused */
     int         debug;
 } mod_opts_t;
 
@@ -100,6 +107,7 @@ parse_opts(mod_opts_t *opts, int argc, const char **argv)
 {
     opts->authkeys_dir  = DEFAULT_AUTHKEYS_DIR;
     opts->challenge_dir = DEFAULT_CHALLENGE_DIR;
+    opts->trusted_ca_keys = NULL;
     opts->debug         = 0;
 
     for (int i = 0; i < argc; i++) {
@@ -107,6 +115,8 @@ parse_opts(mod_opts_t *opts, int argc, const char **argv)
             opts->authkeys_dir  = argv[i] + 20;
         else if (strncmp(argv[i], "challenge_dir=", 14) == 0)
             opts->challenge_dir = argv[i] + 14;
+        else if (strncmp(argv[i], "trusted_ca_keys=", 16) == 0)
+            opts->trusted_ca_keys = argv[i] + 16;
         else if (strcmp(argv[i], "debug") == 0)
             opts->debug = 1;
     }
@@ -410,6 +420,244 @@ authenticate_v2(pam_handle_t *pamh, const mod_opts_t *opts,
     return PAM_SUCCESS;
 }
 
+/* ── v3: certificate tokens ──────────────────────────────────────────── */
+/*
+ * v3 token: "<unix_ts>:<nonce_hex64>:<base64_signature>:<base64_cert>"
+ * Signed message: "pg-sshkey-v3\0" || "<unix_ts>:<nonce_hex64>"
+ *
+ * The certificate is an OpenSSH user certificate; the signature is by the
+ * key it certifies.  The user needs no authorized_keys file: trust comes
+ * from the CA keys in the trusted_ca_keys file.
+ */
+static const unsigned char SIGN_PREFIX_V3[]   = "pg-sshkey-v3";
+static const size_t        SIGN_PREFIX_V3_LEN = 13;
+
+/*
+ * Split the token into its v2-shaped head and the trailing cert field.
+ * head_v2 receives "<ts>:<nonce>:<sig>" and cert_b64 the last field.
+ */
+static int
+split_token_v3(const char *token,
+               char *head_v2, size_t head_size,
+               char *cert_b64, size_t cert_size)
+{
+    const char *c3 = strrchr(token, ':');
+    if (!c3 || c3 == token) return -1;
+    size_t head_len = (size_t)(c3 - token);
+    if (head_len >= head_size) return -1;
+    memcpy(head_v2, token, head_len);
+    head_v2[head_len] = '\0';
+    size_t cert_len = strlen(c3 + 1);
+    if (cert_len == 0 || cert_len >= cert_size) return -1;
+    memcpy(cert_b64, c3 + 1, cert_len + 1);
+    return 0;
+}
+
+/* Load and permission-check the trusted CA file.  NULL and a log on failure. */
+static key_list_t *
+load_trusted_cas(pam_handle_t *pamh, const mod_opts_t *opts, const char *username)
+{
+    const char *path = opts->trusted_ca_keys;
+    if (!path || !*path) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate token for '%s' but "
+                   "trusted_ca_keys is not set", username);
+        return NULL;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: cannot stat trusted_ca_keys %s: %s",
+                   path, strerror(errno));
+        return NULL;
+    }
+    if (access(path, R_OK) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: cannot read trusted_ca_keys %s "
+                   "(permission denied, file must be owned root:postgres "
+                   "mode 0640, got uid=%d gid=%d mode=%04o): %s",
+                   path, (int)st.st_uid, (int)st.st_gid,
+                   (unsigned)(st.st_mode & 07777), strerror(errno));
+        return NULL;
+    }
+    if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: trusted_ca_keys %s is world/group "
+                   "writable, refusing", path);
+        return NULL;
+    }
+    key_list_t *cas = NULL;
+    int n = parse_authorized_keys(path, &cas);
+    if (n <= 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: no valid CA keys in trusted_ca_keys %s",
+                   path);
+        return NULL;
+    }
+    return cas;
+}
+
+static int
+authenticate_v3(pam_handle_t *pamh, const mod_opts_t *opts,
+                const char *username, const char *token)
+{
+    int rc = PAM_AUTH_ERR;
+    key_list_t *cas = NULL;
+    ssh_cert_t *cert = NULL;
+    unsigned char *cert_raw = NULL;
+
+    char *head_v2  = malloc(MAX_TOKEN_LEN);
+    char *cert_b64 = malloc(MAX_TOKEN_LEN);
+    char *sig_b64  = malloc(MAX_TOKEN_LEN);
+    if (!head_v2 || !cert_b64 || !sig_b64) goto out;
+
+    long ts = 0;
+    char nonce_hex[65], head[96];
+    if (split_token_v3(token, head_v2, MAX_TOKEN_LEN, cert_b64, MAX_TOKEN_LEN) != 0 ||
+        parse_token_v2(head_v2, &ts, nonce_hex, head, sizeof(head),
+                       sig_b64, MAX_TOKEN_LEN) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: malformed token for '%s'", username);
+        goto out;
+    }
+
+    long now = (long)time(NULL);
+    if (ts < now - CHALLENGE_TTL_SECS || ts > now + CHALLENGE_TTL_SECS) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: token timestamp for '%s' is %ld s from "
+                   "server time (limit %d), expired or clock skew",
+                   username, ts - now, CHALLENGE_TTL_SECS);
+        goto out;
+    }
+
+    cas = load_trusted_cas(pamh, opts, username);
+    if (!cas) goto out;
+
+    cert_raw = malloc(MAX_TOKEN_LEN);
+    if (!cert_raw) goto out;
+    size_t cert_len = 0;
+    if (b64_decode(cert_b64, cert_raw, MAX_TOKEN_LEN, &cert_len) != 0 ||
+        ssh_cert_parse(cert_raw, cert_len, &cert) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: certificate for '%s' rejected: "
+                   "malformed certificate", username);
+        goto out;
+    }
+
+    if (cert->type != SSH_CERT_TYPE_USER) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate for '%s' rejected: "
+                   "not a user certificate", username);
+        goto out;
+    }
+
+    if ((uint64_t)now >= cert->valid_before) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate for '%s' rejected: expired",
+                   username);
+        goto out;
+    }
+    if ((uint64_t)now < cert->valid_after) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate for '%s' rejected: not yet valid",
+                   username);
+        goto out;
+    }
+
+    /* the principal list must name the user; an empty list admits nobody */
+    int listed = 0;
+    for (size_t i = 0; i < cert->nprincipals; i++)
+        if (strcmp(cert->principals[i], username) == 0) { listed = 1; break; }
+    if (!listed) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate for '%s' rejected: "
+                   "principal '%s' not listed", username, username);
+        goto out;
+    }
+
+    if (cert->critical_option) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate for '%s' rejected: "
+                   "unsupported critical option %s",
+                   username, cert->critical_option);
+        goto out;
+    }
+
+    if (!ssh_cert_ca_is_trusted(cert, cas)) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate for '%s' rejected: "
+                   "not signed by a trusted CA", username);
+        goto out;
+    }
+
+    int vrc = ssh_cert_verify_ca_signature(cert);
+    if (vrc == -2) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate for '%s' rejected: "
+                   "unsupported signature algorithm %s",
+                   username, cert->sig_algo);
+        goto out;
+    }
+    if (vrc != 0) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: certificate for '%s' rejected: "
+                   "invalid CA signature", username);
+        goto out;
+    }
+
+    /* the token signature, by the certified key */
+    unsigned char sig_bytes[1024];
+    size_t        sig_len = 0;
+    if (b64_decode(sig_b64, sig_bytes, sizeof(sig_bytes), &sig_len) != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: base64 decode failed for '%s'", username);
+        goto out;
+    }
+    unsigned char msg[128];
+    size_t head_len = strlen(head);
+    memcpy(msg, SIGN_PREFIX_V3, SIGN_PREFIX_V3_LEN);
+    memcpy(msg + SIGN_PREFIX_V3_LEN, head, head_len);
+    size_t msg_len = SIGN_PREFIX_V3_LEN + head_len;
+
+    key_list_t certified = { cert->key_type, cert->key_id, cert->pkey, NULL };
+    if (verify_signature_raw(&certified, msg, msg_len, sig_bytes, sig_len) != 0) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: authentication failed for '%s'", username);
+        goto out;
+    }
+
+    challenge_sweep(opts->challenge_dir, CHALLENGE_SWEEP_MAX);
+    int mrc = challenge_mark(opts->challenge_dir, nonce_hex);
+    if (mrc == 1) {
+        pam_syslog(pamh, LOG_WARNING,
+                   "pam_pg_sshkey: replayed token for '%s' (nonce already used)",
+                   username);
+        goto out;
+    }
+    if (mrc != 0) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: could not record nonce in %s: %s, refusing "
+                   "(directory must exist and be writable by the postgres user)",
+                   opts->challenge_dir, strerror(errno));
+        goto out;
+    }
+
+    pam_syslog(pamh, LOG_INFO,
+               "pam_pg_sshkey: user '%s' authenticated with certificate '%s' "
+               "serial %llu",
+               username, cert->key_id, (unsigned long long)cert->serial);
+    rc = PAM_SUCCESS;
+
+out:
+    ssh_cert_free(cert);
+    free_key_list(cas);
+    free(cert_raw);
+    free(head_v2);
+    free(cert_b64);
+    free(sig_b64);
+    return rc;
+}
+
 /* ── pam_sm_authenticate ─────────────────────────────────────────────── */
 PAM_EXTERN int
 pam_sm_authenticate(pam_handle_t *pamh, int flags,
@@ -452,13 +700,23 @@ pam_sm_authenticate(pam_handle_t *pamh, int flags,
         return PAM_AUTH_ERR;
     }
 
+    if (strlen(token) >= MAX_TOKEN_LEN) {
+        pam_syslog(pamh, LOG_ERR,
+                   "pam_pg_sshkey: malformed token for '%s'", username);
+        return PAM_AUTH_ERR;
+    }
+
     /* ── 3. Dispatch on token version ── */
     /*
      * v1  "<nonce_hex>:<sig>"        one colon , server-issued nonce file
      * v2  "<ts>:<nonce_hex>:<sig>"   two colons, client-issued challenge
+     * v3  "<ts>:<nonce_hex>:<sig>:<cert>"  three colons, certificate
      */
-    if (count_colons(token) == 2)
+    int ncolons = count_colons(token);
+    if (ncolons == 2)
         return authenticate_v2(pamh, &opts, username, token);
+    if (ncolons == 3)
+        return authenticate_v3(pamh, &opts, username, token);
 
     char challenge_hex[256];
     char sig_b64[MAX_TOKEN_LEN];

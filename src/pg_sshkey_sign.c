@@ -5,10 +5,14 @@
  * SSH private key and outputs the PAM token string.
  *
  * Usage:
- *   pg_sshkey_sign <challenge_hex> <private_key_path>
+ *   pg_sshkey_sign [--at TS] [--nonce HEX] <private_key_path>          (v2)
+ *   pg_sshkey_sign --cert <cert.pub> [--at TS] [--nonce HEX] <key>     (v3)
+ *   pg_sshkey_sign <challenge_hex> <private_key_path>                  (v1)
  *
  * Prints to stdout:
- *   <challenge_hex>:<base64_signature>
+ *   v2: <unix_ts>:<nonce_hex64>:<base64_signature>
+ *   v3: <unix_ts>:<nonce_hex64>:<base64_signature>:<base64_cert>
+ *   v1: <challenge_hex>:<base64_signature>
  *
  * Key formats accepted:
  *   - OpenSSH private key  (-----BEGIN OPENSSH PRIVATE KEY-----)
@@ -29,6 +33,7 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -52,7 +57,18 @@ static const size_t        SIGN_PREFIX_LEN = 13; /* 12 chars + NUL */
 static const unsigned char SIGN_PREFIX_V2[]   = "pg-sshkey-v2";
 static const size_t        SIGN_PREFIX_V2_LEN = 13;
 
+/*
+ * v3: like v2, but the token carries an OpenSSH user certificate so the
+ * server can trust the key through a CA instead of an authorized_keys line.
+ *   token   = "<unix_ts>:<nonce_hex64>:<base64_sig>:<base64_cert>"
+ *   message = "pg-sshkey-v3\0" || "<unix_ts>:<nonce_hex64>"   (ASCII)
+ * <base64_cert> is the second field of the *-cert.pub file, unchanged.
+ */
+static const unsigned char SIGN_PREFIX_V3[]   = "pg-sshkey-v3";
+static const size_t        SIGN_PREFIX_V3_LEN = 13;
+
 #define OPENSSH_MAGIC "openssh-key-v1"
+#define MAX_CERT_FILE 65536
 
 /* ── hex_to_bytes ─────────────────────────────────────────────────────── */
 static int
@@ -420,18 +436,96 @@ sign_message(EVP_PKEY *pkey,
     return sig;
 }
 
+/* ── read_cert_b64 ────────────────────────────────────────────────────── */
+/*
+ * Read an OpenSSH certificate file (*-cert.pub) and return its base64
+ * field as a malloc'd string.  The first field must end in
+ * "-cert-v01@openssh.com"; a plain public key is refused.
+ */
+static char *
+read_cert_b64(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "Cannot read certificate %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    char *line = malloc(MAX_CERT_FILE);
+    if (!line) { fclose(f); return NULL; }
+    if (!fgets(line, MAX_CERT_FILE, f)) {
+        fprintf(stderr, "Certificate %s is empty\n", path);
+        fclose(f); free(line);
+        return NULL;
+    }
+    if (!strchr(line, '\n') && !feof(f)) {
+        fprintf(stderr, "Certificate %s: line too long\n", path);
+        fclose(f); free(line);
+        return NULL;
+    }
+    fclose(f);
+
+    /* first field: cert type */
+    char *type = line;
+    while (*type == ' ' || *type == '\t') type++;
+    char *p = type;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+    size_t type_len = (size_t)(p - type);
+    static const char suffix[] = "-cert-v01@openssh.com";
+    size_t suffix_len = sizeof(suffix) - 1;
+    if (type_len < suffix_len ||
+        memcmp(type + type_len - suffix_len, suffix, suffix_len) != 0) {
+        fprintf(stderr,
+            "%s is not an OpenSSH certificate (first field must end in %s)\n",
+            path, suffix);
+        free(line);
+        return NULL;
+    }
+
+    /* second field: base64 blob */
+    while (*p == ' ' || *p == '\t') p++;
+    char *b64 = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+    size_t b64_len = (size_t)(p - b64);
+    if (b64_len == 0) {
+        fprintf(stderr, "%s has no certificate data\n", path);
+        free(line);
+        return NULL;
+    }
+    for (size_t i = 0; i < b64_len; i++) {
+        char c = b64[i];
+        if (!(isalnum((unsigned char)c) || c == '+' || c == '/' || c == '=')) {
+            fprintf(stderr, "%s: certificate field is not base64\n", path);
+            free(line);
+            return NULL;
+        }
+    }
+    if (b64_len % 4 != 0) {
+        fprintf(stderr, "%s: certificate field is not padded base64\n", path);
+        free(line);
+        return NULL;
+    }
+    char *out = malloc(b64_len + 1);
+    if (out) { memcpy(out, b64, b64_len); out[b64_len] = '\0'; }
+    free(line);
+    return out;
+}
+
 /* ── helpers for main ─────────────────────────────────────────────────── */
 static void
 usage(const char *argv0)
 {
     fprintf(stderr,
         "Usage: %s [--at <unix_ts>] [--nonce <hex64>] <private_key_path>\n"
+        "       %s --cert <cert.pub> [--at <unix_ts>] [--nonce <hex64>] <private_key_path>\n"
         "       %s <challenge_hex> <private_key_path>        (v1, legacy)\n"
         "\n"
         "Default (v2): prints <unix_ts>:<nonce_hex>:<base64_signature>.\n"
         "  The challenge is issued by this client; nothing is needed on the\n"
         "  server beforehand.  --at and --nonce override the timestamp and\n"
         "  nonce (for tests / clock experiments only).\n"
+        "--cert (v3): prints <unix_ts>:<nonce_hex>:<base64_signature>:<base64_cert>.\n"
+        "  <cert.pub> is an OpenSSH user certificate (ssh-keygen -s) for the\n"
+        "  private key; the server checks it against trusted_ca_keys.\n"
         "v1: prints <challenge_hex>:<base64_signature> for a nonce created\n"
         "  on the server by pg_sshkey_challenge.\n"
         "\n"
@@ -440,7 +534,7 @@ usage(const char *argv0)
         "  ~/.ssh/id_rsa              OpenSSH RSA, convert first:\n"
         "                               openssl pkey -in ~/.ssh/id_rsa -out key.pem\n"
         "  key.pem                    PKCS#8 or traditional PEM (any type)\n",
-        argv0, argv0);
+        argv0, argv0, argv0);
 }
 
 static int
@@ -453,10 +547,10 @@ is_hex64_lower(const char *s)
     return n == 64;
 }
 
-/* sign msg with the key at path; print "<head>:<b64sig>\n"; 0 on success */
+/* sign msg with the key at path; print "<head>:<b64sig>[:<tail>]\n"; 0 on success */
 static int
 sign_and_print(const char *privkey_path, const unsigned char *msg, size_t msg_len,
-               const char *head)
+               const char *head, const char *tail)
 {
     EVP_PKEY *pkey = load_private_key(privkey_path);
     if (!pkey)
@@ -476,7 +570,10 @@ sign_and_print(const char *privkey_path, const unsigned char *msg, size_t msg_le
         fprintf(stderr, "Base64 encoding failed\n");
         return 1;
     }
-    printf("%s:%s\n", head, sig_b64);
+    if (tail)
+        printf("%s:%s:%s\n", head, sig_b64, tail);
+    else
+        printf("%s:%s\n", head, sig_b64);
     free(sig_b64);
     return 0;
 }
@@ -486,6 +583,7 @@ int main(int argc, char *argv[])
 {
     long        at         = -1;
     const char *nonce_opt  = NULL;
+    const char *cert_path  = NULL;
     const char *positional[2] = { NULL, NULL };
     int         npos       = 0;
 
@@ -496,6 +594,8 @@ int main(int argc, char *argv[])
         } else if (strcmp(argv[i], "--nonce") == 0 && i + 1 < argc) {
             nonce_opt = argv[++i];
             if (!is_hex64_lower(nonce_opt)) { fprintf(stderr, "--nonce must be 64 lowercase hex chars\n"); return 1; }
+        } else if (strcmp(argv[i], "--cert") == 0 && i + 1 < argc) {
+            cert_path = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]); return 1;
         } else if (argv[i][0] == '-' && argv[i][1] == '-') {
@@ -509,7 +609,7 @@ int main(int argc, char *argv[])
 
     if (npos == 2) {
         /* ── v1: sign a server-issued challenge ── */
-        if (at >= 0 || nonce_opt) { fprintf(stderr, "--at/--nonce apply to v2 only\n"); return 1; }
+        if (at >= 0 || nonce_opt || cert_path) { fprintf(stderr, "--at/--nonce/--cert apply to v2 and v3 only\n"); return 1; }
         const char *challenge_hex = positional[0];
         const char *privkey_path  = positional[1];
 
@@ -528,13 +628,19 @@ int main(int argc, char *argv[])
         memcpy(msg, SIGN_PREFIX, SIGN_PREFIX_LEN);
         memcpy(msg + SIGN_PREFIX_LEN, challenge_bytes, challenge_len);
         return sign_and_print(privkey_path, msg, SIGN_PREFIX_LEN + challenge_len,
-                              challenge_hex);
+                              challenge_hex, NULL);
     }
 
     if (npos != 1) { usage(argv[0]); return 1; }
 
-    /* ── v2: issue our own challenge ── */
+    /* ── v2 / v3: issue our own challenge ── */
     const char *privkey_path = positional[0];
+    char *cert_b64 = NULL;
+    if (cert_path) {
+        cert_b64 = read_cert_b64(cert_path);
+        if (!cert_b64)
+            return 1;
+    }
     char nonce_hex[65];
     if (nonce_opt) {
         memcpy(nonce_hex, nonce_opt, 65);
@@ -551,7 +657,11 @@ int main(int argc, char *argv[])
 
     unsigned char msg[128];
     size_t head_len = strlen(head);
-    memcpy(msg, SIGN_PREFIX_V2, SIGN_PREFIX_V2_LEN);
-    memcpy(msg + SIGN_PREFIX_V2_LEN, head, head_len);
-    return sign_and_print(privkey_path, msg, SIGN_PREFIX_V2_LEN + head_len, head);
+    const unsigned char *prefix     = cert_b64 ? SIGN_PREFIX_V3     : SIGN_PREFIX_V2;
+    size_t               prefix_len = cert_b64 ? SIGN_PREFIX_V3_LEN : SIGN_PREFIX_V2_LEN;
+    memcpy(msg, prefix, prefix_len);
+    memcpy(msg + prefix_len, head, head_len);
+    int rc = sign_and_print(privkey_path, msg, prefix_len + head_len, head, cert_b64);
+    free(cert_b64);
+    return rc;
 }

@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +116,8 @@ typedef struct {
     char keys[PATH_MAX];      /* root/keys   */
     char chal[PATH_MAX];      /* root/chal   */
     char ca_file[PATH_MAX];   /* root/trusted_ca_keys, "" when the option is off */
+    char agent_sock[PATH_MAX];/* root/agent.sock, "" when no agent was started */
+    long agent_pid;           /* ssh-agent to kill in env_teardown */
 } env_t;
 
 static env_t *g_live_env = NULL;   /* for atexit cleanup on abort */
@@ -192,6 +195,8 @@ env_setup(env_t *e)
     mkdir(e->chal,    01733);
     chmod(e->chal,    01733);   /* mkdir honours umask; force the real mode */
     e->ca_file[0] = '\0';
+    e->agent_sock[0] = '\0';
+    e->agent_pid = 0;
 
     write_services(e);
     g_live_env = e;
@@ -201,6 +206,7 @@ static void
 env_teardown(env_t *e)
 {
     g_live_env = NULL;
+    if (e->agent_pid > 0) { kill((pid_t)e->agent_pid, SIGTERM); e->agent_pid = 0; }
     if (getenv("PAM_TEST_KEEP")) {
         fprintf(stderr, "    (kept %s)\n", e->root);
         return;
@@ -223,6 +229,18 @@ gen_key(const env_t *e, const char *name, const char *keygen_args)
     return system(cmd) == 0 ? 0 : -1;
 }
 static int gen_ed25519(const env_t *e, const char *name) { return gen_key(e, name, "-t ed25519"); }
+
+/* Same, with a passphrase: only an agent can use the result. */
+static int
+gen_key_pass(const env_t *e, const char *name, const char *keygen_args,
+             const char *passphrase)
+{
+    char cmd[PATH_MAX * 2];
+    snprintf(cmd, sizeof(cmd),
+             "ssh-keygen -q %s -N '%s' -C '%s' -f '%s/%s' </dev/null >/dev/null 2>&1",
+             keygen_args, passphrase, name, e->root, name);
+    return system(cmd) == 0 ? 0 : -1;
+}
 static int gen_rsa_pem(const env_t *e, const char *name) { return gen_key(e, name, "-t rsa -b 2048 -m PEM"); }
 
 static void
@@ -269,6 +287,72 @@ static void
 authkeys_path(const env_t *e, const char *user, char *out, size_t sz)
 {
     snprintf(out, sz, "%s/%s/authorized_keys", e->keys, user);
+}
+
+static int
+count_colons_str(const char *s)
+{
+    int n = 0;
+    for (; *s; s++) if (*s == ':') n++;
+    return n;
+}
+
+/* ── ssh-agent helpers ────────────────────────────────────────────────── */
+
+/*
+ * Start a real ssh-agent listening on <root>/agent.sock.  The agent is the
+ * only place the private key lives in the agent tests: they delete the key
+ * file, so a token can only come from the agent.
+ */
+static int
+agent_start(env_t *e)
+{
+    snprintf(e->agent_sock, sizeof(e->agent_sock), "%s/agent.sock", e->root);
+    char cmd[PATH_MAX * 2], out[256];
+    snprintf(cmd, sizeof(cmd),
+             "ssh-agent -a '%s' 2>/dev/null | sed -n 's/^SSH_AGENT_PID=\\([0-9]*\\).*/\\1/p'",
+             e->agent_sock);
+    if (run_capture(cmd, out, sizeof(out)) != 0) return -1;
+    e->agent_pid = strtol(out, NULL, 10);
+    return e->agent_pid > 0 ? 0 : -1;
+}
+
+/* Add <name> to the agent.  passphrase != NULL uses an askpass helper. */
+static int
+agent_add(const env_t *e, const char *name, const char *passphrase)
+{
+    char key[PATH_MAX], cmd[PATH_MAX * 3], out[512];
+    key_path(e, name, key, sizeof(key));
+    if (passphrase) {
+        char ask[PATH_MAX], body[512];
+        snprintf(ask, sizeof(ask), "%s/askpass.sh", e->root);
+        snprintf(body, sizeof(body), "#!/bin/sh\nprintf '%%s\\n' '%s'\n", passphrase);
+        write_file(ask, body, 0755);
+        snprintf(cmd, sizeof(cmd),
+                 "SSH_AUTH_SOCK='%s' SSH_ASKPASS='%s' SSH_ASKPASS_REQUIRE=force "
+                 "DISPLAY=:0 ssh-add '%s' 2>&1", e->agent_sock, ask, key);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "SSH_AUTH_SOCK='%s' ssh-add '%s' 2>&1", e->agent_sock, key);
+    }
+    return run_capture(cmd, out, sizeof(out));
+}
+
+/*
+ * Sign through the agent: pg_sshkey_sign --agent <name>.pub [extra].
+ * sock_override lets a test point at a missing or wrong socket.
+ */
+static int
+make_token_agent(const env_t *e, const char *name, const char *extra,
+                 const char *sock_override, char *tok, size_t tok_sz)
+{
+    char key[PATH_MAX], cmd[PATH_MAX * 3];
+    key_path(e, name, key, sizeof(key));
+    snprintf(cmd, sizeof(cmd),
+             "SSH_AUTH_SOCK='%s' '%s' --agent '%s.pub' %s 2>/dev/null",
+             sock_override ? sock_override : e->agent_sock,
+             g_sign_bin, key, extra ? extra : "");
+    return run_capture(cmd, tok, tok_sz);
 }
 
 /* ── token helpers ────────────────────────────────────────────────────── */
@@ -983,6 +1067,146 @@ test_cert_with_control_characters_refused(void)
 }
 
 static void
+test_agent_ed25519_authenticates_without_the_private_key_file(void)
+{
+    /*
+     * The key is added to a real ssh-agent and then deleted from disk, so
+     * pg_sshkey_sign cannot read it: a token can only come from the agent.
+     */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(install_pubkey(&e, "alice", "id_ed25519", NULL, 0), 0);
+    ASSERT_EQ(agent_start(&e), 0);
+    ASSERT_EQ(agent_add(&e, "id_ed25519", NULL), 0);
+
+    char key[PATH_MAX];
+    key_path(&e, "id_ed25519", key, sizeof(key));
+    ASSERT_EQ(unlink(key), 0);
+
+    char tok[8192];
+    ASSERT_EQ(make_token_agent(&e, "id_ed25519", NULL, NULL, tok, sizeof(tok)), 0);
+    int acct = -1;
+    int rc = authenticate(&e, "alice", tok, &acct);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_EQ(acct, PAM_SUCCESS);
+    ASSERT_LOGGED("user 'alice' authenticated with key");
+    env_teardown(&e);
+}
+
+static void
+test_agent_rsa_key_authenticates(void)
+{
+    /* The agent signs RSA with SHA-1 unless the client asks for
+       rsa-sha2-256; the module only verifies SHA-256. */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_rsa_pem(&e, "id_rsa"), 0);
+    ASSERT_EQ(install_pubkey(&e, "alice", "id_rsa", NULL, 0), 0);
+    ASSERT_EQ(agent_start(&e), 0);
+    ASSERT_EQ(agent_add(&e, "id_rsa", NULL), 0);
+    char key[PATH_MAX];
+    key_path(&e, "id_rsa", key, sizeof(key));
+    ASSERT_EQ(unlink(key), 0);
+
+    char tok[8192];
+    ASSERT_EQ(make_token_agent(&e, "id_rsa", NULL, NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_LOGGED("user 'alice' authenticated with key");
+    env_teardown(&e);
+}
+
+static void
+test_agent_passphrase_protected_key_authenticates(void)
+{
+    /*
+     * A passphrase-protected key cannot be used any other way: the signer
+     * has no passphrase prompt and refuses an encrypted key file.
+     */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_key_pass(&e, "id_locked", "-t ed25519", "hunter2"), 0);
+    ASSERT_EQ(install_pubkey(&e, "alice", "id_locked", NULL, 0), 0);
+
+    /* the key file alone is useless to pg_sshkey_sign */
+    char tok[8192];
+    ASSERT_NE(make_token_v2(&e, "id_locked", NULL, tok, sizeof(tok)), 0);
+
+    ASSERT_EQ(agent_start(&e), 0);
+    ASSERT_EQ(agent_add(&e, "id_locked", "hunter2"), 0);
+    ASSERT_EQ(make_token_agent(&e, "id_locked", NULL, NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_LOGGED("user 'alice' authenticated with key");
+    env_teardown(&e);
+}
+
+static void
+test_agent_certificate_authenticates(void)
+{
+    /* --agent and --cert together: a v3 token with no key file and no
+       authorized_keys for the user. */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    ASSERT_EQ(agent_start(&e), 0);
+    ASSERT_EQ(agent_add(&e, "id_ed25519", NULL), 0);
+    char key[PATH_MAX], extra[PATH_MAX + 16];
+    key_path(&e, "id_ed25519", key, sizeof(key));
+    ASSERT_EQ(unlink(key), 0);
+
+    char tok[8192];
+    snprintf(extra, sizeof(extra), "--cert '%s/id_ed25519-cert.pub'", e.root);
+    ASSERT_EQ(make_token_agent(&e, "id_ed25519", extra, NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(count_colons_str(tok), 3);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_LOGGED("authenticated with certificate 'alice-key'");
+    env_teardown(&e);
+}
+
+static void
+test_agent_key_not_registered_refused(void)
+{
+    /* The agent signs, but the key is not in the user's authorized_keys. */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(gen_ed25519(&e, "id_wrong"), 0);
+    ASSERT_EQ(install_pubkey(&e, "alice", "id_ed25519", NULL, 0), 0);
+    ASSERT_EQ(agent_start(&e), 0);
+    ASSERT_EQ(agent_add(&e, "id_wrong", NULL), 0);
+
+    char tok[8192];
+    ASSERT_EQ(make_token_agent(&e, "id_wrong", NULL, NULL, tok, sizeof(tok)), 0);
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("authentication failed for 'alice'");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+    env_teardown(&e);
+}
+
+static void
+test_agent_absent_or_keyless_produces_no_token(void)
+{
+    /* No SSH_AUTH_SOCK, a dead socket, and an agent without the key each
+       fail loudly instead of printing something the server would refuse. */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(install_pubkey(&e, "alice", "id_ed25519", NULL, 0), 0);
+
+    char tok[8192], sock[PATH_MAX];
+    ASSERT_NE(make_token_agent(&e, "id_ed25519", NULL, "", tok, sizeof(tok)), 0);
+    snprintf(sock, sizeof(sock), "%s/no-such.sock", e.root);
+    ASSERT_NE(make_token_agent(&e, "id_ed25519", NULL, sock, tok, sizeof(tok)), 0);
+
+    ASSERT_EQ(agent_start(&e), 0);            /* running, but empty */
+    ASSERT_NE(make_token_agent(&e, "id_ed25519", NULL, NULL, tok, sizeof(tok)), 0);
+    env_teardown(&e);
+}
+
+static void
 test_cert_from_untrusted_ca_refused(void)
 {
     env_t e; env_setup(&e);
@@ -1328,6 +1552,12 @@ main(void)
     RUN(test_cert_refused_when_trusted_ca_keys_unset);
     RUN(test_oversized_token_refused_before_parsing);
     RUN(test_cert_with_control_characters_refused);
+    RUN(test_agent_ed25519_authenticates_without_the_private_key_file);
+    RUN(test_agent_rsa_key_authenticates);
+    RUN(test_agent_passphrase_protected_key_authenticates);
+    RUN(test_agent_certificate_authenticates);
+    RUN(test_agent_key_not_registered_refused);
+    RUN(test_agent_absent_or_keyless_produces_no_token);
     RUN(test_cert_from_untrusted_ca_refused);
     RUN(test_cert_expired_refused);
     RUN(test_cert_not_yet_valid_refused);

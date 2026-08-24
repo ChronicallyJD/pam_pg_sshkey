@@ -88,8 +88,8 @@ pam_pg_sshkey.so: $(PAM_OBJS)
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $^ $(CRYPTO_LIBS) -lpam
 
 # ── Standalone binaries (compiled directly from .c, no intermediate .o) ────
-pg_sshkey_sign: $S/pg_sshkey_sign.c
-	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -o $@ $< $(CRYPTO_LIBS)
+pg_sshkey_sign: $S/pg_sshkey_sign.c $S/ssh_agent.c
+	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -o $@ $^ $(CRYPTO_LIBS)
 
 pg_sshkey_challenge: $S/pg_sshkey_challenge.c $S/challenge_store.c
 	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -o $@ $^ $(CRYPTO_LIBS)

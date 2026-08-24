@@ -596,6 +596,83 @@ static void test_sign_cert_unpadded_field_fails(void) {
     rm_dir();
 }
 
+/* ── ssh-agent signing ────────────────────────────────────────────────── */
+
+/* Write a .pub file whose blob names <type>, without needing that hardware. */
+static int
+fake_pubkey(const char *type, const char *path)
+{
+    static const char script[] =
+        "import base64, struct, sys\n"
+        "t = sys.argv[1].encode()\n"
+        "blob = struct.pack('>I', len(t)) + t\n"
+        "blob += struct.pack('>I', 32) + b'\\0' * 32\n"
+        "blob += struct.pack('>I', 4) + b'ssh:'\n"
+        "open(sys.argv[2], 'w').write('%s %s test\\n' %"
+        " (sys.argv[1], base64.b64encode(blob).decode()))\n";
+    char args[1024];
+    snprintf(args, sizeof(args), "'%s' '%s'", type, path);
+    return run_python_script(script, args);
+}
+
+static void test_agent_without_auth_sock_fails(void) {
+    mk_dir();
+    char priv[512], cmd[2048], out[1024];
+    snprintf(priv, sizeof(priv), "%s/user_ed25519", g_dir);
+    ASSERT_EQ(gen_cert("ed25519", priv, cmd, sizeof(cmd)), 0);   /* also writes .pub */
+    snprintf(cmd, sizeof(cmd),
+        "unset SSH_AUTH_SOCK; pg_sshkey_sign --agent %s.pub 2>%s/err", priv, g_dir);
+    int rc = run_capture(cmd, out, sizeof(out));
+    ASSERT_EQ(rc, 1);
+    ASSERT_STR_EQ(out, "");
+    ASSERT_TRUE(stderr_mentions_cert("SSH_AUTH_SOCK is not set"));
+    rm_dir();
+}
+
+static void test_agent_security_key_type_refused(void) {
+    /* sk-* signatures carry authenticator fields the server does not verify */
+    mk_dir();
+    char pub[512], cmd[2048], out[1024];
+    snprintf(pub, sizeof(pub), "%s/sk.pub", g_dir);
+    ASSERT_EQ(fake_pubkey("sk-ssh-ed25519@openssh.com", pub), 0);
+    snprintf(cmd, sizeof(cmd),
+        "SSH_AUTH_SOCK=/nonexistent pg_sshkey_sign --agent %s 2>%s/err", pub, g_dir);
+    int rc = run_capture(cmd, out, sizeof(out));
+    ASSERT_EQ(rc, 1);
+    ASSERT_STR_EQ(out, "");
+    /* refused on the key type, before any socket is touched */
+    ASSERT_TRUE(stderr_mentions_cert("FIDO/security key"));
+    rm_dir();
+}
+
+static void test_agent_rejects_private_key_and_stray_positional(void) {
+    mk_dir();
+    char priv[512], cmd[2048], out[1024];
+    snprintf(priv, sizeof(priv), "%s/user_ed25519", g_dir);
+    ASSERT_EQ(gen_cert("ed25519", priv, cmd, sizeof(cmd)), 0);
+
+    /* the PRIVATE key is not a public key line */
+    snprintf(cmd, sizeof(cmd),
+        "SSH_AUTH_SOCK=/nonexistent pg_sshkey_sign --agent %s 2>%s/err", priv, g_dir);
+    ASSERT_EQ(run_capture(cmd, out, sizeof(out)), 1);
+    ASSERT_TRUE(stderr_mentions_cert("not an OpenSSH public key line"));
+
+    /* --agent replaces the private key argument, it does not accompany it */
+    snprintf(cmd, sizeof(cmd),
+        "SSH_AUTH_SOCK=/nonexistent pg_sshkey_sign --agent %s.pub %s 2>%s/err",
+        priv, priv, g_dir);
+    ASSERT_EQ(run_capture(cmd, out, sizeof(out)), 1);
+    ASSERT_TRUE(stderr_mentions_cert("do not also pass a private key"));
+
+    /* v1 has no agent flow */
+    snprintf(cmd, sizeof(cmd),
+        "SSH_AUTH_SOCK=/nonexistent pg_sshkey_sign --agent %s.pub %064d %s 2>%s/err",
+        priv, 0, priv, g_dir);
+    ASSERT_EQ(run_capture(cmd, out, sizeof(out)), 1);
+    ASSERT_TRUE(stderr_mentions_cert("--agent"));
+    rm_dir();
+}
+
 static void test_sign_cert_signature_covers_v3_prefix(void) {
     /* The signature must be over "pg-sshkey-v3\0<ts>:<nonce>" with the key
        embedded in the certificate, else the server's v3 check cannot pass. */
@@ -712,6 +789,9 @@ int main(void) {
     RUN(test_sign_cert_missing_file_fails);
     RUN(test_sign_cert_not_a_cert_fails);
     RUN(test_sign_cert_unpadded_field_fails);
+    RUN(test_agent_without_auth_sock_fails);
+    RUN(test_agent_security_key_type_refused);
+    RUN(test_agent_rejects_private_key_and_stray_positional);
     RUN(test_sign_cert_signature_covers_v3_prefix);
     RUN(test_pipeline_two_challenges_two_tokens);
     RUN(test_pipeline_nonce_file_present_before_auth);

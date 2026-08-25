@@ -8,16 +8,15 @@ Tests:
   - get_token() with PKCS#8 Ed25519 key
   - get_token() with PKCS#8 RSA-2048 key
   - get_token() with passphrase-protected key
-  - Token format validation (64hex:base64)
-  - Token hex portion matches nonce file in challenge dir
+  - Token format validation ("<ts>:<64hex>:<base64>")
   - Two calls produce two different tokens
-  - Nonce file exists on disk before authentication
-  - Nonce file is readable (mode 0644)
+  - Nothing is written to the filesystem while a token is made
   - Missing key raises KeyError_
-  - Unwritable challenge dir raises ChallengeError
   - passing password= to connect() raises ValueError
-  - SIGN_PREFIX is exactly b"pg-sshkey-v1\\x00" (13 bytes)
+  - SIGN_PREFIX_V2 is exactly b"pg-sshkey-v2\\x00" (13 bytes)
   - Signed message matches what the PAM module verifies
+  - The removed nonce parameters (version, challenge_cmd, challenge_dir)
+    raise TypeError
   - get_token(cert_path=...) produces a 4-field v3 token, signed over
     "pg-sshkey-v3\\0<ts>:<nonce>", whose 4th field is the cert file's base64,
     byte-identical to pg_sshkey_sign --cert for the same ts and nonce
@@ -56,14 +55,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import pam_pg_sshkey
 from pam_pg_sshkey import (
-    ChallengeError,
     KeyError_,
-    _SIGN_PREFIX,
     _SIGN_PREFIX_V2,
     _SIGN_PREFIX_V3,
-    _create_challenge,
     _load_private_key,
-    _sign,
+    _sign_message,
     connect_replication,
     get_token,
 )
@@ -101,22 +97,24 @@ needs_bcrypt = unittest.skipUnless(
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-TOKEN_RE = re.compile(r"^[0-9a-f]{64}:[A-Za-z0-9+/]+=*$")
 TOKEN_V2_RE = re.compile(r"^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]+=*$")
 TOKEN_V3_RE = re.compile(r"^[0-9]+:[0-9a-f]{64}:[A-Za-z0-9+/]+=*:[A-Za-z0-9+/]+=*$")
 
 
 def _is_valid_token(token: str) -> bool:
-    """v1 or v2 shape"""
-    return bool(TOKEN_RE.match(token) or TOKEN_V2_RE.match(token))
+    """The three-field shape the server takes: "<ts>:<nonce_hex>:<sig>"."""
+    return bool(TOKEN_V2_RE.match(token))
 
 
 class TempDir:
-    """Context manager providing a fresh temp directory and challenge subdir."""
+    """Context manager providing a fresh temp directory and an empty subdir to
+    watch for stray files."""
 
     def __enter__(self):
         self._td = tempfile.TemporaryDirectory()
         self.root = self._td.name
+        # A directory a v1 client would have written a nonce into.  Tokens are
+        # signed in process now, so every test that watches it wants it empty.
         self.chaldir = os.path.join(self.root, "challenges")
         os.makedirs(self.chaldir, mode=0o1733)
         return self
@@ -154,21 +152,6 @@ def make_ed25519_encrypted(passphrase: bytes) -> bytes:
     return sk.private_bytes(
         Encoding.PEM, PrivateFormat.OpenSSH, BestAvailableEncryption(passphrase)
     )
-
-
-# ── Tests: _SIGN_PREFIX ────────────────────────────────────────────────────────
-
-class TestSignPrefix(unittest.TestCase):
-
-    def test_prefix_is_correct_bytes(self):
-        """SIGN_PREFIX must be b'pg-sshkey-v1\\x00' (12 chars + NUL = 13 bytes)."""
-        self.assertEqual(_SIGN_PREFIX, b"pg-sshkey-v1\x00")
-
-    def test_prefix_length_is_13(self):
-        self.assertEqual(len(_SIGN_PREFIX), 13)
-
-    def test_prefix_ends_with_nul(self):
-        self.assertEqual(_SIGN_PREFIX[-1], 0)
 
 
 # ── Tests: _load_private_key ───────────────────────────────────────────────────
@@ -248,102 +231,37 @@ class TestLoadPrivateKey(unittest.TestCase):
         self.assertNotIn("~", str(ctx.exception).split("not found")[0].split(":")[-1])
 
 
-# ── Tests: _create_challenge ───────────────────────────────────────────────────
+# ── Tests: _sign_message ─────────────────────────────────────────────────────
 
-class TestCreateChallenge(unittest.TestCase):
+class TestSignMessage(unittest.TestCase):
+    """_sign_message signs the bytes get_token has already built: the prefix
+    followed by "<ts>:<nonce_hex>"."""
 
-    def test_returns_hex64_and_32_bytes(self):
-        with TempDir() as d:
-            hex_id, raw = _create_challenge(d.chaldir)
-            self.assertEqual(len(hex_id), 64)
-            self.assertTrue(all(c in "0123456789abcdef" for c in hex_id))
-            self.assertEqual(len(raw), 32)
-
-    def test_hex_matches_raw_bytes(self):
-        with TempDir() as d:
-            hex_id, raw = _create_challenge(d.chaldir)
-            self.assertEqual(hex_id, raw.hex())
-
-    def test_creates_file_in_dir(self):
-        with TempDir() as d:
-            hex_id, _ = _create_challenge(d.chaldir)
-            nonce_path = os.path.join(d.chaldir, hex_id)
-            self.assertTrue(os.path.exists(nonce_path))
-
-    def test_file_mode_is_0644(self):
-        with TempDir() as d:
-            hex_id, _ = _create_challenge(d.chaldir)
-            nonce_path = os.path.join(d.chaldir, hex_id)
-            mode = oct(os.stat(nonce_path).st_mode & 0o777)
-            self.assertEqual(mode, oct(0o644))
-
-    def test_file_mode_is_0644_under_umask_077(self):
-        """Restrictive umask (systemd/cron) must not hide the nonce from postgres."""
-        old = os.umask(0o077)
-        try:
-            with TempDir() as d:
-                hex_id, _ = _create_challenge(d.chaldir)
-                nonce_path = os.path.join(d.chaldir, hex_id)
-                mode = oct(os.stat(nonce_path).st_mode & 0o777)
-        finally:
-            os.umask(old)
-        self.assertEqual(mode, oct(0o644))
-
-    def test_successive_challenges_are_unique(self):
-        with TempDir() as d:
-            h1, r1 = _create_challenge(d.chaldir)
-            h2, r2 = _create_challenge(d.chaldir)
-            self.assertNotEqual(h1, h2)
-            self.assertNotEqual(r1, r2)
-
-    def test_unwritable_dir_raises_challenge_error(self):
-        with self.assertRaises(ChallengeError):
-            _create_challenge("/proc/1/pam_test_bad_dir")
-
-    def test_autocreates_missing_dir(self):
-        with tempfile.TemporaryDirectory() as root:
-            newdir = os.path.join(root, "new_chal_dir")
-            self.assertFalse(os.path.exists(newdir))
-            hex_id, _ = _create_challenge(newdir)
-            self.assertTrue(os.path.exists(newdir))
-            self.assertTrue(os.path.exists(os.path.join(newdir, hex_id)))
-
-
-# ── Tests: _sign ──────────────────────────────────────────────────────────────
-
-class TestSign(unittest.TestCase):
-
-    def _make_ed25519(self) -> Ed25519PrivateKey:
-        return Ed25519PrivateKey.generate()
+    def _message(self) -> bytes:
+        import secrets
+        return _SIGN_PREFIX_V2 + f"{int(time.time())}:{secrets.token_bytes(32).hex()}".encode()
 
     def test_ed25519_signature_length_is_64(self):
-        key = self._make_ed25519()
-        sig = _sign(key, b"\x01" * 32)
-        self.assertEqual(len(sig), 64)
+        key = Ed25519PrivateKey.generate()
+        self.assertEqual(len(_sign_message(key, self._message())), 64)
 
     def test_ed25519_signature_verifies(self):
-        import secrets
-        key = self._make_ed25519()
-        challenge = secrets.token_bytes(32)
-        sig = _sign(key, challenge)
-        # Verify using the public key
-        key.public_key().verify(sig, _SIGN_PREFIX + challenge)
+        key = Ed25519PrivateKey.generate()
+        message = self._message()
+        key.public_key().verify(_sign_message(key, message), message)
 
     def test_rsa_signature_verifies(self):
-        import secrets
         from cryptography.hazmat.primitives.asymmetric import padding as p
         from cryptography.hazmat.primitives import hashes as h
         key = generate_private_key(65537, 2048)
-        challenge = secrets.token_bytes(32)
-        sig = _sign(key, challenge)
-        key.public_key().verify(sig, _SIGN_PREFIX + challenge, p.PKCS1v15(), h.SHA256())
+        message = self._message()
+        key.public_key().verify(_sign_message(key, message), message,
+                                p.PKCS1v15(), h.SHA256())
 
-    def test_different_challenges_produce_different_sigs(self):
-        import secrets
-        key = self._make_ed25519()
-        sig1 = _sign(key, secrets.token_bytes(32))
-        sig2 = _sign(key, secrets.token_bytes(32))
-        self.assertNotEqual(sig1, sig2)
+    def test_different_messages_produce_different_sigs(self):
+        key = Ed25519PrivateKey.generate()
+        self.assertNotEqual(_sign_message(key, self._message()),
+                            _sign_message(key, self._message()))
 
 
 # ── Tests: get_token ──────────────────────────────────────────────────────────
@@ -353,71 +271,55 @@ class TestGetToken(unittest.TestCase):
     def test_openssh_ed25519_returns_valid_token(self):
         with TempDir() as d:
             path = d.write_key("id_ed25519", make_ed25519_openssh())
-            token = get_token(key_path=path, challenge_dir=d.chaldir)
+            token = get_token(key_path=path)
             self.assertTrue(_is_valid_token(token), f"invalid token: {token!r}")
 
     def test_pkcs8_ed25519_returns_valid_token(self):
         with TempDir() as d:
             path = d.write_key("ed25519.pem", make_ed25519_pkcs8())
-            token = get_token(key_path=path, challenge_dir=d.chaldir)
-            self.assertTrue(_is_valid_token(token))
+            self.assertTrue(_is_valid_token(get_token(key_path=path)))
 
     def test_rsa_returns_valid_token(self):
         with TempDir() as d:
             path = d.write_key("rsa.pem", make_rsa_pkcs8())
-            token = get_token(key_path=path, challenge_dir=d.chaldir)
-            self.assertTrue(_is_valid_token(token))
+            self.assertTrue(_is_valid_token(get_token(key_path=path)))
 
-    def test_token_hex_matches_nonce_file(self):
+    def test_token_nonce_is_64_hex_and_fresh_each_time(self):
         with TempDir() as d:
             path = d.write_key("key", make_ed25519_openssh())
-            token = get_token(key_path=path, challenge_dir=d.chaldir, version=1)
-            hex_part = token.split(":")[0]
-            nonce_file = os.path.join(d.chaldir, hex_part)
-            self.assertTrue(os.path.exists(nonce_file),
-                            f"nonce file {nonce_file} not found")
+            nonces = {get_token(key_path=path).split(":")[1] for _ in range(5)}
+            self.assertEqual(len(nonces), 5)
+            for nonce in nonces:
+                self.assertRegex(nonce, r"^[0-9a-f]{64}$")
 
     def test_successive_tokens_are_unique(self):
         with TempDir() as d:
             path = d.write_key("key", make_ed25519_openssh())
-            t1 = get_token(key_path=path, challenge_dir=d.chaldir)
-            t2 = get_token(key_path=path, challenge_dir=d.chaldir)
-            self.assertNotEqual(t1, t2)
+            self.assertNotEqual(get_token(key_path=path), get_token(key_path=path))
 
     @needs_bcrypt
     def test_encrypted_key_with_passphrase(self):
         passphrase = b"test passphrase"
         with TempDir() as d:
             path = d.write_key("encrypted", make_ed25519_encrypted(passphrase))
-            token = get_token(
-                key_path=path, challenge_dir=d.chaldir, passphrase=passphrase
-            )
+            token = get_token(key_path=path, passphrase=passphrase)
             self.assertTrue(_is_valid_token(token))
 
     def test_missing_key_raises_keyerror(self):
-        with TempDir() as d:
-            with self.assertRaises(KeyError_):
-                get_token(key_path="/tmp/no_such_key_pam.pem",
-                          challenge_dir=d.chaldir)
+        with self.assertRaises(KeyError_):
+            get_token(key_path="/tmp/no_such_key_pam.pem")
 
-    def test_bad_challenge_dir_raises_challenge_error(self):
+    def test_token_writes_nothing_to_disk(self):
+        """The token is signed in process: a bad key, and a good one, must
+        both leave the filesystem untouched."""
         with TempDir() as d:
             path = d.write_key("key", make_ed25519_openssh())
-            with self.assertRaises(ChallengeError):
-                get_token(key_path=path,
-                          challenge_dir="/proc/1/pam_bad_dir", version=1)
-
-    def test_key_loaded_before_nonce_created(self):
-        """If the key is bad, no nonce file should be left on disk."""
-        with TempDir() as d:
-            files_before = set(os.listdir(d.chaldir))
-            try:
-                get_token(key_path="/no/such/key.pem", challenge_dir=d.chaldir, version=1)
-            except KeyError_:
-                pass
-            files_after = set(os.listdir(d.chaldir))
-            self.assertEqual(files_before, files_after,
-                             "stale nonce file created before key was validated")
+            before = set(os.listdir(d.root)), set(os.listdir(d.chaldir))
+            get_token(key_path=path)
+            with self.assertRaises(KeyError_):
+                get_token(key_path="/no/such/key.pem")
+            self.assertEqual((set(os.listdir(d.root)), set(os.listdir(d.chaldir))),
+                             before)
 
 
 # ── Tests: import robustness ──────────────────────────────────────────────────
@@ -443,13 +345,13 @@ class TestImportWithoutHome(unittest.TestCase):
 class TestV2Token(unittest.TestCase):
     """v2: the client picks timestamp + nonce and signs
     "pg-sshkey-v2\\0" + "<ts>:<nonce_hex>".  Nothing is written anywhere and
-    no server-side step exists, so remote hosts need no ssh/challenge_cmd."""
+    no server-side step exists, so a client on any host can sign its own."""
 
     def test_default_token_is_v2_and_writes_nothing(self):
         with TempDir() as d:
             path = d.write_key("key", make_ed25519_openssh())
             before = int(time.time())
-            token = get_token(key_path=path, challenge_dir=d.chaldir)
+            token = get_token(key_path=path)
             self.assertTrue(TOKEN_V2_RE.match(token), token)
             ts = int(token.split(":")[0])
             self.assertTrue(before <= ts <= int(time.time()) + 1)
@@ -477,60 +379,50 @@ class TestV2Token(unittest.TestCase):
             path = d.write_key("rsa.pem", make_rsa_pkcs8())
             self.assertTrue(TOKEN_V2_RE.match(get_token(key_path=path)))
 
-    def test_version_1_still_available(self):
+
+# ── Tests: the v1 parameters are gone ────────────────────────────────────────
+
+class TestV1ParametersRemoved(unittest.TestCase):
+    """The server takes v2 and v3 tokens only.  The parameters that existed to
+    mint or fetch a server-side nonce were removed rather than deprecated, so a
+    caller that still passes one gets a TypeError from Python itself."""
+
+    def _key(self, d: TempDir) -> str:
+        return d.write_key("key", make_ed25519_openssh())
+
+    def test_version_keyword_raises_typeerror(self):
         with TempDir() as d:
-            path = d.write_key("key", make_ed25519_openssh())
-            token = get_token(key_path=path, challenge_dir=d.chaldir, version=1)
-            self.assertTrue(TOKEN_RE.match(token), token)
-            self.assertTrue(os.path.exists(os.path.join(d.chaldir, token.split(":")[0])))
+            with self.assertRaises(TypeError):
+                get_token(key_path=self._key(d), version=1)
 
-    def test_unknown_version_rejected(self):
+    def test_challenge_cmd_keyword_raises_typeerror(self):
         with TempDir() as d:
-            path = d.write_key("key", make_ed25519_openssh())
-            with self.assertRaises(ValueError):
-                get_token(key_path=path, version=3)
+            with self.assertRaises(TypeError):
+                get_token(key_path=self._key(d), challenge_cmd="echo x")
 
-
-# ── Tests: challenge_cmd (nonce minted on the server, e.g. over ssh) ─────────
-
-class TestChallengeCmd(unittest.TestCase):
-    """The PAM module reads the nonce from the *server's* challenge_dir, so a
-    client on another host must create it there.  challenge_cmd runs a
-    command (typically `ssh server pg_sshkey_challenge DIR`) that prints the
-    64-hex nonce; the token is then signed locally from that hex."""
-
-    HEX = "0123456789abcdef" * 4
-
-    def test_token_uses_hex_from_command_and_creates_no_local_nonce(self):
+    def test_challenge_dir_keyword_raises_typeerror(self):
         with TempDir() as d:
-            path = d.write_key("key", make_ed25519_openssh())
-            token = get_token(key_path=path, challenge_dir=d.chaldir,
-                              challenge_cmd=f"printf '%s\\n' {self.HEX}")
-            self.assertTrue(_is_valid_token(token))
-            self.assertEqual(token.split(":")[0], self.HEX)
-            self.assertEqual(os.listdir(d.chaldir), [], "no nonce may be created locally")
+            with self.assertRaises(TypeError):
+                get_token(key_path=self._key(d), challenge_dir=d.chaldir)
 
-    def test_signature_is_over_the_remote_nonce_bytes(self):
-        with TempDir() as d:
-            sk = Ed25519PrivateKey.generate()
-            path = d.write_key("key", sk.private_bytes(Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption()))
-            token = get_token(key_path=path, challenge_dir=d.chaldir,
-                              challenge_cmd=["printf", "%s", self.HEX])
-            sig = base64.b64decode(token.split(":")[1])
-            sk.public_key().verify(sig, _SIGN_PREFIX + bytes.fromhex(self.HEX))
+    def test_no_public_function_still_takes_them(self):
+        """connect() and connect_replication() forward every other keyword to
+        psycopg2, so a removed name reaches libpq as an unknown connection
+        option instead of a TypeError.  What matters is that neither function
+        names it any more."""
+        import inspect
+        for fn in (get_token, pam_pg_sshkey.connect, connect_replication):
+            for name in ("version", "challenge_cmd", "challenge_dir"):
+                with self.subTest(fn=fn.__name__, parameter=name):
+                    self.assertNotIn(name, inspect.signature(fn).parameters)
 
-    def test_failing_command_raises_challenge_error(self):
-        with TempDir() as d:
-            path = d.write_key("key", make_ed25519_openssh())
-            with self.assertRaises(ChallengeError) as ctx:
-                get_token(key_path=path, challenge_cmd="echo boom >&2; exit 3")
-            self.assertIn("boom", str(ctx.exception))
-
-    def test_garbage_output_raises_challenge_error(self):
-        with TempDir() as d:
-            path = d.write_key("key", make_ed25519_openssh())
-            with self.assertRaises(ChallengeError):
-                get_token(key_path=path, challenge_cmd="echo not-a-nonce")
+    def test_module_no_longer_exports_the_v1_helpers(self):
+        for name in ("_SIGN_PREFIX", "_sign", "_create_challenge",
+                     "_remote_challenge", "DEFAULT_TOKEN_VERSION",
+                     "DEFAULT_CHALLENGE_DIR", "ChallengeError"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(pam_pg_sshkey, name),
+                                 f"{name} is still defined")
 
 
 # ── Tests: connect() guard ────────────────────────────────────────────────────
@@ -557,7 +449,7 @@ class TestConnectReplication(unittest.TestCase):
         with TempDir() as d:
             path = d.write_key("key", make_ed25519_openssh())
             with mock.patch("psycopg2.connect") as m:
-                connect_replication(key_path=path, challenge_dir=d.chaldir,
+                connect_replication(key_path=path,
                                     user="replicator", host="publisher", **kw)
                 self.assertEqual(m.call_count, 1)
                 return m.call_args.kwargs
@@ -666,19 +558,6 @@ class TestCertToken(unittest.TestCase):
             pub.verify(base64.b64decode(sig_b64),
                        _SIGN_PREFIX_V3 + f"{ts}:{nonce}".encode("ascii"),
                        p.PKCS1v15(), h.SHA256())
-
-    def test_cert_path_with_version_1_raises_valueerror(self):
-        with TempDir() as d:
-            key, cert, _ = self._certified_key(d)
-            with self.assertRaises(ValueError):
-                get_token(key_path=key, cert_path=cert, version=1, challenge_dir=d.chaldir)
-            self.assertEqual(os.listdir(d.chaldir), [], "no nonce may be created")
-
-    def test_cert_path_with_challenge_cmd_raises_valueerror(self):
-        with TempDir() as d:
-            key, cert, _ = self._certified_key(d)
-            with self.assertRaises(ValueError):
-                get_token(key_path=key, cert_path=cert, challenge_cmd="echo x")
 
     def test_plain_public_key_as_cert_is_refused(self):
         with TempDir() as d:
@@ -1120,16 +999,6 @@ class TestAgentArgumentErrors(unittest.TestCase):
     def test_agent_pubkey_with_key_path_raises_valueerror(self):
         with self.assertRaises(ValueError):
             get_token(agent_pubkey=self._pub(), key_path="/nonexistent/key")
-
-    def test_agent_pubkey_with_version_1_raises_valueerror(self):
-        with self.assertRaises(ValueError):
-            get_token(agent_pubkey=self._pub(), version=1)
-
-    def test_agent_pubkey_with_challenge_cmd_raises_valueerror(self):
-        """Documented in get_token()'s docstring; the C signer has no such
-        combination to offer."""
-        with self.assertRaises(ValueError):
-            get_token(agent_pubkey=self._pub(), challenge_cmd="echo x")
 
     def test_agent_pubkey_with_passphrase_raises_valueerror(self):
         """A passphrase cannot reach the agent, so accepting one silently

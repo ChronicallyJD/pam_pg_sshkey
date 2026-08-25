@@ -16,10 +16,7 @@ USAGE
     from pam_pg_sshkey import get_token, connect, connect_replication
 
     # Get a signed token and use it yourself:
-    token = get_token(
-        key_path="~/.ssh/id_ed25519",
-        challenge_dir="/var/run/pg_sshkey",
-    )
+    token = get_token(key_path="~/.ssh/id_ed25519")
     conn = psycopg2.connect(
         host="publisher.example.com",
         user="replicator",
@@ -34,6 +31,16 @@ USAGE
     # Sign through the ssh-agent at $SSH_AUTH_SOCK instead of reading the
     # private key file (passphrase-protected keys and forwarded agents work):
     conn = connect(agent_pubkey="~/.ssh/id_ed25519.pub", user="alice", dbname="mydb")
+
+TOKEN FORMAT
+============
+    "<unix_ts>:<nonce_hex>:<base64_sig>"              (with cert_path:
+    "<unix_ts>:<nonce_hex>:<base64_sig>:<base64_cert>")
+
+The client picks the timestamp and the 32-byte nonce and signs them; nothing
+is created on the server beforehand, so a token can be made on any host. The
+server accepts |now - ts| <= 60 seconds and records each nonce on first use,
+which makes every token single-use.
 
 WHY THE TOKEN MUST BE PRE-COMPUTED
 ====================================
@@ -87,14 +94,11 @@ import hashlib
 import os
 import secrets
 import socket
-import stat
 import struct
 import time
 import re
-import shlex
-import subprocess
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 # ── Imports with helpful errors ───────────────────────────────────────────────
 
@@ -122,24 +126,20 @@ except ImportError as e:
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 # Domain-separation prefixes, must match the PAM module exactly
-_SIGN_PREFIX: bytes = b"pg-sshkey-v1\x00"        # v1: server-issued nonce file
 _SIGN_PREFIX_V2: bytes = b"pg-sshkey-v2\x00"     # v2: client-issued challenge
 _SIGN_PREFIX_V3: bytes = b"pg-sshkey-v3\x00"     # v3: certificate, client-issued challenge
 
-# Token versions:
-#   3 (cert_path) "<unix_ts>:<nonce_hex>:<sig>:<cert_b64>", message = PREFIX_V3 +
-#                "<ts>:<nonce_hex>", signed by the private key whose public key
-#                the OpenSSH certificate carries.  Chosen by passing cert_path.
-#   2 (default)  "<unix_ts>:<nonce_hex>:<sig>", message = PREFIX_V2 + "<ts>:<nonce_hex>".
-#                The client picks timestamp and nonce; nothing is created on the
-#                server beforehand; works from any host.  The server accepts
-#                |now - ts| <= 60 s and records each nonce on first use.
-#   1 (legacy)   "<nonce_hex>:<sig>" over a nonce file that must already exist
-#                in the SERVER's challenge_dir (local file or challenge_cmd).
-DEFAULT_TOKEN_VERSION: int = 2
+# Token shapes, both with a client-issued challenge:
+#   v2 (default)  "<unix_ts>:<nonce_hex>:<sig>", message = PREFIX_V2 +
+#                 "<ts>:<nonce_hex>".  The client picks timestamp and nonce;
+#                 nothing is created on the server beforehand; works from any
+#                 host.  The server accepts |now - ts| <= 60 s and records each
+#                 nonce on first use.
+#   v3 (cert_path) "<unix_ts>:<nonce_hex>:<sig>:<cert_b64>", message =
+#                 PREFIX_V3 + "<ts>:<nonce_hex>", signed by the private key
+#                 whose public key the OpenSSH certificate carries.
 
 # Default paths
-DEFAULT_CHALLENGE_DIR: str = "/var/run/pg_sshkey"
 # Resolved lazily-safe: importing must never fail just because HOME is unset
 # (DynamicUser services, `docker run --user`), callers may pass key_path.
 try:
@@ -151,7 +151,8 @@ DEFAULT_KEY_PASSPHRASE: bytes | None = None
 # Spellings libpq treats as "physical replication connection"
 _PHYSICAL_REPLICATION = frozenset({"true", "on", "yes", "1"})
 
-# Challenge TTL (seconds), must match CHALLENGE_TTL_SECS in challenge_store.h
+# How far the server lets a token's timestamp sit from its own clock, in
+# seconds.  Must match CHALLENGE_TTL_SECS in challenge_store.h.
 CHALLENGE_TTL_SECS: int = 60
 
 # ssh-agent protocol (OpenSSH PROTOCOL.agent).  Every message on the socket is
@@ -209,113 +210,9 @@ _UNSET: Any = _UnsetKeyPath()
 class PamPgSshKeyError(Exception):
     """Base exception for all pam_pg_sshkey errors."""
 
-class ChallengeError(PamPgSshKeyError):
-    """Failed to create or read the challenge nonce."""
-
 class KeyError_(PamPgSshKeyError):
     """Failed to load or use the private key."""
     # Named with trailing _ to avoid shadowing Python's built-in KeyError
-
-
-# ── Challenge creation ────────────────────────────────────────────────────────
-
-def _create_challenge(challenge_dir: str) -> tuple[str, bytes]:
-    """
-    Generate a 32-byte nonce, write it to challenge_dir/<hex>, and return
-    (hex_id, raw_bytes).
-
-    The file is written atomically with mode 0644 so the postgres-owned PAM
-    module can read it regardless of which OS user runs this function.
-
-    Raises ChallengeError if the directory is not writable.
-    """
-    dirpath = Path(challenge_dir)
-
-    if not dirpath.exists():
-        try:
-            dirpath.mkdir(mode=0o1733, parents=False)
-        except OSError as e:
-            raise ChallengeError(
-                f"Challenge directory does not exist and could not be created: "
-                f"{challenge_dir}\n\n"
-                f"Fix with (as root):\n"
-                f"  sudo mkdir -p {challenge_dir}\n"
-                f"  sudo chown postgres:postgres {challenge_dir}\n"
-                f"  sudo chmod 1733 {challenge_dir}"
-            ) from e
-
-    if not os.access(challenge_dir, os.W_OK | os.X_OK):
-        raise ChallengeError(
-            f"Cannot write to challenge directory: {challenge_dir}\n\n"
-            f"Current permissions:\n"
-            f"  {oct(dirpath.stat().st_mode)}\n\n"
-            f"Fix with (as root):\n"
-            f"  sudo chown postgres:postgres {challenge_dir}\n"
-            f"  sudo chmod 1733 {challenge_dir}"
-        )
-
-    raw = secrets.token_bytes(32)
-    hex_id = raw.hex()
-    nonce_path = dirpath / hex_id
-
-    # Write atomically: exclusive create so two simultaneous calls never collide
-    try:
-        fd = os.open(str(nonce_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        # os.open() applies the umask; a client under umask 077 would leave a
-        # 0600 nonce that the postgres-run PAM module cannot read.
-        os.fchmod(fd, 0o644)
-    except FileExistsError:
-        # Astronomically unlikely (32-byte collision) but handle gracefully
-        raw = secrets.token_bytes(32)
-        hex_id = raw.hex()
-        nonce_path = dirpath / hex_id
-        fd = os.open(str(nonce_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-
-    with os.fdopen(fd, "w") as f:
-        f.write(f"{int(time.time())}\n{hex_id}\n")
-
-    return hex_id, raw
-
-
-# ── Remote challenge ──────────────────────────────────────────────────────────
-
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
-def _remote_challenge(challenge_cmd: str | Sequence[str]) -> tuple[str, bytes]:
-    """
-    Mint the nonce ON THE SERVER by running challenge_cmd and reading the
-    64-hex nonce it prints, typically
-
-        "ssh dbserver pg_sshkey_challenge /var/run/pg_sshkey"
-
-    The PAM module only ever looks in the server's own challenge_dir, so a
-    client on another host cannot use a locally created nonce.  A str is run
-    through the shell; a sequence is exec'd directly.
-
-    Returns (hex_id, raw_bytes).  Raises ChallengeError on any failure.
-    """
-    shown = challenge_cmd if isinstance(challenge_cmd, str) else shlex.join(challenge_cmd)
-    try:
-        r = subprocess.run(
-            challenge_cmd,
-            shell=isinstance(challenge_cmd, str),
-            capture_output=True, text=True, timeout=60,
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise ChallengeError(f"challenge_cmd could not run ({shown}): {e}") from e
-
-    if r.returncode != 0:
-        raise ChallengeError(
-            f"challenge_cmd failed (exit {r.returncode}): {shown}\n"
-            f"{r.stderr.strip()}"
-        )
-    hex_id = r.stdout.strip()
-    if not _HEX64.match(hex_id):
-        raise ChallengeError(
-            f"challenge_cmd did not print a 64-hex nonce: {shown}\n"
-            f"got: {hex_id[:80]!r}"
-        )
-    return hex_id, bytes.fromhex(hex_id)
 
 
 # ── Key loading ───────────────────────────────────────────────────────────────
@@ -675,31 +572,11 @@ def _sign_message(key: Ed25519PrivateKey | RSAPrivateKey, message: bytes) -> byt
     return key.sign(message, asym_padding.PKCS1v15(), hashes.SHA256())
 
 
-def _sign(key: Ed25519PrivateKey | RSAPrivateKey, challenge_bytes: bytes) -> bytes:
-    """
-    Sign the canonical message: SIGN_PREFIX || challenge_bytes.
-
-    Ed25519: signs the message directly (internal SHA-512 hash).
-    RSA:     RSASSA-PKCS1-v1_5 with SHA-256 (matches rsa-sha2-256 in the PAM module).
-    """
-    message = _SIGN_PREFIX + challenge_bytes
-
-    if isinstance(key, Ed25519PrivateKey):
-        return key.sign(message)
-    elif isinstance(key, RSAPrivateKey):
-        return key.sign(message, asym_padding.PKCS1v15(), hashes.SHA256())
-    else:
-        raise KeyError_(f"Cannot sign with key type: {type(key).__name__}")
-
-
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def get_token(
     key_path: str = _UNSET,
-    challenge_dir: str = DEFAULT_CHALLENGE_DIR,
     passphrase: bytes | None = DEFAULT_KEY_PASSPHRASE,
-    challenge_cmd: str | Sequence[str] | None = None,
-    version: int = DEFAULT_TOKEN_VERSION,
     cert_path: str | None = None,
     agent_pubkey: str | None = None,
 ) -> str:
@@ -710,45 +587,33 @@ def get_token(
     as the password= parameter to psycopg2.connect() or any other libpq
     client before the connection is opened.
 
-    The token is single-use (the nonce is consumed by the PAM module on the
-    first authentication attempt) and expires in 60 seconds.
+    The client picks the timestamp and the nonce, so nothing has to exist on
+    the server first and a token can be made on any host.  The token is
+    single-use (the server records the nonce on the first authentication
+    attempt) and expires 60 seconds after its timestamp.
 
     Args:
-        key_path:      Path to the SSH private key file.
-                       Supports OpenSSH format, PKCS#8 PEM, and traditional PEM.
-                       Defaults to ~/.ssh/id_ed25519.  With agent_pubkey set,
-                       a path is rejected (ValueError) and None means
-                       "not specified", so a wrapper may forward it.
-        challenge_dir: Directory where nonce files are stored.
-                       Must be writable and exist with mode 1733.
-        passphrase:    Passphrase for encrypted keys, as bytes.
-                       None for unencrypted keys.
+        key_path:       Path to the SSH private key file.
+                        Supports OpenSSH format, PKCS#8 PEM, and traditional PEM.
+                        Defaults to ~/.ssh/id_ed25519.  With agent_pubkey set,
+                        a path is rejected (ValueError) and None means
+                        "not specified", so a wrapper may forward it.
 
-    Returns:
-        A token string: "<64 hex chars>:<base64 signature>"
-
-        challenge_cmd:  Command that mints the nonce on the SERVER and prints
-                        it, e.g. "ssh dbserver pg_sshkey_challenge /var/run/pg_sshkey".
-                        Required when the server is another host; challenge_dir
-                        is then ignored and nothing is written locally.
-
-        version:        2 (default): client-issued challenge, no server-side
-                        step, works from any host.  1: legacy server nonce
-                        (challenge_dir / challenge_cmd).
+        passphrase:     Passphrase for encrypted keys, as bytes.
+                        None for unencrypted keys.
 
         cert_path:      OpenSSH certificate for the key (`*-cert.pub` from
                         `ssh-keygen -s`).  Produces a v3 token that the server
                         accepts without an authorized_keys entry when its
-                        trusted_ca_keys file lists the signing CA.  Cannot be
-                        combined with version=1 or challenge_cmd (ValueError).
+                        trusted_ca_keys file lists the signing CA.
 
         agent_pubkey:   Path to the PUBLIC key file (`.pub`) of an identity the
                         ssh-agent at $SSH_AUTH_SOCK holds.  The token is signed
                         through the agent and the private key is never read, so
                         passphrase-protected keys and forwarded agents work.
-                        Cannot be combined with key_path, passphrase,
-                        version=1, or challenge_cmd (ValueError).  Works with
-                        cert_path (v3).  Of the FIDO/security key types only
+                        Cannot be combined with key_path or passphrase
+                        (ValueError).  Works with cert_path (v3).  Of the
+                        FIDO/security key types only
                         `sk-ssh-ed25519@openssh.com` works, because the server
                         has no ECDSA verifier; its token carries 69 signature
                         bytes (64 raw, the flags byte, the 4-byte counter) and
@@ -757,10 +622,14 @@ def get_token(
                         before it becomes a token, except when the file holds
                         a certificate.
 
+    Returns:
+        A token string: "<unix_ts>:<64 hex chars>:<base64 signature>", with a
+        fourth ":<base64 certificate>" field when cert_path is given.
+
     Raises:
-        ChallengeError: if the challenge directory is missing or unwritable.
-        KeyError_:      if the key cannot be loaded, the ssh-agent cannot be
-                        reached or refuses, or signing fails.
+        KeyError_:      if the key or the certificate cannot be read, the
+                        ssh-agent cannot be reached or refuses, or signing
+                        fails.
     """
     if agent_pubkey is not None:
         if key_path is not _UNSET and key_path is not None:
@@ -773,69 +642,30 @@ def get_token(
                 "agent_pubkey signs through the ssh-agent, which holds the "
                 "unlocked key; a passphrase has nothing to unlock here"
             )
-        if version == 1 or challenge_cmd is not None:
-            raise ValueError(
-                "agent_pubkey signs v2 or v3 tokens only; it cannot be "
-                "combined with version=1 or challenge_cmd"
-            )
         key = None
     else:
         if key_path is _UNSET:
             key_path = DEFAULT_KEY_PATH
-        # 1. Load the private key first (fail fast before creating a nonce)
+        # Load the private key first, so a bad key fails before any signing
         key = _load_private_key(key_path, passphrase)
 
-    if cert_path is not None:
-        if challenge_cmd is not None or version not in (2, 3):
-            raise ValueError(
-                "cert_path produces a v3 token; it cannot be combined with "
-                "version=1 or challenge_cmd"
-            )
-        version = 3
-    elif challenge_cmd is not None:
-        version = 1                      # a server-minted nonce is v1 by definition
-    elif version not in (1, 2):
-        raise ValueError(f"unsupported token version {version!r} (1 or 2; 3 needs cert_path)")
-
-    if version == 3:
-        # v3: like v2, plus the certificate; signed with the certified key.
-        cert_b64 = _load_cert_b64(cert_path)
-        head = f"{int(time.time())}:{secrets.token_bytes(32).hex()}"
-        message = _SIGN_PREFIX_V3 + head.encode("ascii")
-        if agent_pubkey is not None:
-            sig = _agent_sign(agent_pubkey, message)
-        else:
-            sig = _sign_message(key, message)
-        return f"{head}:{base64.b64encode(sig).decode('ascii')}:{cert_b64}"
-
-    if version == 2:
-        # v2: issue our own challenge.  Nothing touches the filesystem.
-        head = f"{int(time.time())}:{secrets.token_bytes(32).hex()}"
-        message = _SIGN_PREFIX_V2 + head.encode("ascii")
-        if agent_pubkey is not None:
-            sig = _agent_sign(agent_pubkey, message)
-        else:
-            sig = _sign_message(key, message)
-        return f"{head}:{base64.b64encode(sig).decode('ascii')}"
-
-    # v1: the nonce must exist in the SERVER's challenge_dir
-    if challenge_cmd is not None:
-        hex_id, raw_bytes = _remote_challenge(challenge_cmd)
+    prefix = _SIGN_PREFIX_V2 if cert_path is None else _SIGN_PREFIX_V3
+    head = f"{int(time.time())}:{secrets.token_bytes(32).hex()}"
+    message = prefix + head.encode("ascii")
+    if agent_pubkey is not None:
+        sig = _agent_sign(agent_pubkey, message)
     else:
-        hex_id, raw_bytes = _create_challenge(challenge_dir)
-
-    # Sign: message = "pg-sshkey-v1\0" || challenge_bytes
-    sig = _sign(key, raw_bytes)
-    sig_b64 = base64.b64encode(sig).decode("ascii")
-    return f"{hex_id}:{sig_b64}"
+        sig = _sign_message(key, message)
+    token = f"{head}:{base64.b64encode(sig).decode('ascii')}"
+    if cert_path is None:
+        return token
+    # v3: the same message under its own prefix, plus the certificate.
+    return f"{token}:{_load_cert_b64(cert_path)}"
 
 
 def connect(
     key_path: str = _UNSET,
-    challenge_dir: str = DEFAULT_CHALLENGE_DIR,
     passphrase: bytes | None = DEFAULT_KEY_PASSPHRASE,
-    challenge_cmd: str | Sequence[str] | None = None,
-    version: int = DEFAULT_TOKEN_VERSION,
     cert_path: str | None = None,
     agent_pubkey: str | None = None,
     **psycopg2_kwargs: Any,
@@ -849,9 +679,7 @@ def connect(
 
     Args:
         key_path:         SSH private key path.
-        challenge_dir:    Challenge nonce directory.
         passphrase:       Key passphrase (bytes) or None.
-        challenge_cmd:    See get_token(); required when host= is another machine.
         cert_path:        OpenSSH certificate for the key; see get_token().
         agent_pubkey:     Public key of an ssh-agent identity; see get_token().
         **psycopg2_kwargs: Passed directly to psycopg2.connect().
@@ -883,10 +711,7 @@ def connect(
 
     token = get_token(
         key_path=key_path,
-        challenge_dir=challenge_dir,
         passphrase=passphrase,
-        challenge_cmd=challenge_cmd,
-        version=version,
         cert_path=cert_path,
         agent_pubkey=agent_pubkey,
     )
@@ -896,11 +721,8 @@ def connect(
 
 def connect_replication(
     key_path: str = _UNSET,
-    challenge_dir: str = DEFAULT_CHALLENGE_DIR,
     passphrase: bytes | None = DEFAULT_KEY_PASSPHRASE,
     replication: str | bool = "database",
-    challenge_cmd: str | Sequence[str] | None = None,
-    version: int = DEFAULT_TOKEN_VERSION,
     cert_path: str | None = None,
     agent_pubkey: str | None = None,
     **psycopg2_kwargs: Any,
@@ -929,14 +751,11 @@ def connect_replication(
 
     Args:
         key_path:            SSH private key path.
-        challenge_dir:       Challenge nonce directory.
         passphrase:          Key passphrase (bytes) or None.
         replication:         "database" for logical (default); True or any
                              libpq truthy spelling ("true", "on", "yes", "1")
-                             for physical.
-        challenge_cmd:       See get_token().  A subscriber on another host
-                             MUST pass this, e.g.
-                             "ssh publisher pg_sshkey_challenge /var/run/pg_sshkey".
+                             for physical.  A subscriber signs its own token,
+                             so no step on the publisher is needed first.
         cert_path:           OpenSSH certificate for the key; see get_token().
         agent_pubkey:        Public key of an ssh-agent identity; see get_token().
         **psycopg2_kwargs:   Passed to psycopg2.connect() (user, host, dbname, etc.).
@@ -985,10 +804,7 @@ def connect_replication(
 
     token = get_token(
         key_path=key_path,
-        challenge_dir=challenge_dir,
         passphrase=passphrase,
-        challenge_cmd=challenge_cmd,
-        version=version,
         cert_path=cert_path,
         agent_pubkey=agent_pubkey,
     )

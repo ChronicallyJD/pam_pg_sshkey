@@ -5,7 +5,34 @@ Notable changes to pam_pg_sshkey are recorded here. The format follows
 [Semantic Versioning](https://semver.org/). Each entry names the test that
 covers it; see [docs/testing.md](docs/testing.md).
 
-## [Unreleased]
+## [2.0.0] - 2026-08-24
+
+### Removed
+
+- v1 tokens. The module accepts only `<unix_ts>:<nonce_hex>:<signature>` and
+  the certificate form that appends `:<certificate>`; a token of the old
+  shape `<nonce_hex>:<signature>` is refused as malformed. `pg_sshkey_challenge`
+  is gone, and with it `--v1`, `--challenge-dir`, `--challenge-cmd` and
+  `--challenge-bin` on `pg_sshkey_connect` and `pg_sshkey_query`, and the
+  `version`, `challenge_dir` and `challenge_cmd` parameters of `get_token`,
+  `connect` and `connect_replication`, which now raise `TypeError`.
+  `pg_sshkey_sign` takes one private key and no challenge; a second
+  positional argument is a usage error.
+
+  A client that has not been updated stops working, which is why this is a
+  major version. Nothing on the server needs reconfiguring: the same
+  `authorized_keys` files, certificates and options keep working.
+
+  `/var/run/pg_sshkey` is now installed `0700 postgres:postgres` instead of
+  `1733`. It held nonce files that clients created; it now holds only the
+  records the module writes, so nothing but the module needs to write there.
+  An existing installation can be tightened with
+  `chmod 0700 /var/run/pg_sshkey` and the same change to
+  `/usr/lib/tmpfiles.d/pg_sshkey.conf`.
+  Tests: `test_pam_module` (`test_v1_token_is_refused`), `test_system`
+  (`TestV1IsGone` in `test_pg_sshkey_query`), `test_python_module`
+  (`TestV1ParametersRemoved`); e2e `private_nonce_dir` and the `--v1`
+  refusal in `cert_alice_key_without_cert_still_works`.
 
 ### Added
 

@@ -7,7 +7,9 @@
 #                               Files must be at <dir>/<username>/authorized_keys
 #                               Default: /etc/pg_sshkeys
 #
-#   challenge_dir=<dir>         Where challenge nonces are stored.
+#   challenge_dir=<dir>         Where the nonce of each accepted token is
+#                               recorded, so it cannot be used twice.  Only
+#                               this module writes there; 0700 postgres.
 #                               Default: /var/run/pg_sshkey
 #
 #   trusted_ca_keys=<file>      OpenSSH CA public keys, one per line

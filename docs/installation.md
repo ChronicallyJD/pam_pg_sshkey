@@ -43,10 +43,10 @@ sudo dnf install gcc make openssl-devel pam-devel pkgconf-pkg-config
 make
 ```
 
-This produces `pam_pg_sshkey.so`, the tools `pg_sshkey_sign` and
-`pg_sshkey_challenge`, and copies of the scripts `pg_sshkey_connect`,
-`pg_sshkey_addkey`, and `pg_sshkey_query` in the repository root. Build
-outputs are not tracked by git.
+This produces `pam_pg_sshkey.so`, the signing tool `pg_sshkey_sign`, and
+copies of the scripts `pg_sshkey_connect`, `pg_sshkey_addkey`, and
+`pg_sshkey_query` in the repository root. Build outputs are not tracked by
+git.
 
 Run `make test` before installing; it needs neither root nor PostgreSQL.
 See [Testing](testing.md).
@@ -64,7 +64,6 @@ sudo make install-conf
 | --- | --- |
 | `pam_pg_sshkey.so` | `/lib/<triplet>/security/` on Debian and Ubuntu, `/lib64/security/` on RHEL and Fedora |
 | `pg_sshkey_sign`, `pg_sshkey_connect`, `pg_sshkey_addkey`, `pg_sshkey_query` | `/usr/local/bin/` |
-| `pg_sshkey_challenge` (v1 legacy) | `/usr/local/bin/` |
 | tmpfiles.d rule | `/usr/lib/tmpfiles.d/pg_sshkey.conf` |
 
 and creates these directories:
@@ -72,7 +71,7 @@ and creates these directories:
 | Directory | Owner | Mode | Purpose |
 | --- | --- | --- | --- |
 | `/etc/pg_sshkeys` | `root:postgres` | `0750` | Root of the per-user `authorized_keys` tree |
-| `/var/run/pg_sshkey` | `postgres:postgres` | `1733` | Nonce records. `0700` is enough once only v2 clients remain; see [Security](security.md#the-nonce-directory) |
+| `/var/run/pg_sshkey` | `postgres:postgres` | `0700` | Record of the nonces already used. Only the module writes here; see [Security](security.md#file-permissions) |
 
 `make install-conf` installs `/etc/pam.d/postgresql`, backing up an existing
 file to `postgresql.bak`. Then configure PostgreSQL: [Configuration](configuration.md).
@@ -86,7 +85,7 @@ The install paths can be overridden: `PAM_LIB_DIR`, `BIN_DIR`,
 directory at boot:
 
 ```text
-d /var/run/pg_sshkey 1733 postgres postgres -
+d /var/run/pg_sshkey 0700 postgres postgres -
 ```
 
 To recreate it by hand:
@@ -104,4 +103,5 @@ sudo systemctl reload postgresql
 ```
 
 `make uninstall` removes the module and the tools. It leaves
-`/etc/pg_sshkeys` and `/var/run/pg_sshkey` in place.
+`/etc/pg_sshkeys`, `/var/run/pg_sshkey`, and
+`/usr/lib/tmpfiles.d/pg_sshkey.conf` in place.

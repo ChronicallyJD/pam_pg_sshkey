@@ -91,8 +91,9 @@ for opt in authorized_keys_dir challenge_dir trusted_ca_keys revoked_keys; do
         || { echo "provision: $opt missing from $PAMCONF" >&2; exit 1; }
 done
 
-install -d -m 1733 -o postgres -g postgres "$CHAL_DIR"
-chown postgres:postgres "$CHAL_DIR"; chmod 1733 "$CHAL_DIR"
+# Only the module writes here now, so the directory is private.
+install -d -m 0700 -o postgres -g postgres "$CHAL_DIR"
+chown postgres:postgres "$CHAL_DIR"; chmod 0700 "$CHAL_DIR"
 
 # ── pg_hba.conf ──────────────────────────────────────────────────────────────
 hba_block() {

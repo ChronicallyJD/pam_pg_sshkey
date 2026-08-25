@@ -9,7 +9,7 @@
 
 <a href="docs/installation.md"><img src="badges/postgresql.svg" alt="PostgreSQL 16 and 18 tested"></a>
 <a href="LICENSE"><img src="badges/license.svg" alt="License: MIT"></a>
-<a href="CHANGELOG.md"><img src="badges/version.svg" alt="Version 1.2.0"></a>
+<a href="CHANGELOG.md"><img src="badges/version.svg" alt="Version 2.0.0"></a>
 <a href="docs/security.md"><img src="badges/tokens.svg" alt="Tokens: single use, 60 seconds"></a>
 <a href="https://github.com/ChronicallyJD/pam_pg_sshkey/actions/workflows/test.yml"><img src="https://github.com/ChronicallyJD/pam_pg_sshkey/actions/workflows/test.yml/badge.svg" alt="CI status"></a>
 
@@ -25,7 +25,7 @@ the application, or in a connection string.
 
 It is written in C against libpam and OpenSSL, ships a Python module for
 applications and replication clients, and is licensed under the
-[MIT License](LICENSE). The current version is 1.2.0; see
+[MIT License](LICENSE). The current version is 2.0.0; see
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Why pam_pg_sshkey
@@ -129,7 +129,6 @@ src/
     sig_verify.[ch]         Ed25519 and RSA verification
     ssh_cert.[ch]           OpenSSH certificate parsing and CA verification
     pg_sshkey_sign.c        client: issue and sign a token
-    pg_sshkey_challenge.c   server: create a v1 nonce (legacy)
     pg_sshkey_connect       client: token, then psql
     pg_sshkey_addkey        administrator: deploy a public key
     pg_sshkey_query.py      client: run one query with psycopg2

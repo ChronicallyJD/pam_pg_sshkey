@@ -1,10 +1,10 @@
 # pam_pg_sshkey documentation
 
 pam_pg_sshkey is a PAM module that authenticates PostgreSQL users with SSH
-public keys. The server holds public keys; the client signs a one-time
-challenge with its private key and sends the signature as the PostgreSQL
-password. These pages cover installing the module, configuring PostgreSQL,
-connecting from the shell and from Python, and operating it securely.
+public keys. The server holds the public keys; the client signs a timestamped
+one-time token with its private key and sends it as the PostgreSQL password.
+These pages cover installing the module, configuring PostgreSQL, connecting
+from the shell and from Python, and operating it securely.
 
 ## Where to start
 
@@ -12,8 +12,7 @@ connecting from the shell and from Python, and operating it securely.
 | --- | --- |
 | Build and install the module on a server | [Installation](installation.md) |
 | Tell PostgreSQL and PAM to use it | [Configuration](configuration.md) |
-| Register a key and connect | [User guide](user-guide.md) |
-| Log in with a CA-signed certificate instead of a registered key | [User guide](user-guide.md#connecting-with-a-certificate) |
+| Register a key and connect, with a key file, an ssh-agent, a security key, or a CA-signed certificate | [User guide](user-guide.md) |
 | Authenticate from a Python application | [Python](python.md) |
 | Run a logical replication subscriber without a stored password | [Replication](replication.md) |
 | Look up a token format, a tool option, or a log message | [Reference](reference.md) |

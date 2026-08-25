@@ -10,7 +10,6 @@ see the [User guide](user-guide.md).
 | --- | --- | --- | --- |
 | 2 (default) | `<unix_ts>:<nonce_hex>:<base64_sig>` | `"pg-sshkey-v2\0" \|\| "<unix_ts>:<nonce_hex>"` (ASCII) | `\|now - ts\| <= 60`, signature valid, nonce not recorded before; the nonce is then recorded |
 | 3 (certificate) | `<unix_ts>:<nonce_hex>:<base64_sig>:<base64_cert>` | `"pg-sshkey-v3\0" \|\| "<unix_ts>:<nonce_hex>"` (ASCII) | As v2, with the signature verified against the key inside the certificate, after the certificate passes the checks in [Security](security.md#certificates) |
-| 1 (legacy) | `<nonce_hex>:<base64_sig>` | `"pg-sshkey-v1\0" \|\| nonce_bytes` | A nonce file created by `pg_sshkey_challenge` exists in `challenge_dir` and is under 60 seconds old; the file is then deleted |
 
 Each prefix is 13 bytes including the NUL. `nonce_hex` is 64 lowercase
 hexadecimal characters (32 random bytes). A security key's signature field
@@ -30,7 +29,6 @@ apart by the number of colons (one, two, or three). A token of 8192 bytes
 pg_sshkey_sign [--at <unix_ts>] [--nonce <hex64>] <private_key>                    v2
 pg_sshkey_sign --cert <cert.pub> [--at <unix_ts>] [--nonce <hex64>] <private_key>  v3
 pg_sshkey_sign --agent <pubkey.pub> [--cert <cert.pub>] [--at <ts>] [--nonce <hex>]  v2 or v3
-pg_sshkey_sign <nonce_hex> <private_key>                                            v1
 ```
 
 Prints the token to standard output. `--at` and `--nonce` override the
@@ -53,8 +51,8 @@ client asks the agent for `rsa-sha2-256`, because the module verifies RSA
 with SHA-256; an agent that answers with `ssh-rsa` is refused. An
 `sk-ssh-ed25519@openssh.com` identity works and the token then carries the
 authenticator's flags and counter; `sk-ecdsa-sha2-nistp256@openssh.com` is
-refused, because the module has no ECDSA verifier. `--agent` is not available
-with a v1 challenge.
+refused, because the module has no ECDSA verifier. `--agent` takes no private key
+argument, and a second positional argument is a usage error.
 
 ## pg_sshkey_connect
 
@@ -73,10 +71,6 @@ pg_sshkey_connect [options] [dbname] [-- psql arguments]
 | `--cert FILE` | none | OpenSSH user certificate for the key; produces a v3 token. `<identity>-cert.pub` is not picked up automatically |
 | `-v`, `--verbose` | off | Print each step to standard error |
 | `--sign-bin PATH` | from `PATH` | Location of `pg_sshkey_sign` |
-| `--v1` | off | Produce a v1 token |
-| `-c`, `--challenge-dir DIR` | `/var/run/pg_sshkey` | v1: where to create the nonce on a local server |
-| `--challenge-cmd CMD` | none | v1: shell command that creates the nonce on the server and prints it; implies `--v1` |
-| `--challenge-bin PATH` | from `PATH` | v1: location of `pg_sshkey_challenge` |
 
 Everything after `--` is passed to `psql`.
 
@@ -86,7 +80,7 @@ Everything after `--` is passed to `psql`.
 pg_sshkey_query [options] [dbname]
 ```
 
-Takes `-U`, `-h`, `-p`, `-d`, `-i`, `-v`, `--agent`, `--cert`, `--v1`, and `-c` with the
+Takes `-U`, `-h`, `-p`, `-d`, `-i`, `-v`, `--agent`, and `--cert` with the
 meanings above, plus `-q`, `--query SQL` (default `SELECT 1`). Prints the result rows,
 or one `error:` line and exit status 1. Helper tools are found on `PATH` or
 beside the script.
@@ -103,14 +97,6 @@ Runs as root. `-d`, `--keys-dir` changes the root directory from
 `/etc/pg_sshkeys`; `-a`, `--append` adds to an existing file instead of
 replacing it. Unsupported key types in the input are skipped with a warning.
 
-## pg_sshkey_challenge (v1 only)
-
-```text
-pg_sshkey_challenge <challenge_dir>
-```
-
-Creates a 32-byte nonce file `<challenge_dir>/<hex>` (mode 0644) and prints
-the hex. Not used by v2 tokens.
 
 ## Module options
 
@@ -135,7 +121,7 @@ hosts read them with `journalctl -t postgres` or
 | --- | --- | --- |
 | info | `user 'U' authenticated with key K` | Success. `K` is the key comment, or its type |
 | info | `user 'U' authenticated with certificate 'KEYID' serial N` | Success with a v3 token. `KEYID` is the `-I` value given to `ssh-keygen` |
-| warning | `authentication failed for 'U'` | No registered key (v1, v2) or the certified key (v3) verifies the signature |
+| warning | `authentication failed for 'U'` | No registered key, or the certified key of a v3 token, verifies the signature |
 | warning | `key for 'U' is revoked` | The key that verified is listed in `revoked_keys` |
 | warning | `certificate for 'U' rejected: key is revoked` | The certified key is listed in `revoked_keys` |
 | warning | `certificate for 'U' rejected: signing CA is revoked` | The CA that signed it is listed in `revoked_keys` |
@@ -163,16 +149,14 @@ hosts read them with `journalctl -t postgres` or
 | warning | `certificate for 'U' rejected: not signed by a trusted CA` | The signing key is not in `trusted_ca_keys` |
 | warning | `certificate for 'U' rejected: unsupported signature algorithm ALGO` | The CA signed with `ssh-rsa` (SHA-1) or another algorithm the module does not verify |
 | warning | `certificate for 'U' rejected: invalid CA signature` | The certificate body does not verify with the CA key |
-| warning | `challenge not found or expired for 'U'` | v1 nonce file missing, used, or older than 60 seconds |
 | warning | `no authorized_keys for 'U'` | `<authorized_keys_dir>/U/authorized_keys` does not exist |
 | warning | `no valid keys in 'PATH'` | The file has no `ssh-ed25519`, `ssh-rsa`, or `sk-ssh-ed25519@openssh.com` entries |
 | error | `failed to get auth token for 'U' (client sent no password)` | The client connected without a precomputed token |
-| error | `malformed token for 'U'` | The password is not a v1, v2, or v3 token |
+| error | `malformed token for 'U'` | The password is not a v2 or v3 token, or is 8192 bytes or longer |
 | error | `base64 decode failed for 'U'` | The signature part is not base64 |
 | error | `cannot read authorized_keys for 'U' (permission denied, ...)` | The file is not readable by `postgres`; the next line gives the `chown` and `chmod` to run |
 | error | `authorized_keys for 'U' is world/group writable, refusing` | Mode allows writes by group or others |
 | error | `could not record nonce in DIR: ..., refusing` | v2 and v3: the nonce directory is missing or not writable by `postgres` |
-| error | `could not delete challenge H in DIR: ..., refusing` | v1: the nonce file could not be removed, so the login is refused rather than risk a replay |
 | debug | `swept N stale challenge(s) from DIR` | Housekeeping, with `debug` on |
 
 PostgreSQL itself logs `PAM authentication failed for user "U"` for any

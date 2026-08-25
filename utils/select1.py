@@ -3,6 +3,11 @@
 Connect to PostgreSQL as the current OS user using pam_pg_sshkey SSH-key
 authentication and execute SELECT 1.
 
+The token is "<unix_ts>:<nonce_hex>:<base64_signature>": the client picks the
+timestamp and the nonce and signs them, so nothing has to exist on the server
+first and this runs from any host.  The server accepts a timestamp within 60
+seconds of its own clock and records each nonce on first use.
+
 Requirements:
     pip install psycopg2-binary cryptography
 
@@ -20,19 +25,22 @@ from cryptography.hazmat.primitives.serialization import (
     load_ssh_private_key,
     load_pem_private_key,
 )
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives import hashes
 
 import psycopg2
 
-# Must match the PAM module exactly (v2: client-issued challenge)
+# Domain-separation prefix, must match the PAM module exactly
 SIGN_PREFIX_V2 = b"pg-sshkey-v2\x00"
+
+KEY_PATH = os.path.expanduser("~/.ssh/id_ed25519")
 
 
 def make_challenge() -> str:
-    """v2: the client issues its own challenge, "<unix_ts>:<nonce_hex>".
-    Nothing is written anywhere; the server bounds the timestamp (±60 s)
-    and records the nonce on first use, so this works from any host."""
+    """The client issues its own challenge, "<unix_ts>:<nonce_hex>".
+    Nothing is written anywhere; the server bounds the timestamp (60 s either
+    way) and records the nonce on first use, so this works from any host."""
     return f"{int(time.time())}:{secrets.token_bytes(32).hex()}"
 
 
@@ -54,7 +62,7 @@ def sign(key, head: str) -> bytes:
 
 
 def get_token(key_path: str = KEY_PATH) -> str:
-    """Return a v2 token "<ts>:<nonce_hex>:<base64_sig>" ready to use as the password."""
+    """Return a token "<ts>:<nonce_hex>:<base64_sig>" ready to use as the password."""
     key  = load_key(key_path)
     head = make_challenge()
     sig  = sign(key, head)

@@ -1,16 +1,13 @@
 /*
  * challenge_store.h
  *
- * Simple filesystem-backed challenge store.
+ * A record of the nonces that have been used.
  *
- * Each challenge is stored as a file:
- *   <challenge_dir>/<challenge_hex>
- *
- * File contents: <unix_timestamp_issued>\n<hex_challenge_bytes>\n
- *
- * Challenges expire after CHALLENGE_TTL_SECS seconds.
- * The challenge server (pg_sshkey_challenge) creates these files;
- * the PAM module reads and deletes them.
+ * A client issues its own nonce and timestamp; the module records the nonce
+ * as a file <challenge_dir>/<nonce_hex> once the token is accepted, so the
+ * same token cannot be used twice.  Records older than
+ * CHALLENGE_SWEEP_AGE_SECS are swept, because a token whose timestamp is
+ * that old can no longer pass the window check.
  */
 
 #ifndef CHALLENGE_STORE_H
@@ -33,32 +30,7 @@
 #define CHALLENGE_SWEEP_AGE_SECS (2 * CHALLENGE_TTL_SECS)
 
 /*
- * Load a challenge by its hex ID.
- *
- * @param dir          Directory containing challenge files.
- * @param challenge_hex Hex string naming the challenge file.
- * @param out_bytes    Output buffer for raw challenge bytes.
- * @param out_size     Size of output buffer.
- * @param out_len      Set to the number of bytes decoded.
- *
- * Returns 0 on success, -1 if not found / expired / corrupt.
- * Expired challenges are deleted automatically.
- */
-int challenge_load(const char    *dir,
-                   const char    *challenge_hex,
-                   unsigned char *out_bytes,
-                   size_t         out_size,
-                   size_t        *out_len);
-
-/*
- * Delete a challenge file (call immediately after successful load).
- * Returns 0 if the file was removed, -1 (errno set) otherwise.  A consumer
- * must treat failure as fatal, an unremovable nonce can be replayed.
- */
-int challenge_delete(const char *dir, const char *challenge_hex);
-
-/*
- * v2: record a client-issued nonce as used.
+ * Record a client-issued nonce as used.
  *
  * Atomically creates <dir>/<nonce_hex> (O_CREAT|O_EXCL, mode 0600).  Call
  * it only AFTER the signature verified, so garbage tokens create nothing.
@@ -86,14 +58,5 @@ int challenge_mark(const char *dir, const char *nonce_hex);
  */
 int challenge_sweep(const char *dir, int max_unlink);
 
-/*
- * Generate and store a new challenge.
- *
- * @param dir           Directory to store challenge files (must exist).
- * @param out_hex       Output buffer for the hex challenge ID (≥65 bytes).
- *
- * Returns 0 on success, -1 on error.
- */
-int challenge_create(const char *dir, char *out_hex, size_t out_hex_size);
 
 #endif /* CHALLENGE_STORE_H */

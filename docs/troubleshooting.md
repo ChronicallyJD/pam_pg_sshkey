@@ -1,7 +1,9 @@
 # Troubleshooting
 
-This page maps symptoms to causes and fixes. The module's own messages are
-listed in [Reference](reference.md#log-messages); PostgreSQL logs
+This page maps symptoms to causes and fixes. It assumes the module is
+installed and PostgreSQL is set to use it ([Installation](installation.md),
+[Configuration](configuration.md)). The module's own messages are listed in
+[Reference](reference.md#log-messages); PostgreSQL logs
 `PAM authentication failed for user "U"` for every refusal, and the reason is
 in the system journal beside it.
 
@@ -22,6 +24,7 @@ of an attempt. Remove it afterwards.
 | --- | --- | --- |
 | `psql` asks for a password, or `fe_sendauth: no password supplied` | The client connected without a precomputed token | Use `pg_sshkey_connect`, `pg_sshkey_query`, or the Python module |
 | Journal: `failed to get auth token for 'U' (client sent no password)` | Same as above, seen from the server | Same |
+| Journal: `malformed token for 'U'` | The password is not a token: a plain password, a truncated one, or a retired v1 token of the form `<nonce_hex>:<sig>` | Mint a token with `pg_sshkey_sign`, `pg_sshkey_connect`, or the Python module |
 | Journal: `no authorized_keys for 'U'` | No key registered for that role name | `sudo pg_sshkey_addkey U key.pub` |
 | Journal: `cannot read authorized_keys for 'U' (permission denied, ...)` | File not readable by `postgres`, usually `U:U 0600` | Run the `chown` and `chmod` printed on the next journal line, or re-register with `pg_sshkey_addkey` |
 | Journal: `authorized_keys for 'U' is world/group writable, refusing` | Mode too loose | `chmod 640` |
@@ -46,9 +49,7 @@ of an attempt. Remove it afterwards.
 | Journal: `it is limited to source-address ... and the client address is not known` | A pinned certificate over the unix socket, where PostgreSQL reports no address | Connect over TCP, or issue a certificate without the option |
 | Journal: `cannot check source-address` | `pam_use_hostname=1` in `pg_hba.conf`, so `PAM_RHOST` is a name, or the list is malformed | Remove `pam_use_hostname` from the `pam` line, or fix the list |
 | Journal: `certificate for 'U' rejected: unsupported signature algorithm ssh-rsa` | The RSA CA signed with SHA-1 (`ssh-keygen -t ssh-rsa`) | Re-sign without `-t`; ssh-keygen defaults to `rsa-sha2-512` |
-| Journal: `challenge not found or expired for 'U'` | v1 token whose nonce file is missing, used, or old; typically a remote v1 client that created the nonce locally | Use v2 tokens, or create the v1 nonce on the server with `--challenge-cmd` |
-| Journal: `could not record nonce in DIR` | `/var/run/pg_sshkey` missing (after a reboot without the tmpfiles rule) or not writable by `postgres` | `sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/pg_sshkey.conf`, or `chown postgres:postgres` |
-| Journal: `could not delete challenge ... refusing` | v1 nonce directory not owned by `postgres` | `sudo chown postgres:postgres /var/run/pg_sshkey && sudo chmod 1733 /var/run/pg_sshkey` |
+| Journal: `could not record nonce in DIR` | `/var/run/pg_sshkey` missing (after a reboot without the tmpfiles rule) or not writable by `postgres` | `sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/pg_sshkey.conf`, or `sudo chown postgres:postgres /var/run/pg_sshkey && sudo chmod 0700 /var/run/pg_sshkey` |
 | PostgreSQL: `invalid authentication method "pamservice=postgresql"` | The `pg_hba.conf` line has five columns; `pam` is missing | Put `pam` in the method column and `pamservice=postgresql` in the options column |
 | PostgreSQL: `password authentication failed` with nothing in the journal | An earlier `pg_hba.conf` rule (`scram-sha-256`, `md5`) matched first | Move the `pam` rule above it; check with `SELECT * FROM pg_hba_file_rules` |
 | PostgreSQL: `no pg_hba.conf entry for replication connection` | No `replication` database rule for the subscriber | Add one; see [Replication](replication.md) |
@@ -63,6 +64,7 @@ of an attempt. Remove it afterwards.
 | `pg_sshkey_sign`: `The ssh-agent returned an empty signature` | The agent answered with no signature bytes | Check the agent; try `ssh-add -l` and re-add the key |
 | `pg_sshkey_sign`: `ssh-agent: timed out waiting for a reply` | The agent did not answer within 60 seconds | Confirm any `ssh-add -c` prompt, or raise `PG_SSHKEY_AGENT_TIMEOUT_MS` |
 | Either client: `--agent replaces -i/--identity` | Both were given | Pass only `--agent` |
+| `pg_sshkey_connect` or `pg_sshkey_sign`: `Unknown option: --v1` | The v1 token and its options were removed | Drop the option; the client sends a v2 token, or a v3 token with `--cert` |
 | Python: `KeyError_: ... Need bcrypt module` | Passphrase-protected OpenSSH key without `bcrypt` installed | `pip install bcrypt`, or export the key to unencrypted PEM |
 | Python: `ImportError: dynamic module does not define module export function` | `import pam_pg_sshkey` ran with the repository root as working directory, so `pam_pg_sshkey.so` was found first | Run from another directory, or install the Python file where the `.so` is not |
 

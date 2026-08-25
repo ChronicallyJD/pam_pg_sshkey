@@ -5,10 +5,10 @@ pg_sshkey_query.py
 Connect to a PostgreSQL database using SSH-key authentication
 (pam_pg_sshkey) and run a query.
 
-This script replicates the token-generation flow of pg_sshkey_connect
-(v2 by default: the token carries its own timestamp and nonce, nothing is
-created on the server first), then uses psycopg2 to open the connection
-with the signed token as the password.
+This script replicates the token-generation flow of pg_sshkey_connect: the
+token carries its own timestamp and nonce, so nothing is created on the
+server first. It then uses psycopg2 to open the connection with the signed
+token as the password.
 
 WHY THE TOKEN MUST BE PRE-COMPUTED
 ====================================
@@ -18,8 +18,8 @@ exact moment. If no password is available, libpq disconnects immediately
 with "fe_sendauth: no password supplied", before any user code runs.
 
 This means:
-  - The token (challenge hex + base64 signature) must be computed BEFORE
-    psycopg2.connect() is called.
+  - The token (timestamp, nonce and base64 signature) must be computed
+    BEFORE psycopg2.connect() is called.
   - The token is passed as the password= argument to psycopg2.connect(),
     where libpq holds it ready to send the instant AUTH_REQ_PASSWORD arrives.
 
@@ -34,15 +34,13 @@ Usage:
       --agent FILE        Sign through the ssh-agent holding the identity whose
                           public key is FILE; the private key is never read
       --cert FILE         OpenSSH user certificate for the key (v3 token)
-      --v1                Legacy token (server-issued nonce file)
-  -c, --challenge-dir DIR (--v1) Challenge nonce dir  (default: /var/run/pg_sshkey)
   -q, --query SQL         Query to run               (default: SELECT 1)
   -v, --verbose           Print each step to stderr
 
 Requirements:
   pip install psycopg2-binary
 
-  pg_sshkey_challenge and pg_sshkey_sign must be installed (make install).
+  pg_sshkey_sign must be installed (make install).
 
 SPDX-License-Identifier: MIT
 """
@@ -64,8 +62,8 @@ from pathlib import Path
 
 def _find_tool(name: str) -> str:
     """
-    Locate pg_sshkey_challenge / pg_sshkey_sign: on PATH first, otherwise
-    beside this script (the build directory layout), like pg_sshkey_connect.
+    Locate pg_sshkey_sign: on PATH first, otherwise beside this script (the
+    build directory layout), like pg_sshkey_connect.
     Raises RuntimeError with install guidance if neither works.
     """
     found = shutil.which(name)
@@ -83,62 +81,18 @@ def _find_tool(name: str) -> str:
 
 # ── Token generation ──────────────────────────────────────────────────────────
 
-def generate_challenge(challenge_dir: str, verbose: bool) -> str:
-    """
-    Run pg_sshkey_challenge to create a nonce.
-    Returns the 64-char hex challenge ID.
-    Raises RuntimeError on failure.
-    """
-    if verbose:
-        print(f"[pg_sshkey_query] generating challenge in {challenge_dir}", file=sys.stderr)
-
-    result = subprocess.run(
-        [_find_tool("pg_sshkey_challenge"), challenge_dir],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"pg_sshkey_challenge failed (exit {result.returncode}).\n"
-            f"stderr: {result.stderr.strip()}\n\n"
-            f"Check that {challenge_dir} exists and is writable:\n"
-            f"  ls -la {challenge_dir}\n"
-            f"  sudo chmod 1733 {challenge_dir}\n"
-            f"  sudo chown postgres:postgres {challenge_dir}"
-        )
-
-    challenge = result.stdout.strip()
-
-    # Validate: must be exactly 64 lowercase hex characters
-    if len(challenge) != 64 or not all(c in "0123456789abcdef" for c in challenge):
-        raise RuntimeError(
-            f"pg_sshkey_challenge produced invalid output: {challenge!r}\n"
-            f"Expected 64 lowercase hex characters."
-        )
-
-    if verbose:
-        print(f"[pg_sshkey_query] challenge: {challenge}", file=sys.stderr)
-
-    return challenge
-
-
-def sign_challenge(challenge: str | None, key_path: str, verbose: bool,
-                   cert_path: str | None = None,
-                   agent_pubkey: str | None = None) -> str:
+def sign_token(key_path: str, verbose: bool,
+               cert_path: str | None = None,
+               agent_pubkey: str | None = None) -> str:
     """
     Run pg_sshkey_sign to produce a signed token.
 
-    challenge=None (v2, default): pg_sshkey_sign issues its own timestamp and
-    nonce, "<ts>:<nonce_hex>:<sig>"; nothing exists on the server first.
-    challenge="<hex>" (v1): sign a server-issued nonce, "<hex>:<sig>".
+    By default (v2) pg_sshkey_sign issues its own timestamp and nonce,
+    "<ts>:<nonce_hex>:<sig>"; nothing exists on the server first.
     cert_path (v3): pass "--cert FILE" so the token also carries the OpenSSH
-    user certificate, "<ts>:<nonce_hex>:<sig>:<cert>". Not valid with v1.
+    user certificate, "<ts>:<nonce_hex>:<sig>:<cert>".
     Raises RuntimeError on failure.
     """
-    if cert_path and challenge:
-        raise RuntimeError("--cert cannot be combined with --v1")
-    if agent_pubkey and challenge:
-        raise RuntimeError("--agent cannot be combined with --v1")
     if verbose:
         where = f"the ssh-agent identity {agent_pubkey}" if agent_pubkey else key_path
         print(f"[pg_sshkey_query] signing with {where}", file=sys.stderr)
@@ -165,7 +119,6 @@ def sign_challenge(challenge: str | None, key_path: str, verbose: bool,
         if not Path(cert_path).exists():
             raise RuntimeError(f"Certificate not found: {cert_path}")
         argv += ["--cert", cert_path]
-    argv += ([challenge] if challenge else [])
     if not agent_pubkey:
         argv += [key_path]
     result = subprocess.run(
@@ -193,17 +146,13 @@ def sign_challenge(challenge: str | None, key_path: str, verbose: bool,
     token = result.stdout.strip()
 
     # Validate token shape: v3 "<ts>:<64hex>:<b64>:<b64>", v2 "<ts>:<64hex>:<b64>"
-    # or v1 "<64hex>:<b64>"
     b64 = r"[A-Za-z0-9+/]{4,}=*"
     if cert_path:
         shape = rf"^[0-9]+:[0-9a-f]{{64}}:{b64}:{b64}$"
         expected = "<unix_ts>:<64 hex chars>:<base64 signature>:<base64 certificate>"
-    elif challenge is None:
+    else:
         shape = rf"^[0-9]+:[0-9a-f]{{64}}:{b64}$"
         expected = "<unix_ts>:<64 hex chars>:<base64 signature>"
-    else:
-        shape = rf"^[0-9a-f]{{64}}:{b64}$"
-        expected = "<64 hex chars>:<base64 signature>"
     if not re.match(shape, token):
         raise RuntimeError(
             f"pg_sshkey_sign produced invalid token: {token!r}\n"
@@ -277,10 +226,10 @@ def connect_and_query(
         elif "PAM authentication failed" in msg:
             hint = (
                 "\nThe PAM module rejected the token. Possible causes:\n"
-                "  1. The challenge expired (> 60 seconds between steps)\n"
+                "  1. The token timestamp is outside the server's 60 second window\n"
                 "  2. The authorized_keys file is missing or unreadable:\n"
                 f"       sudo pg_sshkey_addkey {username} ~/.ssh/id_ed25519.pub\n"
-                "  3. The wrong key was used to sign the challenge\n"
+                "  3. The wrong key was used to sign the token\n"
                 "  4. The authorized_keys file has wrong permissions:\n"
                 "       sudo chown root:postgres /etc/pg_sshkeys/"
                 f"{username}/authorized_keys\n"
@@ -416,17 +365,6 @@ examples:
              "token checked against the server's trusted_ca_keys",
     )
     parser.add_argument(
-        "--v1",
-        action="store_true",
-        help="Legacy token: create a nonce in the server's challenge dir first",
-    )
-    parser.add_argument(
-        "-c", "--challenge-dir",
-        default="/var/run/pg_sshkey",
-        metavar="DIR",
-        help="(--v1 only) Challenge nonce directory (default: /var/run/pg_sshkey)",
-    )
-    parser.add_argument(
         "-q", "--query",
         default="SELECT 1",
         metavar="SQL",
@@ -479,29 +417,21 @@ def main() -> int:
             print(f"[pg_sshkey_query] key:           {identity}", file=sys.stderr)
         if args.cert:
             print(f"[pg_sshkey_query] cert:          {args.cert}", file=sys.stderr)
-        print(f"[pg_sshkey_query] challenge dir: {args.challenge_dir}", file=sys.stderr)
         print(f"[pg_sshkey_query] query:         {args.query}", file=sys.stderr)
 
     try:
-        if args.cert and args.v1:
-            raise RuntimeError("--cert cannot be combined with --v1")
-        if args.agent and args.v1:
-            raise RuntimeError("--agent cannot be combined with --v1")
         if args.agent and args.identity:
             raise RuntimeError(
                 "--agent replaces -i/--identity; pass only one.\n"
                 "--agent takes the PUBLIC key of an identity the agent holds."
             )
 
-        # Step 1 (--v1 only): create the nonce in the SERVER's challenge dir.
-        # v2 tokens carry their own timestamp + nonce, so there is nothing to do.
-        challenge = generate_challenge(args.challenge_dir, args.verbose) if args.v1 else None
+        # Step 1: sign. pg_sshkey_sign issues the timestamp and nonce itself,
+        # so nothing has to exist on the server first.
+        token = sign_token(identity, args.verbose,
+                           cert_path=args.cert, agent_pubkey=args.agent)
 
-        # Step 2: sign (v2: pg_sshkey_sign issues the challenge itself)
-        token = sign_challenge(challenge, identity, args.verbose,
-                               cert_path=args.cert, agent_pubkey=args.agent)
-
-        # Step 3: connect and run the query
+        # Step 2: connect and run the query
         # The token is passed as password= BEFORE the connection opens.
         rows = connect_and_query(
             username=args.username,
@@ -513,7 +443,7 @@ def main() -> int:
             verbose=args.verbose,
         )
 
-        # Step 4: display results
+        # Step 3: display results
         print_results(rows, args.query)
 
     except RuntimeError as e:

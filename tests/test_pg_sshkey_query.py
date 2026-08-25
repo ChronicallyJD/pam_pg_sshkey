@@ -9,9 +9,10 @@ Tests:
   - missing helper binaries → one clear "error:" line, no traceback, exit 1
   - non-numeric PGPORT       → clear error, no traceback
   - PGDATABASE is honoured like psql / pg_sshkey_connect
-  - helpers are found beside the script when not on PATH
+  - pg_sshkey_sign is found beside the script when not on PATH
   - --cert FILE is forwarded to pg_sshkey_sign and the v3 token is accepted
   - pg_sshkey_connect --cert FILE does the same (stub psql captures PGPASSWORD)
+  - the retired v1 options are rejected by all three client tools
 
 Run:  python3 tests/test_pg_sshkey_query.py
 
@@ -28,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONNECT_SRC = ROOT / "src" / "pg_sshkey_connect"
 SCRIPT_SRC = ROOT / "src" / "pg_sshkey_query.py"      # no binaries beside it
 SCRIPT_BUILT = ROOT / "pg_sshkey_query"               # copied by `make`, beside the tools
+SIGN_BUILT = ROOT / "pg_sshkey_sign"                   # built by `make pg_sshkey_sign`
 NO_TOOLS_PATH = "/usr/bin:/bin"                        # helpers are never here
 
 
@@ -65,7 +67,7 @@ class TestErrorHandling(unittest.TestCase):
         self.assertIn("database:      explicit", r.stderr)
 
 
-@unittest.skipUnless((ROOT / "pg_sshkey_challenge").exists() and SCRIPT_BUILT.exists(),
+@unittest.skipUnless(SCRIPT_BUILT.exists() and SIGN_BUILT.exists(),
                      "run `make` first: built tools not found")
 class TestHelperLookup(unittest.TestCase):
 
@@ -74,41 +76,19 @@ class TestHelperLookup(unittest.TestCase):
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
         return key
 
-    def test_v1_helpers_found_beside_script_when_not_on_path(self):
+    def test_signer_is_found_beside_the_script_and_the_run_reaches_connect(self):
         with tempfile.TemporaryDirectory() as td:
-            chal = Path(td) / "chal"; chal.mkdir(mode=0o1733)
             key = self._key(td)
             # port 1 on localhost: connection is refused instantly, so the run
-            # proves challenge + sign happened and stops at connect.
-            r = run(SCRIPT_BUILT, "--v1", "-U", "alice", "-h", "127.0.0.1", "-p", "1",
-                    "-c", str(chal), "-i", str(key))
+            # proves the real pg_sshkey_sign beside the script produced a token
+            # and the run stopped at connect.
+            r = run(SCRIPT_BUILT, "-U", "alice", "-h", "127.0.0.1", "-p", "1",
+                    "-i", str(key), "-v")
             self.assertEqual(r.returncode, 1, r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+            self.assertNotIn("invalid token", r.stderr)
             self.assertIn("error: Connection failed", r.stderr)
-            nonces = [p for p in chal.iterdir() if len(p.name) == 64]
-            self.assertEqual(len(nonces), 1, "pg_sshkey_challenge beside the script was not used")
-
-    def test_v2_default_creates_no_nonce_and_reaches_connect(self):
-        with tempfile.TemporaryDirectory() as td:
-            chal = Path(td) / "chal"; chal.mkdir(mode=0o1733)
-            key = self._key(td)
-            r = run(SCRIPT_BUILT, "-U", "alice", "-h", "127.0.0.1", "-p", "1",
-                    "-c", str(chal), "-i", str(key), "-v")
-            self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertIn("error: Connection failed", r.stderr)
-            self.assertNotIn("generating challenge", r.stderr)
-            self.assertEqual(list(chal.iterdir()), [], "v2 must not create a server nonce")
-
-    def test_cert_with_v1_is_refused_before_minting_a_nonce(self):
-        with tempfile.TemporaryDirectory() as td:
-            chal = Path(td) / "chal"; chal.mkdir(mode=0o1733)
-            key = self._key(td)
-            cert = Path(td) / "id-cert.pub"; cert.write_text("c")
-            r = run(SCRIPT_BUILT, "-U", "alice", "--v1", "-c", str(chal),
-                    "-i", str(key), "--cert", str(cert), "-v")
-            self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertIn("--cert cannot be combined with --v1", r.stderr)
-            self.assertEqual(list(chal.iterdir()), [], "a refused request must not mint a nonce")
+            self.assertIn("[pg_sshkey_query] token: ", r.stderr)
 
 
 # A pg_sshkey_sign stand-in: records its argv, prints a v3-shaped token.
@@ -190,17 +170,6 @@ class TestCertOption(unittest.TestCase):
                              ["--agent", str(pub)])
             self.assertIn(f"key:           {pub} (ssh-agent)", r.stderr)
 
-    def test_query_agent_with_v1_is_refused_before_minting_a_nonce(self):
-        with tempfile.TemporaryDirectory() as td:
-            b = self._bin(td, v2=True)
-            chal = Path(td) / "chal"; chal.mkdir(mode=0o1733)
-            pub = Path(td) / "id_ed25519.pub"; pub.write_text("ssh-ed25519 AAAA c\n")
-            r = run(SCRIPT_SRC, "-U", "carol", "--v1", "-c", str(chal),
-                    "--agent", str(pub), "-v", path=f"{b}:{NO_TOOLS_PATH}")
-            self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertIn("--agent cannot be combined with --v1", r.stderr)
-            self.assertEqual(list(chal.iterdir()), [])
-
     def test_connect_forwards_agent_to_sign_without_a_key_path(self):
         with tempfile.TemporaryDirectory() as td:
             b = self._bin(td, v2=True)
@@ -278,6 +247,59 @@ class TestCertOption(unittest.TestCase):
             self.assertIn("Malformed token", r.stderr)
             self.assertEqual(argv.read_text().split("\n")[:-1], [str(key)])
             self.assertFalse(pw.exists())
+
+
+class TestV1IsGone(unittest.TestCase):
+    """v1 tokens are retired.  The server refuses a one-colon token, so no
+    client tool may still offer the option or the mode that produced it."""
+
+    @unittest.skipUnless(SIGN_BUILT.exists(), "run `make pg_sshkey_sign` first")
+    def test_sign_refuses_a_second_positional(self):
+        with tempfile.TemporaryDirectory() as td:
+            key = Path(td) / "id_ed25519"
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+                            "-f", str(key)], check=True)
+            r = subprocess.run([str(SIGN_BUILT), "ab" * 32, str(key)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertEqual(r.stdout, "",
+                             "a server-issued nonce must not be signed")
+            self.assertIn("Usage:", r.stderr)
+
+    @unittest.skipUnless(SIGN_BUILT.exists(), "run `make pg_sshkey_sign` first")
+    def test_sign_rejects_v1_as_an_unknown_option(self):
+        r = subprocess.run([str(SIGN_BUILT), "--v1"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("Unknown option: --v1", r.stderr)
+        help_text = subprocess.run([str(SIGN_BUILT), "--help"],
+                                   capture_output=True, text=True)
+        self.assertNotIn("v1", help_text.stderr + help_text.stdout)
+        self.assertNotIn("pg_sshkey_challenge", help_text.stderr + help_text.stdout)
+
+    def test_connect_rejects_v1_as_an_unknown_option(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = {"PATH": NO_TOOLS_PATH, "HOME": td, "USER": "carol"}
+            for opt in (["--v1"], ["-c", td], ["--challenge-dir", td],
+                        ["--challenge-cmd", "true"], ["--challenge-bin", "true"]):
+                with self.subTest(option=opt[0]):
+                    r = subprocess.run(["bash", str(CONNECT_SRC), *opt],
+                                       capture_output=True, text=True, env=env)
+                    self.assertEqual(r.returncode, 1, r.stderr)
+                    self.assertIn(f"Unknown option: {opt[0]}", r.stderr)
+            usage = subprocess.run(["bash", str(CONNECT_SRC), "--help"],
+                                   capture_output=True, text=True, env=env)
+            self.assertNotIn("v1", usage.stderr)
+            self.assertNotIn("challenge", usage.stderr)
+
+    def test_query_rejects_v1_as_an_unknown_option(self):
+        for opt in (["--v1"], ["-c", "/nonexistent"], ["--challenge-dir", "/nonexistent"]):
+            with self.subTest(option=opt[0]):
+                r = run(SCRIPT_SRC, "-U", "carol", *opt)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("unrecognized arguments", r.stderr)
+        usage = run(SCRIPT_SRC, "--help")
+        self.assertNotIn("v1", usage.stdout)
+        self.assertNotIn("challenge", usage.stdout)
 
 
 if __name__ == "__main__":

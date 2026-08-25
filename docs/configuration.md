@@ -42,6 +42,10 @@ Use `hostssl` rather than `host` on networks you do not control. The token
 travels as the password, and PostgreSQL sends it in clear text unless the
 connection is encrypted.
 
+Leave `pam_use_hostname` off. It replaces the client address the module sees
+with a reverse-DNS name the client's own DNS supplies, which defeats the
+`source-address` check on a certificate.
+
 ## The PAM service file
 
 `make install-conf` installs this file as `/etc/pam.d/postgresql`:
@@ -62,13 +66,18 @@ stack is `pam_permit.so` because a database role need not be an OS account.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `authorized_keys_dir=<dir>` | `/etc/pg_sshkeys` | Keys are read from `<dir>/<username>/authorized_keys` |
-| `challenge_dir=<dir>` | `/var/run/pg_sshkey` | Where used nonces are recorded (and where v1 nonce files are read) |
+| `challenge_dir=<dir>` | `/var/run/pg_sshkey` | Where the module records the nonce of every accepted token, so the token cannot be used twice |
 | `trusted_ca_keys=<file>` | unset | CA public keys that may certify user keys; unset refuses every certificate token |
 | `revoked_keys=<file>` | unset | Public keys that may not authenticate, whatever else admits them |
 | `debug` | off | Log each step at `LOG_DEBUG` to the `authpriv` facility |
 
-Turn `debug` on only while diagnosing a problem; it logs the challenge of
-every attempt.
+The module is the only writer in `challenge_dir`. The directory is
+`postgres:postgres` mode `0700`, and a login is refused when the nonce
+cannot be recorded there.
+
+Turn `debug` on only while diagnosing a problem. It logs the user being
+authenticated, the `authorized_keys` path, each key the module tries, and
+the client address a certificate is checked against.
 
 ### Revoked keys
 

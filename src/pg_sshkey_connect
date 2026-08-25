@@ -4,11 +4,8 @@
 # This script is the required entry point for pam_pg_sshkey authentication.
 # It produces a signed token and passes it to psql as PGPASSWORD.
 #
-# By default (v2) the token carries its own timestamp and nonce: nothing is
-# created on the server first, so it works identically for local and remote
-# servers.  --v1 selects the legacy flow where a nonce file must first be
-# created in the SERVER's challenge directory (pg_sshkey_challenge locally,
-# or --challenge-cmd over ssh).
+# The token carries its own timestamp and nonce: nothing is created on the
+# server first, so it works identically for local and remote servers.
 #
 # Usage:
 #   pg_sshkey_connect [OPTIONS] [DBNAME]
@@ -23,12 +20,6 @@
 #                           public key is FILE; the private key is never read
 #       --cert FILE         OpenSSH user certificate (*-cert.pub) for the key;
 #                           produces a v3 token, no authorized_keys needed
-#       --v1                Legacy token: needs a server-side nonce (see below)
-#   -c, --challenge-dir DIR (v1) Challenge directory (default: /var/run/pg_sshkey)
-#       --challenge-cmd CMD (v1) Shell command that mints the nonce ON THE SERVER
-#                           and prints it, e.g.
-#                             --challenge-cmd 'ssh db pg_sshkey_challenge /var/run/pg_sshkey'
-#       --challenge-bin BIN (v1) Path to pg_sshkey_challenge (default: from PATH)
 #       --sign-bin BIN      Path to pg_sshkey_sign (default: from PATH)
 #   -v, --verbose           Print diagnostic information to stderr
 #
@@ -53,10 +44,6 @@ SSH_KEY="${HOME}/.ssh/id_ed25519"
 CERT_FILE=""
 AGENT_PUBKEY=""
 IDENTITY_GIVEN=0
-CHALLENGE_DIR="/var/run/pg_sshkey"
-CHALLENGE_CMD=""
-TOKEN_V1=0
-CHAL_BIN="pg_sshkey_challenge"
 SIGN_BIN="pg_sshkey_sign"
 VERBOSE=0
 EXTRA_PSQL_ARGS=()
@@ -81,12 +68,6 @@ Options:
       --cert FILE         OpenSSH user certificate for the key (*-cert.pub).
                           Sends a v3 token; the server checks it against
                           trusted_ca_keys instead of authorized_keys.
-      --v1                Legacy token format (server-issued nonce). The options
-                          below apply to --v1 only:
-  -c, --challenge-dir DIR Challenge nonce directory  (default: /var/run/pg_sshkey)
-      --challenge-cmd CMD Command that creates the nonce ON THE SERVER and prints
-                          it, e.g. 'ssh db pg_sshkey_challenge /var/run/pg_sshkey'
-      --challenge-bin BIN Path to pg_sshkey_challenge
       --sign-bin BIN      Path to pg_sshkey_sign
   -v, --verbose           Print diagnostics to stderr
       --                  End of pg_sshkey_connect options; rest passed to psql
@@ -116,10 +97,6 @@ while [[ $# -gt 0 ]]; do
         -i|--identity)    SSH_KEY="$2"; IDENTITY_GIVEN=1; shift 2 ;;
         --cert)           CERT_FILE="$2";     shift 2 ;;
         --agent)          AGENT_PUBKEY="$2";  shift 2 ;;
-        -c|--challenge-dir) CHALLENGE_DIR="$2"; shift 2 ;;
-        --challenge-cmd)  CHALLENGE_CMD="$2";  shift 2 ;;
-        --v1)             TOKEN_V1=1;          shift ;;
-        --challenge-bin)  CHAL_BIN="$2";      shift 2 ;;
         --sign-bin)       SIGN_BIN="$2";      shift 2 ;;
         -v|--verbose)     VERBOSE=1;          shift ;;
         --help)           usage ;;
@@ -148,21 +125,6 @@ die() { echo "pg_sshkey_connect: error: $*" >&2; exit 1; }
 # ── preflight checks ──────────────────────────────────────────────────────────
 [[ -z "$PG_USER" ]] && die "No username specified. Use -U or set PGUSER."
 
-# --challenge-cmd implies the legacy flow
-[[ -n "$CHALLENGE_CMD" ]] && TOKEN_V1=1
-[[ -n "$CERT_FILE" && "$TOKEN_V1" -eq 1 ]] && die "--cert cannot be combined with --v1 or --challenge-cmd."
-
-# Locate binaries (pg_sshkey_challenge is only needed for a local v1 nonce)
-if [[ "$TOKEN_V1" -eq 1 && -z "$CHALLENGE_CMD" ]] && ! command -v "$CHAL_BIN" &>/dev/null; then
-    # Try same directory as this script
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [[ -x "$SCRIPT_DIR/pg_sshkey_challenge" ]]; then
-        CHAL_BIN="$SCRIPT_DIR/pg_sshkey_challenge"
-    else
-        die "pg_sshkey_challenge not found in PATH. Install it or use --challenge-bin."
-    fi
-fi
-
 if ! command -v "$SIGN_BIN" &>/dev/null; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [[ -x "$SCRIPT_DIR/pg_sshkey_sign" ]]; then
@@ -172,7 +134,6 @@ if ! command -v "$SIGN_BIN" &>/dev/null; then
     fi
 fi
 
-[[ -n "$AGENT_PUBKEY" && "$TOKEN_V1" -eq 1 ]] && die "--agent cannot be combined with --v1 or --challenge-cmd."
 [[ -n "$AGENT_PUBKEY" && "$IDENTITY_GIVEN" -eq 1 ]] && die "--agent replaces -i/--identity; pass only one.
 --agent takes the PUBLIC key of an identity the agent holds."
 if [[ -n "$AGENT_PUBKEY" ]]; then
@@ -195,41 +156,8 @@ if [[ -n "$AGENT_PUBKEY" ]]; then
 else
     log "key:           $SSH_KEY"
 fi
-if [[ "$TOKEN_V1" -eq 1 ]]; then
-    log "token:         v1 (server-issued nonce)"
-    if [[ -n "$CHALLENGE_CMD" ]]; then log "challenge cmd: $CHALLENGE_CMD"; else log "challenge dir: $CHALLENGE_DIR"; fi
-
-    # ── v1 step 1: generate challenge ──────────────────────────────────────
-    # The nonce must exist in the SERVER's challenge directory.  Locally that
-    # is pg_sshkey_challenge; for a remote server, --challenge-cmd runs it there.
-    log "generating challenge..."
-    if [[ -n "$CHALLENGE_CMD" ]]; then
-        CHALLENGE=$(sh -c "$CHALLENGE_CMD") || \
-            die "--challenge-cmd failed: $CHALLENGE_CMD"
-    else
-        CHALLENGE=$("$CHAL_BIN" "$CHALLENGE_DIR" 2>&1) || \
-            die "Failed to create challenge.
-Check that $CHALLENGE_DIR exists and is writable:
-  ls -la $CHALLENGE_DIR
-  sudo chmod 1733 $CHALLENGE_DIR
-  sudo chown postgres:postgres $CHALLENGE_DIR"
-    fi
-    CHALLENGE="${CHALLENGE%$'\n'}"
-    [[ -z "$CHALLENGE" ]] && die "pg_sshkey_challenge produced no output."
-    if ! [[ "$CHALLENGE" =~ ^[0-9a-f]{64}$ ]]; then
-        die "Malformed challenge: '$CHALLENGE' (expected 64 hex chars)"
-    fi
-    log "challenge:     $CHALLENGE"
-
-    # ── v1 step 2: sign the challenge ──────────────────────────────────────
-    log "signing challenge with $SSH_KEY..."
-    TOKEN=$("$SIGN_BIN" "$CHALLENGE" "$SSH_KEY" 2>&1) || \
-        die "Signing failed. Output was: $TOKEN"
-    TOKEN="${TOKEN%$'\n'}"
-    if ! [[ "$TOKEN" =~ ^[0-9a-f]{64}:[A-Za-z0-9+/]+=*$ ]]; then
-        die "Malformed token from pg_sshkey_sign: '$TOKEN'"
-    fi
-elif [[ -n "$CERT_FILE" ]]; then
+# ── step 1: sign a token this client issues for itself ───────────────────────
+if [[ -n "$CERT_FILE" ]]; then
     # ── v3: like v2, plus the certificate that vouches for the key ─────────
     log "token:         v3 (certificate)"
     log "cert:          $CERT_FILE"
@@ -265,7 +193,7 @@ else
 fi
 log "token:         ${TOKEN:0:72}..."
 
-# ── step 3: build psql arguments ─────────────────────────────────────────────
+# ── step 2: build psql arguments ─────────────────────────────────────────────
 PSQL_ARGS=(-U "$PG_USER" -d "$PG_DBNAME")
 [[ -n "$PG_HOST" ]] && PSQL_ARGS+=(-h "$PG_HOST")
 [[ -n "$PG_PORT" ]] && PSQL_ARGS+=(-p "$PG_PORT")
@@ -273,7 +201,7 @@ PSQL_ARGS+=("${EXTRA_PSQL_ARGS[@]}")
 
 log "running: PGPASSWORD=<token> psql ${PSQL_ARGS[*]}"
 
-# ── step 4: connect ───────────────────────────────────────────────────────────
+# ── step 3: connect ───────────────────────────────────────────────────────────
 # PGPASSWORD must be exported so psql inherits it; the token is single-use.
 export PGPASSWORD="$TOKEN"
 exec psql "${PSQL_ARGS[@]}"

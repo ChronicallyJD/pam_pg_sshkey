@@ -15,7 +15,7 @@ token format in [Reference](reference.md#token-formats).
   cannot be used later.
 - The module verifies the signature before it records the nonce. A flood of
   forged tokens creates no files.
-- If the module cannot record a nonce, or cannot remove a v1 nonce file, it
+- If the module cannot record a nonce, it
   refuses the login. It does not fall back to accepting.
 - Replay protection depends on the nonce directory. The module records nonces
   in `challenge_dir` and sweeps records older than 120 seconds on each
@@ -151,25 +151,21 @@ by hand is the most common cause of a login failure.
 
 ### The nonce directory
 
-With v2 tokens the module is the only writer, so the directory can be
-`0700 postgres:postgres`. The installed mode `1733` (sticky, world-writable,
-not world-readable) exists for the legacy v1 flow in which each client user
-creates its own nonce file and only the owner or `postgres` may remove it.
-Tighten the mode once no v1 clients remain:
+`/var/run/pg_sshkey` holds one file per nonce the module has accepted. Only
+the module writes there, so it is installed `0700 postgres:postgres`, and
+the tmpfiles.d rule in `/usr/lib/tmpfiles.d/pg_sshkey.conf` recreates it
+that way after a reboot. A record is removed once it is older than twice
+the token window, by which time its token can no longer be accepted.
 
-```sh
-sudo chmod 0700 /var/run/pg_sshkey
-```
-
-and change the tmpfiles.d rule in `/usr/lib/tmpfiles.d/pg_sshkey.conf` to
-`0700` so the setting survives a reboot.
+If the directory is missing or unwritable the module refuses every login
+rather than accepting a token it cannot record.
 
 ## Hardening checklist
 
 - `hostssl` rules in `pg_hba.conf`, and `sslmode=verify-full` on clients.
 - `authorized_keys` files `root:postgres 0640`, managed by `pg_sshkey_addkey`
   or by configuration management.
-- `/var/run/pg_sshkey` owned by `postgres`; `0700` when v1 is no longer used.
+- `/var/run/pg_sshkey` owned by `postgres`, mode `0700`.
 - `trusted_ca_keys` set only when certificates are in use; the CA private
   key kept off the database server; certificate windows of weeks, not years.
 - `debug` off in `/etc/pam.d/postgresql` outside of diagnosis.

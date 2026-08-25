@@ -18,21 +18,19 @@ from pam_pg_sshkey import get_token
 token = get_token(key_path="~/.ssh/id_ed25519")
 ```
 
-`get_token` loads the key, issues a timestamped nonce, signs it, and returns
-`<ts>:<nonce_hex>:<base64_signature>`. Nothing is written anywhere and no
-server is contacted, so the same call serves local and remote servers. Pass
-the result as `password=` to any libpq-based client; it must be present when
-the connection opens.
+`get_token` loads the key, picks a timestamp and a nonce, signs them, and
+returns `<ts>:<nonce_hex>:<base64_signature>`. Nothing is written anywhere
+and no server is contacted, so the same call serves local and remote servers.
+Pass the result as `password=` to any libpq-based client; it must be present
+when the connection opens. The token is single-use and the server refuses it
+more than 60 seconds after its timestamp.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `key_path` | `~/.ssh/id_ed25519` | OpenSSH, PKCS#8 PEM, or traditional PEM private key |
 | `passphrase` | `None` | Passphrase as `bytes` for an encrypted key |
-| `version` | `2` | `1` selects the legacy server-nonce token |
-| `challenge_dir` | `/var/run/pg_sshkey` | v1 only: where to create the nonce on a local server |
-| `challenge_cmd` | `None` | v1 only: command that creates the nonce on a remote server and prints it; implies `version=1` |
-| `agent_pubkey` | `None` | Path to the public key of an identity in the ssh-agent at `$SSH_AUTH_SOCK`; the private key is never read. `ValueError` with `key_path`, `passphrase`, `version=1`, or `challenge_cmd` |
-| `cert_path` | `None` | Path to an OpenSSH user certificate (`*-cert.pub`) for the key; produces a v3 token `<ts>:<nonce_hex>:<base64_signature>:<base64_cert>`. `ValueError` with `version=1` or `challenge_cmd` |
+| `agent_pubkey` | `None` | Path to the public key of an identity in the ssh-agent at `$SSH_AUTH_SOCK`; the private key is never read. `ValueError` when `key_path` or `passphrase` is also given |
+| `cert_path` | `None` | Path to an OpenSSH user certificate (`*-cert.pub`) for the key; produces a v3 token `<ts>:<nonce_hex>:<base64_signature>:<base64_cert>` |
 
 `agent_pubkey` replaces `key_path`: the agent signs, so the key may carry a
 passphrase, be an OpenSSH-format RSA key, or live on another machine behind a
@@ -65,10 +63,12 @@ cur = conn.cursor()
 cur.execute("SELECT current_user")
 ```
 
-`connect` accepts the `get_token` parameters, including `agent_pubkey` and `cert_path`, and
-forwards every other keyword argument to `psycopg2.connect`. Passing `password=` raises `ValueError`; the
-function sets it. Each call mints a new token, so call `connect` again rather
-than reusing a token after a disconnect.
+`connect` accepts the `get_token` parameters, including `agent_pubkey` and
+`cert_path`, and forwards every other keyword argument to
+`psycopg2.connect`. Passing `password=` raises `ValueError`; the function
+sets it. Without psycopg2 installed it raises `ImportError` naming the
+package to install. Each call mints a new token, so call `connect` again
+rather than reusing a token after a disconnect.
 
 ## Replication connections
 
@@ -91,8 +91,11 @@ All errors raised by the module derive from `PamPgSshKeyError`:
 
 | Exception | Raised when |
 | --- | --- |
+| `PamPgSshKeyError` | Base class; catch it to catch every error below |
 | `KeyError_` | The key file is missing, unreadable, encrypted without a passphrase, of an unsupported type, or needs `bcrypt`; or `cert_path` cannot be read or is not a `*-cert-v01@openssh.com` certificate; or an ssh-agent signature could not be obtained |
-| `ChallengeError` | A v1 nonce could not be created, or `challenge_cmd` failed or printed something other than a 64-character hex nonce |
+
+Combining `agent_pubkey` with `key_path` or `passphrase` raises `ValueError`,
+which is not a `PamPgSshKeyError`.
 
 Messages include the command to fix the problem. The module never lets a raw
 `cryptography` exception escape from key loading. Importing the module
@@ -101,9 +104,9 @@ succeeds when `HOME` is unset; pass `key_path` explicitly in that case.
 ## Signing by hand
 
 Any language with Ed25519 or RSA can produce a token. The signed message is
-the 13-byte prefix `pg-sshkey-v2` followed by a NUL byte, then the ASCII
-string `<unix_ts>:<nonce_hex>`. Ed25519 signs the message directly; RSA uses
+`pg-sshkey-v2` followed by a NUL byte, 13 bytes in all, then the ASCII string
+`<unix_ts>:<nonce_hex>`. Ed25519 signs the message directly; RSA uses
 PKCS#1 v1.5 with SHA-256. A certificate token uses the prefix `pg-sshkey-v3`
 followed by a NUL byte and appends `:<base64_cert>`, the second field of the
-`*-cert.pub` file. `utils/select1.py` is a 90-line example that does
+`*-cert.pub` file. `utils/select1.py` is an 86-line example that does
 this with `cryptography` and psycopg2 alone.

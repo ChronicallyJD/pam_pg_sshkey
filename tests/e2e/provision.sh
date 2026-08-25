@@ -225,6 +225,9 @@ sign carol id_ed25519_bob       trusted_ca   -I carol-as-bob    -n bob   -V -1m:
 # ignored --agent would sign with id_ed25519, which this certificate does
 # not certify, so the login would fail rather than pass by accident.
 SIGN_SRC=id_agent sign carol id_agent trusted_ca -I carol-agent -n carol -V -1m:+52w
+# pinned to the loopback address the e2e connects from, and to one it does not
+sign carol id_ed25519_here  trusted_ca -I carol-here  -n carol -V -1m:+52w -O source-address=127.0.0.1/32
+sign carol id_ed25519_there trusted_ca -I carol-there -n carol -V -1m:+52w -O source-address=10.0.0.0/8
 
 # ── sshd: lets alice mint a nonce "on the server" via ssh (remote-client flow) ──
 runuser -l alice -c 'grep -qf ~/.ssh/id_ed25519.pub ~/.ssh/authorized_keys 2>/dev/null || cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys'

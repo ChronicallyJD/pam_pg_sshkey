@@ -417,6 +417,35 @@ check_agent_absent_is_a_clean_error() {
     grep -q "SSH_AUTH_SOCK is not set" <<<"$out" || { echo "unclear error: $out"; return 1; }
 }
 
+# ── source-address ──────────────────────────────────────────────────────────
+# PostgreSQL reports the client address in PAM_RHOST, so these checks pass
+# only if the module reads the real thing: the harness cannot fake it here.
+check_cert_source_address_permitted() {
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_carol "pg_sshkey_connect --cert ~/.ssh/id_ed25519_here-cert.pub -h 127.0.0.1 -- -tAc 'select current_user'" 2>&1) \
+        || { echo "$out"; return 1; }
+    [[ "$out" == "carol" ]] || { echo "got: $out"; return 1; }
+    expect_journal "$cur" "pam_pg_sshkey: user 'carol' authenticated with certificate 'carol-here'"
+}
+check_cert_source_address_refused() {
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_carol "pg_sshkey_connect --cert ~/.ssh/id_ed25519_there-cert.pub -h 127.0.0.1 -- -tAc 'select 1'" 2>&1) \
+        && { echo "a certificate pinned to another network authenticated"; return 1; }
+    expect_journal "$cur" "client address 127.0.0.1 is not permitted by source-address 10.0.0.0/8"
+}
+check_cert_source_address_local_socket_refused() {
+    # On the unix socket PostgreSQL sets no PAM_RHOST at all, so the module
+    # cannot know where the client is and refuses the pinned certificate.
+    local cur; cur=$(journal_mark)
+    local out; out=$(as_carol "pg_sshkey_connect --cert ~/.ssh/id_ed25519_here-cert.pub -- -tAc 'select 1'" 2>&1) \
+        && { echo "a pinned certificate authenticated over the local socket"; return 1; }
+    expect_journal "$cur" "the client address is not known" || return 1
+    # an unpinned certificate over the same socket is unaffected
+    out=$(as_carol "pg_sshkey_connect --cert $CAROL_CERT -- -tAc 'select current_user'" 2>&1) \
+        || { echo "unpinned: $out"; return 1; }
+    [[ "$out" == "carol" ]] || { echo "unpinned got: $out"; return 1; }
+}
+
 # ── revocation ──────────────────────────────────────────────────────────────
 REVOKED=/etc/pg_sshkeys/revoked_keys
 clear_revocations() { : > "$REVOKED"; chown root:postgres "$REVOKED"; chmod 640 "$REVOKED"; }
@@ -547,6 +576,9 @@ run_check agent_rsa_key_connects
 run_check agent_certificate_connects
 run_check agent_query_and_python_connect
 run_check agent_absent_is_a_clean_error
+run_check cert_source_address_permitted
+run_check cert_source_address_refused
+run_check cert_source_address_local_socket_refused
 run_check revoked_key_rejected
 run_check revoked_certificate_rejected
 run_check unreadable_revocation_list_fails_closed

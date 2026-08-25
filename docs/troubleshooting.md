@@ -41,7 +41,10 @@ of an attempt. Remove it afterwards.
 | Journal: `certificate for 'U' rejected: principal 'U' not listed` | The certificate was signed with a different `-n` principal, or none | Re-sign with `-n U` |
 | Journal: `certificate for 'U' rejected: expired` or `not yet valid` | Server time outside the `-V` window | Re-sign; check clocks with `ssh-keygen -L -f cert.pub` against `date` on the server |
 | Journal: `certificate for 'U' rejected: not signed by a trusted CA` | A CA not listed in `trusted_ca_keys` | Add the CA public key to the file, or re-sign with the trusted CA |
-| Journal: `certificate for 'U' rejected: unsupported critical option NAME` | Signed with `-O source-address=` or `-O force-command=` | Re-sign without critical options |
+| Journal: `certificate for 'U' rejected: unsupported critical option NAME` | Signed with `-O force-command=` or another option the module does not enforce | Re-sign with no critical option other than `source-address` |
+| Journal: `client address A is not permitted by source-address L` | Connecting from outside the addresses the certificate names | Connect from a listed address, or re-sign with the right list |
+| Journal: `it is limited to source-address ... and the client address is not known` | A pinned certificate over the unix socket, where PostgreSQL reports no address | Connect over TCP, or issue a certificate without the option |
+| Journal: `cannot check source-address` | `pam_use_hostname=1` in `pg_hba.conf`, so `PAM_RHOST` is a name, or the list is malformed | Remove `pam_use_hostname` from the `pam` line, or fix the list |
 | Journal: `certificate for 'U' rejected: unsupported signature algorithm ssh-rsa` | The RSA CA signed with SHA-1 (`ssh-keygen -t ssh-rsa`) | Re-sign without `-t`; ssh-keygen defaults to `rsa-sha2-512` |
 | Journal: `challenge not found or expired for 'U'` | v1 token whose nonce file is missing, used, or old; typically a remote v1 client that created the nonce locally | Use v2 tokens, or create the v1 nonce on the server with `--challenge-cmd` |
 | Journal: `could not record nonce in DIR` | `/var/run/pg_sshkey` missing (after a reboot without the tmpfiles rule) or not writable by `postgres` | `sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/pg_sshkey.conf`, or `chown postgres:postgres` |

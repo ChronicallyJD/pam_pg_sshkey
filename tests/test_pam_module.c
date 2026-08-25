@@ -7,6 +7,7 @@
  *   pam_start_confdir(service, "pgsql@", &conv, confdir, &pamh)
  *   pam_set_item(PAM_USER, user)
  *   pam_set_item(PAM_CONV, &conv)
+ *   pam_set_item(PAM_RHOST, client address)
  *   pam_authenticate(pamh, 0)
  *   pam_acct_mgmt(pamh, 0)
  *   pam_end(pamh, rc)
@@ -474,6 +475,8 @@ fail:
  * Returns the pam_authenticate() result.  If acct_rc is non-NULL and
  * authentication succeeded, *acct_rc receives pam_acct_mgmt()'s result.
  */
+static const char *g_rhost = NULL;   /* what PostgreSQL would report */
+
 static int
 authenticate(const env_t *e, const char *user, const char *token, int *acct_rc)
 {
@@ -490,6 +493,14 @@ authenticate(const env_t *e, const char *user, const char *token, int *acct_rc)
     }
     pam_set_item(pamh, PAM_USER, user);
     pam_set_item(pamh, PAM_CONV, &conv);
+    /*
+     * PostgreSQL sets PAM_RHOST to port->remote_host: the client address,
+     * for a TCP connection, nothing at all on the unix socket, and the
+     * reverse-DNS name when pg_hba.conf carries pam_use_hostname=1.
+     * g_rhost is NULL unless a test sets it, which is the case of a
+     * PostgreSQL build that does not set the item at all.
+     */
+    if (g_rhost) pam_set_item(pamh, PAM_RHOST, g_rhost);
 
     rc = pam_authenticate(pamh, 0);
     if (rc == PAM_SUCCESS && acct_rc)
@@ -936,6 +947,23 @@ enable_certs(env_t *e, const char *ca1, const char *ca2)
     if (system(cmd) != 0) { fprintf(stderr, "enable_certs failed\n"); exit(2); }
     chmod(e->ca_file, 0640);
     write_services(e);
+}
+
+/*
+ * tests/cert_helper.py signs a certificate ssh-keygen would refuse to
+ * write, so the module can be held to lists a careless or compromised CA
+ * could produce.  Writes <root>/<name>-cert.pub.
+ */
+static int
+forge_cert(const env_t *e, const char *ca, const char *key, const char *name,
+           const char *args)
+{
+    char cmd[PATH_MAX * 4], out[4096];
+    snprintf(cmd, sizeof(cmd),
+             "python3 '%s/cert_helper.py' '%s/%s' '%s/%s.pub' '%s/%s-cert.pub' "
+             "--key-id alice-key --principal alice %s 2>&1",
+             g_test_dir, e->root, ca, e->root, key, e->root, name, args);
+    return run_capture(cmd, out, sizeof(out));
 }
 
 /* ── security keys ────────────────────────────────────────────────────── */
@@ -1493,6 +1521,151 @@ test_same_file_for_ca_and_revocation_refused(void)
 }
 
 static void
+test_certificate_source_address_is_enforced(void)
+{
+    /*
+     * A certificate can be pinned to the addresses it may be used from.
+     * PostgreSQL reports the client address in PAM_RHOST, so the module can
+     * hold the certificate to it instead of refusing the option outright.
+     */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519",
+        "-I alice-key -n alice -V -1m:+5m -O source-address=127.0.0.1/32"), 0);
+
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+
+    g_rhost = "127.0.0.1";
+    int rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    ASSERT_LOGGED("authenticated with certificate 'alice-key'");
+
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = "10.0.0.7";
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("certificate for 'alice' rejected: client address 10.0.0.7 "
+                  "is not permitted by source-address");
+    ASSERT_EQ(dir_entry_count(e.chal), 1);   /* only the first login's nonce */
+    g_rhost = NULL;
+    env_teardown(&e);
+}
+
+static void
+test_source_address_refuses_what_it_cannot_check(void)
+{
+    /*
+     * A restriction the module cannot evaluate must refuse, not pass: a
+     * host name (PostgreSQL with pam_use_hostname=1), a value that is not
+     * an address at all, and a PostgreSQL that sets no PAM_RHOST, which is
+     * what it does on the unix socket.
+     */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519",
+        "-I alice-key -n alice -V -1m:+5m -O source-address=127.0.0.1/32"), 0);
+
+    char tok[8192];
+    /* a name, which is what pam_use_hostname=1 reports */
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = "client.example.com";
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("cannot check source-address");
+
+    /* an empty item, which is a different branch from a name */
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = "";
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("the client address is not known");
+
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = NULL;                      /* no PAM_RHOST item at all */
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("the client address is not known");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+
+    /* a certificate without the option is unaffected by any of this */
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519", "-I alice-key -n alice -V -1m:+5m"), 0);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+    env_teardown(&e);
+}
+
+static void
+test_source_address_list_and_ipv6(void)
+{
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519",
+        "-I alice-key -n alice -V -1m:+5m "
+        "-O source-address=10.0.0.0/8,192.168.5.7,::1/128"), 0);
+
+    char tok[8192];
+    const char *allowed[]  = { "10.9.9.9", "192.168.5.7", "::1", NULL };
+    const char *refused[]  = { "11.0.0.1", "192.168.5.8", "::2", NULL };
+    for (size_t i = 0; allowed[i]; i++) {
+        ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+        g_rhost = allowed[i];
+        int rc = authenticate(&e, "alice", tok, NULL);
+        if (rc != PAM_SUCCESS) log_dump();
+        ASSERT_EQ(rc, PAM_SUCCESS);
+    }
+    int nonces = dir_entry_count(e.chal);
+    for (size_t i = 0; refused[i]; i++) {
+        ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+        g_rhost = refused[i];
+        int rc = authenticate(&e, "alice", tok, NULL);
+        ASSERT_EQ(rc, PAM_AUTH_ERR);
+        ASSERT_LOGGED("is not permitted by source-address");
+        ASSERT_EQ(dir_entry_count(e.chal), nonces);   /* refused, so no nonce */
+    }
+    g_rhost = NULL;
+    env_teardown(&e);
+}
+
+static void
+test_source_address_malformed_list_refuses(void)
+{
+    /*
+     * ssh-keygen will not sign "192.168.1.50/24" (host bits set), but
+     * another CA might.  The module must refuse the certificate rather than
+     * enforce the entries it does understand, or a typo would hand out a
+     * subnet.  cert_helper.py mints what ssh-keygen will not.
+     */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    ASSERT_EQ(forge_cert(&e, "ca", "id_ed25519", "id_ed25519",
+                         "--critical 'source-address=192.168.1.50/24'"), 0);
+
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = "192.168.1.50";            /* inside the network it names */
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("cannot check source-address");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+
+    /* the same CA and key, with a list ssh-keygen would sign, works */
+    ASSERT_EQ(forge_cert(&e, "ca", "id_ed25519", "id_ed25519",
+                         "--critical 'source-address=192.168.1.0/24'"), 0);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
+    g_rhost = NULL;
+    env_teardown(&e);
+}
+
+static void
 test_security_key_authenticates(void)
 {
     /*
@@ -1785,14 +1958,27 @@ test_cert_with_critical_option_refused(void)
     env_t e; env_setup(&e);
     ASSERT_EQ(gen_ed25519(&e, "ca"), 0);
     ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    /* source-address is honoured; every other critical option is refused */
     ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519",
-                       "-I alice-key -n alice -V -1m:+5m -O source-address=127.0.0.1/32"), 0);
+                       "-I alice-key -n alice -V -1m:+5m -O force-command=/bin/true"), 0);
     enable_certs(&e, "ca", NULL);
     char tok[8192];
     ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
     int rc = authenticate(&e, "alice", tok, NULL);
     ASSERT_EQ(rc, PAM_AUTH_ERR);
-    ASSERT_LOGGED("certificate for 'alice' rejected: unsupported critical option source-address");
+    ASSERT_LOGGED("certificate for 'alice' rejected: unsupported critical option force-command");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+
+    /* and an unknown option alongside source-address is still refused */
+    ASSERT_EQ(gen_cert(&e, "ca", "id_ed25519",
+                       "-I alice-key -n alice -V -1m:+5m "
+                       "-O source-address=127.0.0.1/32 -O force-command=/bin/true"), 0);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = "127.0.0.1";
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("unsupported critical option force-command");
+    g_rhost = NULL;
     ASSERT_EQ(dir_entry_count(e.chal), 0);
     env_teardown(&e);
 }
@@ -2025,6 +2211,10 @@ main(void)
     RUN(test_cert_refused_when_trusted_ca_keys_unset);
     RUN(test_oversized_token_refused_before_parsing);
     RUN(test_cert_with_control_characters_refused);
+    RUN(test_certificate_source_address_is_enforced);
+    RUN(test_source_address_refuses_what_it_cannot_check);
+    RUN(test_source_address_list_and_ipv6);
+    RUN(test_source_address_malformed_list_refuses);
     RUN(test_security_key_authenticates);
     RUN(test_security_key_without_user_presence_refused);
     RUN(test_security_key_signature_is_bound_to_its_application);

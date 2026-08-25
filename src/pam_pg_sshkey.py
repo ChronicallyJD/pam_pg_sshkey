@@ -83,6 +83,7 @@ SPDX-License-Identifier: MIT
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import secrets
 import socket
@@ -103,7 +104,10 @@ try:
         load_ssh_public_key,
         load_pem_private_key,
     )
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
     from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
     from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
     from cryptography.hazmat.primitives import hashes
@@ -157,6 +161,14 @@ _SSH_AGENT_SIGN_RESPONSE: int = 14
 # RSA flag for the sign request: without it an agent signs with SHA-1,
 # which the PAM module refuses.
 _SSH_AGENT_RSA_SHA2_256: int = 2
+# A security key signs SHA256(application) || flags || counter ||
+# SHA256(message), and its SSH signature carries the flags byte and the 4-byte
+# counter after the 64 raw bytes.  The sign request carries flags 0: the RSA
+# SHA-2 flag does not apply, and the server has no ECDSA verifier, so only the
+# Ed25519 security key type works.  Spelled as src/ssh_agent.c reads it.
+_SK_ED25519: bytes = b"sk-ssh-ed25519@openssh.com"
+_SK_FLAG_USER_PRESENT: int = 0x01
+_SK_SIG_LEN: int = 64 + 1 + 4
 _AGENT_MAX_MSG: int = 256 * 1024
 # How long to wait on the agent socket.  An agent that asks a human (ssh-add -c
 # confirmation, a smartcard PIN) is healthy and slow, so the wait is generous.
@@ -514,17 +526,19 @@ def _agent_sign(agent_pubkey: str, message: bytes) -> bytes:
     whose public key file is agent_pubkey.  The private key is never read.
 
     Returns the inner signature bytes (Ed25519 raw, or RSASSA-PKCS1-v1_5
-    with SHA-256), exactly what the PAM module verifies.  Raises KeyError_
-    on any agent or key problem.
+    with SHA-256), exactly what the PAM module verifies.  A security key
+    returns 69 bytes: the 64 raw bytes, the flags byte and the 4-byte
+    counter it signed.  Raises KeyError_ on any agent or key problem.
     """
     blob = _agent_pubkey_blob(agent_pubkey)
     key_type, _ = _agent_read_string(blob, 0, f"key blob in {agent_pubkey}")
     type_str = key_type.decode("ascii", "replace")
-    if key_type.startswith(b"sk-"):
+    is_sk_ed25519 = key_type == _SK_ED25519
+    if key_type.startswith(b"sk-") and not is_sk_ed25519:
         raise KeyError_(
-            f"Key type {type_str} (a FIDO/security key) is not supported: its "
-            f"signature carries authenticator fields the server does not "
-            f"verify.  Use an ed25519 or rsa key instead."
+            f"Key type {type_str} is not supported.  Of the security key "
+            f"types only sk-ssh-ed25519@openssh.com is: the server has no "
+            f"ECDSA verifier."
         )
     is_rsa = key_type.startswith(b"ssh-rsa")
 
@@ -548,15 +562,36 @@ def _agent_sign(agent_pubkey: str, message: bytes) -> bytes:
         )
     sigblob, _ = _agent_read_string(reply, 1, "signature response")
     algo, pos = _agent_read_string(sigblob, 0, "signature blob")
-    sig, _ = _agent_read_string(sigblob, pos, "signature blob")
+    sig, sig_end = _agent_read_string(sigblob, pos, "signature blob")
     algo_str = algo.decode("ascii", "replace")
-    if is_rsa and algo != b"rsa-sha2-256":
+    # A security key's signature carries a flags byte and a 4-byte counter
+    # after the raw 64 bytes, and both are part of what it signed.  The server
+    # needs all 69 bytes, so they travel in the token.
+    sk_tail = b""
+    if is_sk_ed25519:
+        if algo != _SK_ED25519:
+            raise KeyError_(
+                f"The ssh-agent signed with '{algo_str}'; this key needs "
+                f"sk-ssh-ed25519@openssh.com."
+            )
+        sk_tail = sigblob[sig_end:]
+        if len(sig) != 64 or len(sig) + len(sk_tail) != _SK_SIG_LEN:
+            raise KeyError_(
+                "The ssh-agent returned a security key signature without its "
+                "flags and counter; the server cannot verify it."
+            )
+        if not sk_tail[0] & _SK_FLAG_USER_PRESENT:
+            raise KeyError_(
+                "The security key reported no user presence: touch the key "
+                "when it flashes.  The server refuses a signature without it."
+            )
+    if not is_sk_ed25519 and is_rsa and algo != b"rsa-sha2-256":
         raise KeyError_(
             f"The ssh-agent signed with '{algo_str}'; the server needs "
             f"rsa-sha2-256.  Use an OpenSSH 7.2 or newer agent, or sign "
             f"from the key file with key_path=."
         )
-    if not is_rsa and algo != b"ssh-ed25519":
+    if not is_sk_ed25519 and not is_rsa and algo != b"ssh-ed25519":
         raise KeyError_(
             f"The ssh-agent signed with '{algo_str}', which the server does "
             f"not verify.  Use an ed25519 or rsa key."
@@ -566,6 +601,9 @@ def _agent_sign(agent_pubkey: str, message: bytes) -> bytes:
             f"The ssh-agent returned an empty signature for the key in "
             f"{agent_pubkey}."
         )
+    if is_sk_ed25519:
+        _agent_sk_verify(agent_pubkey, blob, message, sig, sk_tail)
+        return sig + sk_tail
     # Verify with the public key the caller named.  The agent can return
     # anything, and a forwarded socket is served by another host; without this
     # a wrong signature only surfaces as "authentication failed" on the server,
@@ -574,6 +612,33 @@ def _agent_sign(agent_pubkey: str, message: bytes) -> bytes:
     if not key_type.endswith(b"-cert-v01@openssh.com"):
         _agent_verify(agent_pubkey, key_type, blob, message, sig, is_rsa)
     return sig
+
+
+def _agent_sk_verify(agent_pubkey: str, blob: bytes, message: bytes,
+                     sig: bytes, sk_tail: bytes) -> None:
+    """Check a security key's signature the way src/sig_verify.c does: the
+    signed data is SHA256(application) || flags || counter || SHA256(message),
+    where the application is the third string of the public key blob.
+    Raises KeyError_ when it does not verify."""
+    what = f"key blob in {agent_pubkey}"
+    _key_type, pos = _agent_read_string(blob, 0, what)
+    raw_pub, pos = _agent_read_string(blob, pos, what)
+    application, _pos = _agent_read_string(blob, pos, what)
+    if len(raw_pub) != 32:
+        raise KeyError_(
+            f"The public key in {agent_pubkey} is not a 32-byte "
+            f"sk-ssh-ed25519@openssh.com key."
+        )
+    signed_data = (hashlib.sha256(application).digest() + sk_tail
+                   + hashlib.sha256(message).digest())
+    try:
+        Ed25519PublicKey.from_public_bytes(raw_pub).verify(sig, signed_data)
+    except (InvalidSignature, TypeError, ValueError) as e:
+        raise KeyError_(
+            f"The security key's signature does not verify with the public "
+            f"key in {agent_pubkey}.  The agent may hold a different key "
+            f"under that name."
+        ) from e
 
 
 def _agent_verify(agent_pubkey: str, key_type: bytes, blob: bytes,
@@ -683,10 +748,14 @@ def get_token(
                         passphrase-protected keys and forwarded agents work.
                         Cannot be combined with key_path, passphrase,
                         version=1, or challenge_cmd (ValueError).  Works with
-                        cert_path (v3).  FIDO/security keys (`sk-*`) are
-                        refused.  The signature the agent returns is verified
-                        against this public key before it becomes a token,
-                        except when the file holds a certificate.
+                        cert_path (v3).  Of the FIDO/security key types only
+                        `sk-ssh-ed25519@openssh.com` works, because the server
+                        has no ECDSA verifier; its token carries 69 signature
+                        bytes (64 raw, the flags byte, the 4-byte counter) and
+                        the key must report user presence.  The signature the
+                        agent returns is verified against this public key
+                        before it becomes a token, except when the file holds
+                        a certificate.
 
     Raises:
         ChallengeError: if the challenge directory is missing or unwritable.

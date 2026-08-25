@@ -188,6 +188,55 @@ decode_ed25519_key(const unsigned char *data, size_t len)
     return pkey; /* may be NULL if OpenSSL < 1.1.1 */
 }
 
+/* ── security key decoder ────────────────────────────────────────────── */
+/*
+ * sk-ssh-ed25519@openssh.com wire bytes:
+ *   string "sk-ssh-ed25519@openssh.com" | string <32-byte key> | string application
+ *
+ * The key itself is an ordinary Ed25519 public key; what differs is the
+ * message it signs.  The application is returned so sig_verify.c can
+ * rebuild that message.
+ */
+static EVP_PKEY *
+decode_sk_ed25519_key(const unsigned char *data, size_t len, char **application)
+{
+    const unsigned char *p = data, *end = data + len;
+    const unsigned char *ktype, *key_bytes, *app;
+    size_t ktype_len, key_len, app_len;
+
+    if (read_string(&p, end, &ktype, &ktype_len) != 0) return NULL;
+    if (read_string(&p, end, &key_bytes, &key_len) != 0 || key_len != 32) return NULL;
+    if (read_string(&p, end, &app, &app_len) != 0) return NULL;
+    if (app_len > 1024) return NULL;
+    for (size_t i = 0; i < app_len; i++)
+        if (app[i] < 0x20 || app[i] > 0x7e) return NULL;   /* it reaches no log,
+                                                              but keep it sane */
+
+    EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
+                                                 key_bytes, key_len);
+    if (!pkey) return NULL;
+
+    char *copy = malloc(app_len + 1);
+    if (!copy) { EVP_PKEY_free(pkey); return NULL; }
+    memcpy(copy, app, app_len);
+    copy[app_len] = '\0';
+    *application = copy;
+    return pkey;
+}
+
+EVP_PKEY *
+ssh_sk_pubkey_from_blob(const unsigned char *blob, size_t len, char **application)
+{
+    const unsigned char *p = blob, *end = blob + len;
+    const unsigned char *ktype; size_t ktype_len;
+    if (!blob || !application) return NULL;
+    if (read_string(&p, end, &ktype, &ktype_len) != 0) return NULL;
+    if (ktype_len != 26 ||
+        memcmp(ktype, "sk-ssh-ed25519@openssh.com", 26) != 0)
+        return NULL;
+    return decode_sk_ed25519_key(blob, len, application);
+}
+
 /* ── ssh_pubkey_from_blob ────────────────────────────────────────────── */
 EVP_PKEY *
 ssh_pubkey_from_blob(const unsigned char *blob, size_t len)
@@ -246,8 +295,9 @@ parse_authorized_keys(const char *path, key_list_t **out)
                            strcmp(key_type_str, "rsa-sha2-256")  == 0 ||
                            strcmp(key_type_str, "rsa-sha2-512")  == 0);
         int is_ed25519  = (strcmp(key_type_str, "ssh-ed25519")   == 0);
+        int is_sk       = (strcmp(key_type_str, "sk-ssh-ed25519@openssh.com") == 0);
 
-        if (!is_rsa && !is_ed25519)
+        if (!is_rsa && !is_ed25519 && !is_sk)
             continue;
 
         /* Decode base64 blob */
@@ -258,10 +308,13 @@ parse_authorized_keys(const char *path, key_list_t **out)
 
         /* Decode into EVP_PKEY */
         EVP_PKEY *pkey = NULL;
+        char     *sk_app = NULL;
         if (is_rsa)
             pkey = decode_rsa_key(raw, raw_len);
         else if (is_ed25519)
             pkey = decode_ed25519_key(raw, raw_len);
+        else if (is_sk)
+            pkey = decode_sk_ed25519_key(raw, raw_len, &sk_app);
 
         if (!pkey)
             continue;
@@ -270,11 +323,13 @@ parse_authorized_keys(const char *path, key_list_t **out)
         key_list_t *entry = calloc(1, sizeof(*entry));
         if (!entry) {
             EVP_PKEY_free(pkey);
+            free(sk_app);
             break;
         }
         entry->key_type = strdup(key_type_str);
         entry->comment  = comment_str ? strdup(comment_str) : NULL;
         entry->pkey     = pkey;
+        entry->sk_application = sk_app;
         entry->next     = NULL;
 
         if (!tail) {
@@ -291,6 +346,21 @@ parse_authorized_keys(const char *path, key_list_t **out)
 }
 
 /* ── free_key_list ───────────────────────────────────────────────────── */
+int
+key_in_list(const EVP_PKEY *key, const key_list_t *list)
+{
+    if (!key) return 0;
+    for (const key_list_t *k = list; k; k = k->next) {
+        if (!k->pkey) continue;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        if (EVP_PKEY_eq(k->pkey, key) == 1) return 1;
+#else
+        if (EVP_PKEY_cmp(k->pkey, key) == 1) return 1;
+#endif
+    }
+    return 0;
+}
+
 void
 free_key_list(key_list_t *list)
 {
@@ -298,6 +368,7 @@ free_key_list(key_list_t *list)
         key_list_t *next = list->next;
         free(list->key_type);
         free(list->comment);
+        free(list->sk_application);
         EVP_PKEY_free(list->pkey);
         free(list);
         list = next;

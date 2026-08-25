@@ -21,6 +21,11 @@ Tests:
   - get_token(cert_path=...) produces a 4-field v3 token, signed over
     "pg-sshkey-v3\\0<ts>:<nonce>", whose 4th field is the cert file's base64,
     byte-identical to pg_sshkey_sign --cert for the same ts and nonce
+  - get_token(agent_pubkey=...) with an sk-ssh-ed25519@openssh.com key: the
+    token carries 69 signature bytes (sig64 || flags || counter), is
+    byte-identical to pg_sshkey_sign --agent for the same ts and nonce, and
+    a reply without user presence, without the trailing five bytes, with the
+    wrong algorithm, or that does not verify is refused
 
 Run:
     python3 -m pytest tests/test_python_module.py -v
@@ -31,6 +36,7 @@ SPDX-License-Identifier: MIT
 """
 
 import base64
+import hashlib
 import os
 import re
 import shutil
@@ -971,6 +977,53 @@ def write_pubkey(path: str, key) -> str:
     return path
 
 
+# ── Security keys, without hardware ──────────────────────────────────────────
+#
+# A FIDO key signs SHA256(application) || flags || counter || SHA256(message)
+# and its SSH signature carries the flags byte and the 4-byte counter after
+# the raw 64 bytes.  tests/sk_helper.py builds the same bytes for the C tests;
+# these helpers build them for the fake agent.
+
+SK_ED25519 = b"sk-ssh-ed25519@openssh.com"
+
+
+def sk_pubkey_blob(key, application: str = "ssh:",
+                   key_type: bytes = SK_ED25519) -> bytes:
+    """A security key's public blob: string type, string pk32, string app."""
+    return (_sshstr(key_type)
+            + _sshstr(key.public_key().public_bytes_raw())
+            + _sshstr(application.encode("ascii")))
+
+
+def write_sk_pubkey(path: str, key, application: str = "ssh:",
+                    key_type: bytes = SK_ED25519) -> str:
+    """Write a security key's public half as an authorized_keys line."""
+    blob = sk_pubkey_blob(key, application, key_type)
+    Path(path).write_bytes(key_type + b" " + base64.b64encode(blob)
+                           + b" sk@fake\n")
+    return path
+
+
+def sk_signed_data(application: str, flags: int, counter: int,
+                   message: bytes) -> bytes:
+    """What the authenticator signs, byte for byte as sig_verify.c builds it."""
+    return (hashlib.sha256(application.encode("ascii")).digest()
+            + bytes([flags]) + struct.pack(">I", counter)
+            + hashlib.sha256(message).digest())
+
+
+def sk_sign_response(key, message: bytes, application: str = "ssh:",
+                     flags: int = 0x01, counter: int = 7,
+                     algo: bytes = SK_ED25519,
+                     tail: bytes | None = None) -> bytes:
+    """An SSH_AGENT_SIGN_RESPONSE shaped the way a security key answers:
+    inside one blob, the algorithm, the 64 raw bytes, then flags and counter."""
+    sig = key.sign(sk_signed_data(application, flags, counter, message))
+    if tail is None:
+        tail = bytes([flags]) + struct.pack(">I", counter)
+    return bytes([14]) + _sshstr(_sshstr(algo) + _sshstr(sig) + tail)
+
+
 class FakeAgent:
     """A Unix socket that answers one sign request with whatever `responder`
     returns.  A responder returning None never answers, which is what an agent
@@ -1085,21 +1138,25 @@ class TestAgentArgumentErrors(unittest.TestCase):
             get_token(agent_pubkey=self._pub(), passphrase=b"secret")
         self.assertIn("passphrase", str(ctx.exception))
 
-    def test_sk_key_type_is_refused(self):
-        """FIDO/security keys: signature carries authenticator fields the
-        server does not verify.  Blob crafted by hand, no hardware needed."""
-        typ = b"sk-ssh-ed25519@openssh.com"
+    def test_sk_ecdsa_key_type_is_refused(self):
+        """Of the security key types only sk-ssh-ed25519@openssh.com works:
+        the server has no ECDSA verifier.  Blob crafted by hand, no hardware
+        needed, and no agent is contacted."""
+        typ = b"sk-ecdsa-sha2-nistp256@openssh.com"
         blob = (struct.pack(">I", len(typ)) + typ
-                + struct.pack(">I", 32) + b"\x00" * 32
+                + struct.pack(">I", 8) + b"nistp256"
+                + struct.pack(">I", 65) + b"\x04" + b"\x00" * 64
                 + struct.pack(">I", 4) + b"ssh:")
-        pub = os.path.join(self.dir, "sk.pub")
+        pub = os.path.join(self.dir, "sk_ecdsa.pub")
         with open(pub, "w") as f:
-            f.write("sk-ssh-ed25519@openssh.com "
+            f.write(typ.decode("ascii") + " "
                     + base64.b64encode(blob).decode("ascii") + " test\n")
         with self.assertRaises(KeyError_) as ctx:
             get_token(agent_pubkey=pub)
-        self.assertIn("security key", str(ctx.exception))
-        self.assertIn("sk-ssh-ed25519@openssh.com", str(ctx.exception))
+        msg = str(ctx.exception)
+        self.assertIn("sk-ecdsa-sha2-nistp256@openssh.com", msg)
+        self.assertIn("sk-ssh-ed25519@openssh.com", msg)
+        self.assertIn("ECDSA", msg)
 
     def test_missing_pubkey_file_raises_keyerror(self):
         with self.assertRaises(KeyError_) as ctx:
@@ -1228,6 +1285,174 @@ class TestAgentSignatureChecks(_FakeAgentFixture):
         self.start_agent(self.honest_responder())
         token = get_token(agent_pubkey=self.pub, key_path=None)
         self.assertTrue(TOKEN_V2_RE.match(token), token)
+
+
+class TestSkAgentSigning(_FakeAgentFixture):
+    """sk-ssh-ed25519@openssh.com through the agent.  The signature is not the
+    64 bytes a plain Ed25519 key returns: the flags and the counter the
+    authenticator signed travel with it, so the token carries 69 bytes.  No
+    hardware and no ssh binaries are involved; the fake agent signs the way
+    tests/sk_helper.py does."""
+
+    # Not the default "ssh:".  Every check here then reads the application
+    # out of the public key blob, so a module that ignored the field and
+    # assumed the default fails the whole class instead of passing it.
+    APPLICATION = "ssh:corp"
+    TS = 1700000000
+    NONCE = "0123456789abcdef" * 4
+
+    def setUp(self):
+        super().setUp()
+        self.sk_key = Ed25519PrivateKey.generate()
+        self.sk_pub = write_sk_pubkey(os.path.join(self.dir, "id_sk.pub"),
+                                      self.sk_key, self.APPLICATION)
+
+    def serve(self, responder) -> FakeAgent:
+        """start_agent, but usable more than once in a check: the previous
+        agent is closed and its socket path freed first."""
+        agent = getattr(self, "agent", None)
+        if agent is not None:
+            agent.close()
+            os.unlink(self.sock)
+        return self.start_agent(responder)
+
+    def sk_responder(self, key=None, application=None, **kw):
+        """Answers the sign request the way a security key does."""
+        signer = self.sk_key if key is None else key
+        app = self.APPLICATION if application is None else application
+        return lambda req: sk_sign_response(
+            signer, agent_request_message(req), application=app, **kw)
+
+    def test_sk_token_carries_sig_flags_and_counter(self):
+        """The token's signature field is sig64 || flags || counter, and the
+        64 bytes verify over what the authenticator signed."""
+        self.start_agent(self.sk_responder(counter=7))
+        token = get_token(agent_pubkey=self.sk_pub)
+        self.assertTrue(TOKEN_V2_RE.match(token), token)
+        ts, nonce, sig_b64 = token.split(":")
+        sig = base64.b64decode(sig_b64)
+        self.assertEqual(len(sig), 69, sig.hex())
+        self.assertEqual(sig[64], 0x01)
+        self.assertEqual(struct.unpack(">I", sig[65:69])[0], 7)
+        message = _SIGN_PREFIX_V2 + f"{ts}:{nonce}".encode("ascii")
+        self.sk_key.public_key().verify(
+            sig[:64], sk_signed_data(self.APPLICATION, sig[64], 7, message))
+
+    @unittest.skipUnless(PG_SSHKEY_SIGN.exists(),
+                         "pg_sshkey_sign not built (run make)")
+    def test_sk_token_matches_pg_sshkey_sign_agent(self):
+        """Same fake agent, pubkey, timestamp and nonce: the Python token must
+        be byte-identical to pg_sshkey_sign --agent."""
+        self.start_agent(self.sk_responder())
+        r = subprocess.run([str(PG_SSHKEY_SIGN), "--agent", self.sk_pub,
+                            "--at", str(self.TS), "--nonce", self.NONCE],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, SSH_AUTH_SOCK=self.sock))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        expected = r.stdout.strip()
+        with mock.patch("pam_pg_sshkey.time.time", return_value=self.TS), \
+             mock.patch("pam_pg_sshkey.secrets.token_bytes",
+                        return_value=bytes.fromhex(self.NONCE)):
+            token = get_token(agent_pubkey=self.sk_pub)
+        self.assertEqual(token, expected)
+
+    def test_no_user_presence_is_refused(self):
+        """Without the presence bit the signature says nothing about whether a
+        person touched the key, and the server refuses it."""
+        self.start_agent(self.sk_responder(flags=0x00))
+        with self.assertRaises(KeyError_) as ctx:
+            get_token(agent_pubkey=self.sk_pub)
+        self.assertIn("touch the key", str(ctx.exception))
+
+    def test_missing_flags_and_counter_is_refused(self):
+        """A 64-byte reply with no trailing five bytes cannot be verified by
+        the server, so it must not become a token."""
+        self.start_agent(self.sk_responder(tail=b""))
+        with self.assertRaises(KeyError_) as ctx:
+            get_token(agent_pubkey=self.sk_pub)
+        self.assertIn("flags and counter", str(ctx.exception))
+
+    def test_plain_ed25519_algorithm_is_refused(self):
+        """The reply's algorithm must be the key type: 'ssh-ed25519' means the
+        agent signed the message itself, which this public key cannot verify."""
+        self.start_agent(self.sk_responder(algo=b"ssh-ed25519"))
+        with self.assertRaises(KeyError_) as ctx:
+            get_token(agent_pubkey=self.sk_pub)
+        msg = str(ctx.exception)
+        self.assertIn("ssh-ed25519", msg)
+        self.assertIn("sk-ssh-ed25519@openssh.com", msg)
+
+    def test_signature_from_another_key_is_refused(self):
+        """Right shape, right algorithm, right flags, wrong key."""
+        self.start_agent(self.sk_responder(key=Ed25519PrivateKey.generate()))
+        with self.assertRaises(KeyError_) as ctx:
+            get_token(agent_pubkey=self.sk_pub)
+        self.assertIn("does not verify", str(ctx.exception))
+
+    def test_signature_is_bound_to_the_keys_application(self):
+        """The application string is hashed into what the key signs, and it
+        comes from the public key blob rather than from the reply.  This key
+        is scoped to "ssh:corp", so a signature made for the default "ssh:"
+        must not pass: a module that ignored the field and assumed the
+        default would take it.  tests/test_pam_module.c makes the same claim
+        in test_security_key_signature_is_bound_to_its_application."""
+        # the key's own application signs a token
+        self.serve(self.sk_responder())
+        self.assertTrue(TOKEN_V2_RE.match(get_token(agent_pubkey=self.sk_pub)))
+
+        # the default application, which this key is not scoped to, does not,
+        # and neither does a third one
+        for other in ("ssh:", "ssh:other"):
+            with self.subTest(application=other):
+                self.serve(self.sk_responder(application=other))
+                with self.assertRaises(KeyError_) as ctx:
+                    get_token(agent_pubkey=self.sk_pub)
+                self.assertIn("does not verify", str(ctx.exception))
+
+    def test_default_application_key_refuses_another_application(self):
+        """The binding holds in both directions: a key scoped to the default
+        "ssh:" takes a signature made for "ssh:" and refuses one made for
+        "ssh:corp".  Without this a module could hard-code either string and
+        still pass."""
+        pub = write_sk_pubkey(os.path.join(self.dir, "id_sk_default.pub"),
+                              self.sk_key, "ssh:")
+        self.serve(self.sk_responder(application="ssh:"))
+        self.assertTrue(TOKEN_V2_RE.match(get_token(agent_pubkey=pub)))
+
+        self.serve(self.sk_responder(application="ssh:corp"))
+        with self.assertRaises(KeyError_) as ctx:
+            get_token(agent_pubkey=pub)
+        self.assertIn("does not verify", str(ctx.exception))
+
+    def test_flags_and_counter_come_from_the_reply(self):
+        """Both trailing bytes are hashed into what the key signs, and both
+        are read from the reply.  A key that reports user verification as well
+        as presence sends flags 0x05, and the counter is whatever the
+        authenticator is at; a module that assumed 0x01, or a fixed counter,
+        would refuse a signature the server accepts."""
+        self.serve(self.sk_responder(flags=0x05, counter=0x12345678))
+        token = get_token(agent_pubkey=self.sk_pub)
+        ts, nonce, sig_b64 = token.split(":")
+        sig = base64.b64decode(sig_b64)
+        self.assertEqual(len(sig), 69, sig.hex())
+        self.assertEqual(sig[64], 0x05)
+        self.assertEqual(struct.unpack(">I", sig[65:69])[0], 0x12345678)
+        message = _SIGN_PREFIX_V2 + f"{ts}:{nonce}".encode("ascii")
+        self.sk_key.public_key().verify(
+            sig[:64],
+            sk_signed_data(self.APPLICATION, 0x05, 0x12345678, message))
+
+    def test_tail_that_disagrees_with_the_signed_bytes_is_refused(self):
+        """The flags and the counter travel in the token and the server
+        verifies with the bytes the reply carries, so a tail that differs from
+        what the key signed cannot verify.  Either field alone breaks it."""
+        for name, tail in (("flags", bytes([0x05]) + struct.pack(">I", 7)),
+                           ("counter", bytes([0x01]) + struct.pack(">I", 8))):
+            with self.subTest(field=name):
+                self.serve(self.sk_responder(flags=0x01, counter=7, tail=tail))
+                with self.assertRaises(KeyError_) as ctx:
+                    get_token(agent_pubkey=self.sk_pub)
+                self.assertIn("does not verify", str(ctx.exception))
 
 
 class TestUnsetSentinel(unittest.TestCase):

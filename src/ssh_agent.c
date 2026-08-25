@@ -325,11 +325,13 @@ ssh_agent_sign(const unsigned char *keyblob, size_t blob_len,
         fprintf(stderr, "The public key file does not hold an SSH key blob\n");
         return NULL;
     }
-    if (type_len > 3 && memcmp(type, "sk-", 3) == 0) {
+    int is_sk_ed25519 = (type_len == 26 &&
+                         memcmp(type, "sk-ssh-ed25519@openssh.com", 26) == 0);
+    if (type_len > 3 && memcmp(type, "sk-", 3) == 0 && !is_sk_ed25519) {
         char tbuf[64];
         fprintf(stderr,
-            "Key type %s (a FIDO/security key) is not supported: its\n"
-            "signature carries authenticator fields the server does not verify.\n",
+            "Key type %s is not supported.  Of the security key types only\n"
+            "sk-ssh-ed25519@openssh.com is: the server has no ECDSA verifier.\n",
             printable(type, type_len, tbuf, sizeof(tbuf)));
         return NULL;
     }
@@ -380,7 +382,40 @@ ssh_agent_sign(const unsigned char *keyblob, size_t blob_len,
         return NULL;
     }
     char abuf[64];
-    if (is_rsa && !(algo_len == 12 && memcmp(algo, "rsa-sha2-256", 12) == 0)) {
+    /*
+     * A security key's signature carries a flags byte and a 4-byte counter
+     * after the raw 64 bytes, and both are part of what it signed.  The
+     * server needs all 69 bytes, so they travel in the token.
+     */
+    unsigned char sk_tail[5];
+    if (is_sk_ed25519) {
+        if (!(algo_len == 26 &&
+              memcmp(algo, "sk-ssh-ed25519@openssh.com", 26) == 0)) {
+            fprintf(stderr,
+                "The ssh-agent signed with '%s'; this key needs "
+                "sk-ssh-ed25519@openssh.com.\n",
+                printable(algo, algo_len, abuf, sizeof(abuf)));
+            free(reply);
+            return NULL;
+        }
+        if (sigblob_len - spos != 5 || sig_len != 64) {
+            fprintf(stderr,
+                "The ssh-agent returned a security key signature without its\n"
+                "flags and counter; the server cannot verify it.\n");
+            free(reply);
+            return NULL;
+        }
+        memcpy(sk_tail, sigblob + spos, 5);
+        if ((sk_tail[0] & 0x01) == 0) {
+            fprintf(stderr,
+                "The security key reported no user presence: touch the key when\n"
+                "it flashes.  The server refuses a signature without it.\n");
+            free(reply);
+            return NULL;
+        }
+    }
+    if (!is_sk_ed25519 && is_rsa &&
+        !(algo_len == 12 && memcmp(algo, "rsa-sha2-256", 12) == 0)) {
         fprintf(stderr,
             "The ssh-agent signed with '%s'; the server needs rsa-sha2-256.\n"
             "Use an OpenSSH 7.2 or newer agent, or sign from the key file.\n",
@@ -388,7 +423,8 @@ ssh_agent_sign(const unsigned char *keyblob, size_t blob_len,
         free(reply);
         return NULL;
     }
-    if (!is_rsa && !(algo_len == 11 && memcmp(algo, "ssh-ed25519", 11) == 0)) {
+    if (!is_sk_ed25519 && !is_rsa &&
+        !(algo_len == 11 && memcmp(algo, "ssh-ed25519", 11) == 0)) {
         fprintf(stderr,
             "The ssh-agent signed with '%s', which the server does not verify.\n",
             printable(algo, algo_len, abuf, sizeof(abuf)));
@@ -409,6 +445,47 @@ ssh_agent_sign(const unsigned char *keyblob, size_t blob_len,
      */
     int is_cert = (type_len > 21 &&
                    memcmp(type + type_len - 21, "-cert-v01@openssh.com", 21) == 0);
+    if (is_sk_ed25519) {
+        char *application = NULL;
+        EVP_PKEY *pub = ssh_sk_pubkey_from_blob(keyblob, blob_len, &application);
+        int ok = 0;
+        if (pub && application) {
+            unsigned char signed_data[32 + 1 + 4 + 32];
+            unsigned int n1 = 0, n2 = 0;
+            if (EVP_Digest(application, strlen(application), signed_data, &n1,
+                           EVP_sha256(), NULL) == 1 && n1 == 32) {
+                signed_data[32] = sk_tail[0];
+                memcpy(signed_data + 33, sk_tail + 1, 4);
+                if (EVP_Digest(msg, msg_len, signed_data + 37, &n2,
+                               EVP_sha256(), NULL) == 1 && n2 == 32) {
+                    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+                    if (ctx) {
+                        if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pub) == 1)
+                            ok = (EVP_DigestVerify(ctx, sig, sig_len,
+                                                   signed_data,
+                                                   sizeof(signed_data)) == 1);
+                        EVP_MD_CTX_free(ctx);
+                    }
+                }
+            }
+        }
+        free(application);
+        EVP_PKEY_free(pub);
+        if (!ok) {
+            fprintf(stderr,
+                "The security key's signature does not verify with the public\n"
+                "key in the file you named.\n");
+            free(reply);
+            return NULL;
+        }
+        unsigned char *out = malloc(64 + 5);
+        if (!out) { free(reply); return NULL; }
+        memcpy(out, sig, 64);
+        memcpy(out + 64, sk_tail, 5);
+        free(reply);
+        *sig_len_out = 64 + 5;
+        return out;
+    }
     if (!is_cert) {
         EVP_PKEY *pub = ssh_pubkey_from_blob(keyblob, blob_len);
         if (!pub) {

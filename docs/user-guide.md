@@ -41,8 +41,10 @@ mode `0600`, and the module then refuses them with a permission error.
 | `pg_sshkey_addkey --remove alice` | Remove all of alice's keys |
 
 The file uses the OpenSSH `authorized_keys` format, one key per line. The
-module accepts `ssh-ed25519` and `ssh-rsa` keys; the words `rsa-sha2-256` and
-`rsa-sha2-512` are accepted as aliases of `ssh-rsa`. Other types are skipped.
+module accepts `ssh-ed25519`, `ssh-rsa`, and
+`sk-ssh-ed25519@openssh.com` keys; the words `rsa-sha2-256` and
+`rsa-sha2-512` are accepted as aliases of `ssh-rsa`. Other types, including
+ECDSA and `sk-ecdsa`, are skipped.
 
 Then create the role if it does not exist:
 
@@ -116,10 +118,54 @@ pg_sshkey_connect --agent ~/.ssh/id_ed25519.pub --cert ~/.ssh/id_ed25519-cert.pu
 The registered key is still the public key of the identity in the agent, so
 `pg_sshkey_addkey` and the certificate rules are unchanged. RSA keys work:
 the client asks the agent for an `rsa-sha2-256` signature, and an agent older
-than OpenSSH 7.2, which can only answer with SHA-1, is refused. FIDO security
-keys (`sk-ssh-ed25519@openssh.com`) are refused, because their signature
-carries authenticator fields the module does not verify. `--agent` does not
-work with `--v1`.
+than OpenSSH 7.2, which can only answer with SHA-1, is refused. A FIDO
+security key needs `--agent`, and has a section of its own below.
+`sk-ecdsa-sha2-nistp256@openssh.com` is refused: the server has no ECDSA
+verifier. `--agent` does not work with `--v1`.
+
+## Connecting with a security key
+
+A key on a FIDO authenticator (`ssh-keygen -t ed25519-sk`) authenticates like
+any other, with two differences: the private key never leaves the hardware,
+so signing goes through an agent, and the authenticator must report that
+someone touched it.
+
+```sh
+ssh-keygen -t ed25519-sk -f ~/.ssh/id_ed25519_sk
+sudo pg_sshkey_addkey -a alice ~/.ssh/id_ed25519_sk.pub
+ssh-add ~/.ssh/id_ed25519_sk
+pg_sshkey_connect --agent ~/.ssh/id_ed25519_sk.pub -h dbserver -U alice mydb
+```
+
+The key flashes; touch it. A signature whose user-presence bit is clear is
+refused, so a login cannot happen without that touch. Only
+`sk-ssh-ed25519@openssh.com` is supported:
+`sk-ecdsa-sha2-nistp256@openssh.com` is refused, because the server has no
+ECDSA verifier. `ssh-keygen -t ed25519-sk` needs an authenticator plugged in
+and an `ssh-keygen` built with `libfido2`; without one it stops with
+`Key enrollment failed: device not found`. The file it writes is a handle
+rather than a private key the module could sign with, so there is no
+key-file route and no certificate support for security keys yet.
+
+The tests exercise this path with signatures built to the authenticator
+format rather than with hardware, so the format is verified and a particular
+vendor's token is not.
+
+## Revoking a key
+
+`revoked_keys` in `/etc/pam.d/postgresql` names a file of public keys that
+may not authenticate ([Configuration](configuration.md#revoked-keys)). To
+withdraw a key, append it and reload nothing: the module reads the file on
+every attempt.
+
+```sh
+sudo sh -c 'cat /home/alice/.ssh/id_ed25519.pub >> /etc/pg_sshkeys/revoked_keys'
+```
+
+This works for a key registered in an `authorized_keys` file and for a key
+certified by a CA, which is the only way to withdraw a certificate before it
+expires. The list names keys, so there is no revocation by certificate
+serial or key id.
 
 ## Connecting with a certificate
 
@@ -163,9 +209,9 @@ The server log shows `user 'alice' authenticated with certificate
 'alice-laptop' serial 0`. The certificate must list the role name among its
 principals, be within its validity window, be a user certificate, and carry
 no critical options (`-O source-address=...` or `-O force-command=...` are
-refused). There is no revocation list: to withdraw a certificate before it
-expires, replace the CA key or wait for the window to close, so keep windows
-short. RSA user keys and RSA CAs work; a CA signature made with the SHA-1
+refused). To withdraw a certificate before it expires, name its key, or the
+CA's key, in `revoked_keys` (see [Revoking a key](#revoking-a-key)); keep
+validity windows short all the same. RSA user keys and RSA CAs work; a CA signature made with the SHA-1
 `ssh-rsa` algorithm (`ssh-keygen -t ssh-rsa` when signing) is refused. A
 certificate token is about 770 characters for Ed25519 and about 1660 for a
 3072-bit RSA key.

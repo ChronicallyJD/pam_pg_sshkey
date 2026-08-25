@@ -13,7 +13,10 @@ see the [User guide](user-guide.md).
 | 1 (legacy) | `<nonce_hex>:<base64_sig>` | `"pg-sshkey-v1\0" \|\| nonce_bytes` | A nonce file created by `pg_sshkey_challenge` exists in `challenge_dir` and is under 60 seconds old; the file is then deleted |
 
 Each prefix is 13 bytes including the NUL. `nonce_hex` is 64 lowercase
-hexadecimal characters (32 random bytes). Ed25519 signs the message directly;
+hexadecimal characters (32 random bytes). A security key's signature field
+holds 69 bytes, the 64 raw bytes followed by the flags byte and the 4-byte
+counter, and covers `SHA256(application) || flags || counter ||
+SHA256(message)`. Ed25519 signs the message directly;
 RSA uses PKCS#1 v1.5 with SHA-256. `base64_cert` is the second field of an
 OpenSSH `*-cert.pub` file, unchanged; `ssh-ed25519-cert-v01@openssh.com` and
 `ssh-rsa-cert-v01@openssh.com` are accepted. The module tells the versions
@@ -47,9 +50,10 @@ agent all work. The client verifies the agent's signature against that public
 key before printing the token, and waits at most 60 seconds for the agent
 (`PG_SSHKEY_AGENT_TIMEOUT_MS` overrides that). For an RSA key the
 client asks the agent for `rsa-sha2-256`, because the module verifies RSA
-with SHA-256; an agent that answers with `ssh-rsa` is refused. `sk-` key
-types (FIDO security keys) are refused: their signature carries
-authenticator fields the module does not verify. `--agent` is not available
+with SHA-256; an agent that answers with `ssh-rsa` is refused. An
+`sk-ssh-ed25519@openssh.com` identity works and the token then carries the
+authenticator's flags and counter; `sk-ecdsa-sha2-nistp256@openssh.com` is
+refused, because the module has no ECDSA verifier. `--agent` is not available
 with a v1 challenge.
 
 ## pg_sshkey_connect
@@ -117,6 +121,7 @@ Set in `/etc/pam.d/postgresql`; see [Configuration](configuration.md#module-opti
 | `authorized_keys_dir=<dir>` | `/etc/pg_sshkeys` |
 | `challenge_dir=<dir>` | `/var/run/pg_sshkey` |
 | `trusted_ca_keys=<file>` | unset (certificate tokens refused) |
+| `revoked_keys=<file>` | unset (nothing revoked) |
 | `debug` | off |
 
 ## Log messages
@@ -131,6 +136,14 @@ hosts read them with `journalctl -t postgres` or
 | info | `user 'U' authenticated with key K` | Success. `K` is the key comment, or its type |
 | info | `user 'U' authenticated with certificate 'KEYID' serial N` | Success with a v3 token. `KEYID` is the `-I` value given to `ssh-keygen` |
 | warning | `authentication failed for 'U'` | No registered key (v1, v2) or the certified key (v3) verifies the signature |
+| warning | `key for 'U' is revoked` | The key that verified is listed in `revoked_keys` |
+| warning | `certificate for 'U' rejected: key is revoked` | The certified key is listed in `revoked_keys` |
+| warning | `certificate for 'U' rejected: signing CA is revoked` | The CA that signed it is listed in `revoked_keys` |
+| error | `revoked_keys PATH has N line(s) but only M parsed as keys, refusing` | The file is not in `authorized_keys` format, so the list cannot be trusted |
+| error | `revoked_keys PATH is not a regular file, refusing` | The option names a directory or a device |
+| error | `trusted_ca_keys and revoked_keys are the same file (PATH), refusing` | One file cannot be both lists |
+| error | `cannot read revoked_keys PATH: ..., refusing` | The list is missing or unreadable, so every login is refused |
+| error | `revoked_keys PATH is world/group writable, refusing` | Mode allows writes by group or others |
 | warning | `replayed token for 'U' (nonce already used)` | A v2 or v3 token was presented a second time |
 | warning | `token timestamp for 'U' is N s from server time (limit 60), expired or clock skew` | v2 or v3 timestamp outside the window |
 | warning | `certificate token for 'U' but trusted_ca_keys is not set` | A v3 token arrived and the option is absent from `/etc/pam.d/postgresql` |
@@ -149,7 +162,7 @@ hosts read them with `journalctl -t postgres` or
 | warning | `certificate for 'U' rejected: invalid CA signature` | The certificate body does not verify with the CA key |
 | warning | `challenge not found or expired for 'U'` | v1 nonce file missing, used, or older than 60 seconds |
 | warning | `no authorized_keys for 'U'` | `<authorized_keys_dir>/U/authorized_keys` does not exist |
-| warning | `no valid keys in 'PATH'` | The file has no `ssh-ed25519` or `ssh-rsa` entries |
+| warning | `no valid keys in 'PATH'` | The file has no `ssh-ed25519`, `ssh-rsa`, or `sk-ssh-ed25519@openssh.com` entries |
 | error | `failed to get auth token for 'U' (client sent no password)` | The client connected without a precomputed token |
 | error | `malformed token for 'U'` | The password is not a v1, v2, or v3 token |
 | error | `base64 decode failed for 'U'` | The signature part is not base64 |

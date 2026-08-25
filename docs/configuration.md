@@ -64,10 +64,59 @@ stack is `pam_permit.so` because a database role need not be an OS account.
 | `authorized_keys_dir=<dir>` | `/etc/pg_sshkeys` | Keys are read from `<dir>/<username>/authorized_keys` |
 | `challenge_dir=<dir>` | `/var/run/pg_sshkey` | Where used nonces are recorded (and where v1 nonce files are read) |
 | `trusted_ca_keys=<file>` | unset | CA public keys that may certify user keys; unset refuses every certificate token |
+| `revoked_keys=<file>` | unset | Public keys that may not authenticate, whatever else admits them |
 | `debug` | off | Log each step at `LOG_DEBUG` to the `authpriv` facility |
 
 Turn `debug` on only while diagnosing a problem; it logs the challenge of
 every attempt.
+
+### Revoked keys
+
+`revoked_keys` names a file of public keys, in `authorized_keys` format,
+that may not authenticate. It is checked after the signature verifies and
+before the login is granted, for a key in an `authorized_keys` file and for
+a key carried by a certificate alike, so revoking a key does not require
+finding every file that lists it.
+
+```text
+auth    required    pam_pg_sshkey.so \
+            authorized_keys_dir=/etc/pg_sshkeys \
+            challenge_dir=/var/run/pg_sshkey \
+            revoked_keys=/etc/pg_sshkeys/revoked_keys
+```
+
+The file must exist, be readable by `postgres`, and not be group or world
+writable, with the same ownership as the CA file. If it cannot be read every
+login is refused: a revocation list that vanishes must not readmit the keys
+it named. An empty file is a valid list that revokes nothing.
+
+Add a key with `cat key.pub >> /etc/pg_sshkeys/revoked_keys`. Blank lines
+and `#` comments are ignored, so a date and a reason can sit next to each
+entry, and listing a key twice is harmless. Every other line must parse as a
+public key: a file the module cannot read that way, such as a key revocation
+list from `ssh-keygen -k`, refuses every login rather than revoking nothing,
+and the log says how many lines parsed.
+
+There is no command that lists the file; read it, and confirm a revocation
+took effect by attempting a login and looking for
+`key for 'U' is revoked` in the journal.
+
+The list holds keys, not certificates. Revoking the key inside a certificate
+stops that certificate, and revoking a CA key stops every certificate it
+signed, which is the fastest answer to a compromised CA. There is no
+revocation by certificate serial or key id. The file may not be the same one
+named by `trusted_ca_keys`: the module refuses that configuration, because
+every revoked key would become a trusted CA.
+
+### Security keys
+
+The module accepts `sk-ssh-ed25519@openssh.com` entries, so a key that lives
+on a FIDO authenticator can authenticate. The signature covers the key's
+application string, a flags byte, and the authenticator's counter, and the
+module refuses one whose user-presence bit is clear, so a login requires a
+touch. `sk-ecdsa-sha2-nistp256@openssh.com` is not accepted; the module has
+no ECDSA verifier. Signing needs `--agent`, because the private key is on
+the hardware. See [User guide](user-guide.md#connecting-with-a-security-key).
 
 ### Certificates
 

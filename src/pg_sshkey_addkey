@@ -71,6 +71,8 @@ while [[ $# -gt 0 ]]; do
         --list)         LIST=1;        shift ;;
         --remove)       REMOVE=1;      shift ;;
         --help)         usage ;;
+        -)              if [[ -z "$PG_USER" ]]; then die "Give the user name before -"; fi
+                        KEY_SRC="-"; shift ;;
         -*)             die "Unknown option: $1" ;;
         *)
             if [[ -z "$PG_USER" ]]; then
@@ -149,7 +151,7 @@ if [[ "$KEY_SRC" == "-" ]]; then
     KEY_DATA=$(cat)
 elif [[ -f "$KEY_SRC" ]]; then
     KEY_DATA=$(cat "$KEY_SRC")
-elif [[ "$KEY_SRC" == ssh-* || "$KEY_SRC" == ecdsa-* ]]; then
+elif [[ "$KEY_SRC" == ssh-* || "$KEY_SRC" == ecdsa-* || "$KEY_SRC" == sk-* ]]; then
     # Literal key string passed directly
     KEY_DATA="$KEY_SRC"
 else
@@ -160,7 +162,7 @@ fi
 [[ -z "$KEY_DATA" ]] && die "No key data provided"
 
 # ── validate key format ───────────────────────────────────────────────────────
-VALID_TYPES="ssh-ed25519 ssh-rsa rsa-sha2-256 rsa-sha2-512"
+VALID_TYPES="ssh-ed25519 ssh-rsa rsa-sha2-256 rsa-sha2-512 sk-ssh-ed25519@openssh.com"
 KEY_TYPE=$(echo "$KEY_DATA" | awk 'NR==1{print $1}')
 
 # Strip unsupported types with a warning
@@ -196,7 +198,7 @@ chmod 640 "$AK_FILE"
 info "set $AK_FILE → root:postgres 0640"
 
 # ── confirm ───────────────────────────────────────────────────────────────────
-KEY_COUNT=$(grep -c "^ssh-\|^rsa-\|^ecdsa-" "$AK_FILE" 2>/dev/null || echo 0)
+KEY_COUNT=$(grep -c "^ssh-\|^rsa-\|^ecdsa-\|^sk-" "$AK_FILE" 2>/dev/null) || KEY_COUNT=0
 info "user '$PG_USER' now has $KEY_COUNT authorized key(s)"
 info ""
 info "Verify the postgres user can read it:"

@@ -72,12 +72,25 @@ make -C "$SRC" install-conf >/dev/null
 # install-conf ships the auth line without trusted_ca_keys; the e2e checks
 # need it.  Appended once, after the challenge_dir continuation line.
 PAMCONF=/etc/pam.d/postgresql
-if ! grep -qE '^[^#]*trusted_ca_keys=' "$PAMCONF"; then
-    log "adding trusted_ca_keys to $PAMCONF"
-    sed -i 's|^\([[:space:]]*challenge_dir=[^[:space:]]*\)[[:space:]]*$|\1 \\\n            trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys|' "$PAMCONF"
-    grep -q 'trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys' "$PAMCONF" \
-        || { echo "provision: could not add trusted_ca_keys to $PAMCONF (no challenge_dir= line?)" >&2; exit 1; }
-fi
+# install-conf ships the auth line with none of the optional settings, and
+# editing it in place proved brittle.  The stanza is written whole instead,
+# so the result is the same whatever a warm container started with.
+cat > "$PAMCONF" <<PAMEOF
+#%PAM-1.0
+# written by tests/e2e/provision.sh
+auth    required    pam_pg_sshkey.so \\
+            authorized_keys_dir=/etc/pg_sshkeys \\
+            challenge_dir=$CHAL_DIR \\
+            trusted_ca_keys=/etc/pg_sshkeys/trusted_ca_keys \\
+            revoked_keys=/etc/pg_sshkeys/revoked_keys
+
+account required    pam_permit.so
+PAMEOF
+for opt in authorized_keys_dir challenge_dir trusted_ca_keys revoked_keys; do
+    grep -qE "^[^#]*$opt=" "$PAMCONF" \
+        || { echo "provision: $opt missing from $PAMCONF" >&2; exit 1; }
+done
+
 install -d -m 1733 -o postgres -g postgres "$CHAL_DIR"
 chown postgres:postgres "$CHAL_DIR"; chmod 1733 "$CHAL_DIR"
 
@@ -167,6 +180,22 @@ if ! cmp -s "$CA_DIR/trusted_ca.pub" "$TRUSTED_CA_KEYS" 2>/dev/null; then
     install -m 640 -o root -g postgres "$CA_DIR/trusted_ca.pub" "$TRUSTED_CA_KEYS"
 fi
 chown root:postgres "$TRUSTED_CA_KEYS"; chmod 640 "$TRUSTED_CA_KEYS"
+
+# ── revocation list: present and empty, so the checks can fill it ───────────
+# Truncated on every run: a list left populated by an interrupted check
+# would quietly lock users out of the next one.
+REVOKED_KEYS=/etc/pg_sshkeys/revoked_keys
+: > "$REVOKED_KEYS"
+chown root:postgres "$REVOKED_KEYS"; chmod 640 "$REVOKED_KEYS"
+
+# ── a software security key for the sk checks ──────────────────────────────
+# No FIDO hardware in a container: sk_helper.py signs the way an
+# authenticator does, which is what the module verifies.
+runuser -l alice -c "mkdir -p -m 700 ~/.ssh"
+if [[ ! -f /home/alice/.ssh/sk.pub ]]; then
+    log "generating a software security key for alice"
+    runuser -l alice -c "python3 $SRC/tests/sk_helper.py keygen ~/.ssh >/dev/null"
+fi
 
 # sign <user> <name> <ca> <ssh-keygen -s args...>
 # Copies ~/.ssh/id_ed25519.pub to ~/.ssh/<name>.pub and signs it, producing

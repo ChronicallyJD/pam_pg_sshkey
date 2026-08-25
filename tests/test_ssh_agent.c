@@ -53,6 +53,9 @@ typedef enum {
     R_INNER_OVERRUN,     /* inner string claims more than the blob holds */
     R_GOOD_SIG,          /* a genuine signature, correctly labelled */
     R_GOOD_SIG_BAD_ALGO, /* a genuine signature under a wrong algorithm name */
+    R_SK_GOOD,           /* a security key signature, presence bit set */
+    R_SK_NO_PRESENCE,    /* the same, with the presence bit clear */
+    R_SK_NO_TAIL,        /* a security key algorithm with no flags or counter */
 } reply_kind;
 
 static void
@@ -135,6 +138,21 @@ serve(int listen_fd, reply_kind kind, const unsigned char *sig, size_t sig_len)
         unsigned char blob[256]; size_t bl = 0;
         bl += put_string(blob + bl, algo, strlen(algo));
         bl += put_string(blob + bl, sig, sig_len);
+        body[body_len++] = SSH_AGENT_SIGN_RESPONSE;
+        body_len += put_string(body + body_len, blob, bl);
+        break;
+    }
+    case R_SK_GOOD:
+    case R_SK_NO_PRESENCE:
+    case R_SK_NO_TAIL: {
+        const char *algo = "sk-ssh-ed25519@openssh.com";
+        unsigned char blob[256]; size_t bl = 0;
+        bl += put_string(blob + bl, algo, strlen(algo));
+        bl += put_string(blob + bl, sig, sig_len);
+        if (kind != R_SK_NO_TAIL) {
+            blob[bl++] = (kind == R_SK_GOOD) ? 0x01 : 0x00;   /* flags */
+            put_u32(blob + bl, 7); bl += 4;                    /* counter */
+        }
         body[body_len++] = SSH_AGENT_SIGN_RESPONSE;
         body_len += put_string(body + body_len, blob, bl);
         break;
@@ -297,6 +315,77 @@ sign_msg(EVP_PKEY *pkey, size_t *len_out)
     int ok = sig &&
              EVP_DigestSignInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
              EVP_DigestSign(ctx, sig, &sl, MSG, sizeof(MSG) - 1) == 1;
+    EVP_MD_CTX_free(ctx);
+    if (!ok) { free(sig); return NULL; }
+    *len_out = sl;
+    return sig;
+}
+
+/*
+ * An sk-ssh-ed25519 public key file, and a signature over
+ * SHA256(application) || flags || counter || SHA256(message).
+ */
+static EVP_PKEY *
+gen_sk_key(char *pub_out, size_t pub_sz, const char *application)
+{
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+    if (!ctx || EVP_PKEY_keygen_init(ctx) != 1 || EVP_PKEY_keygen(ctx, &pkey) != 1) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+    EVP_PKEY_CTX_free(ctx);
+
+    unsigned char raw[32]; size_t raw_len = sizeof(raw);
+    if (EVP_PKEY_get_raw_public_key(pkey, raw, &raw_len) != 1 || raw_len != 32) {
+        EVP_PKEY_free(pkey); return NULL;
+    }
+    const char *type = "sk-ssh-ed25519@openssh.com";
+    unsigned char blob[256]; size_t bl = 0;
+    bl += put_string(blob + bl, type, strlen(type));
+    bl += put_string(blob + bl, raw, 32);
+    bl += put_string(blob + bl, application, strlen(application));
+
+    static const char *b64c =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char b64[512]; size_t o = 0;
+    for (size_t i = 0; i < bl; i += 3) {
+        unsigned v = (unsigned)blob[i] << 16;
+        if (i + 1 < bl) v |= (unsigned)blob[i + 1] << 8;
+        if (i + 2 < bl) v |= blob[i + 2];
+        b64[o++] = b64c[(v >> 18) & 63];
+        b64[o++] = b64c[(v >> 12) & 63];
+        b64[o++] = (i + 1 < bl) ? b64c[(v >> 6) & 63] : '=';
+        b64[o++] = (i + 2 < bl) ? b64c[v & 63] : '=';
+    }
+    b64[o] = '\0';
+
+    snprintf(pub_out, pub_sz, "%s/sk.pub", g_dir);
+    FILE *f = fopen(pub_out, "w");
+    if (!f) { EVP_PKEY_free(pkey); return NULL; }
+    fprintf(f, "%s %s sk\n", type, b64);
+    fclose(f);
+    return pkey;
+}
+
+static unsigned char *
+sign_sk(EVP_PKEY *pkey, const char *application, unsigned char flags,
+        size_t *len_out)
+{
+    unsigned char data[32 + 1 + 4 + 32];
+    unsigned int n = 0;
+    if (EVP_Digest(application, strlen(application), data, &n, EVP_sha256(), NULL) != 1)
+        return NULL;
+    data[32] = flags;
+    put_u32(data + 33, 7);
+    if (EVP_Digest(MSG, sizeof(MSG) - 1, data + 37, &n, EVP_sha256(), NULL) != 1)
+        return NULL;
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx) return NULL;
+    unsigned char *sig = malloc(128); size_t sl = 128;
+    int ok = sig && EVP_DigestSignInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
+             EVP_DigestSign(ctx, sig, &sl, data, sizeof(data)) == 1;
     EVP_MD_CTX_free(ctx);
     if (!ok) { free(sig); return NULL; }
     *len_out = sl;
@@ -481,6 +570,56 @@ test_empty_signature_with_a_certificate_blob_is_refused(void)
     rm_dir();
 }
 
+static void
+test_security_key_signature_is_passed_through_with_its_tail(void)
+{
+    /*
+     * The server needs the flags and counter, so the client must carry all
+     * 69 bytes.  A reply without them, or with the presence bit clear, is
+     * refused rather than turned into a token the server would reject.
+     */
+    mk_dir();
+    char pub[512];
+    EVP_PKEY *pkey = gen_sk_key(pub, sizeof(pub), "ssh:");
+    ASSERT_NOT_NULL(pkey);
+    size_t blob_len = 0;
+    unsigned char *blob = ssh_pubkey_blob_from_file(pub, &blob_len);
+    ASSERT_NOT_NULL(blob);
+
+    size_t sig_len = 0;
+    unsigned char *sig = sign_sk(pkey, "ssh:", 0x01, &sig_len);
+    ASSERT_NOT_NULL(sig);
+    agent_up(R_SK_GOOD, sig, sig_len);
+    size_t out_len = 0;
+    unsigned char *out = ssh_agent_sign(blob, blob_len, MSG, sizeof(MSG) - 1, &out_len);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQ(out_len, 69);
+    if (out) {
+        ASSERT_EQ(out[64], 0x01);          /* flags travel with the signature */
+        ASSERT_EQ(out[68], 7);             /* and so does the counter */
+        free(out);
+    }
+    agent_down();
+    free(sig);
+
+    agent_up(R_SK_NO_TAIL, NULL, 0);
+    sig = sign_sk(pkey, "ssh:", 0x01, &sig_len);
+    agent_down();
+    agent_up(R_SK_NO_TAIL, sig, sig_len);
+    ASSERT_NULL(ssh_agent_sign(blob, blob_len, MSG, sizeof(MSG) - 1, &out_len));
+    agent_down();
+    free(sig);
+
+    sig = sign_sk(pkey, "ssh:", 0x00, &sig_len);
+    ASSERT_NOT_NULL(sig);
+    agent_up(R_SK_NO_PRESENCE, sig, sig_len);
+    ASSERT_NULL(ssh_agent_sign(blob, blob_len, MSG, sizeof(MSG) - 1, &out_len));
+    agent_down();
+
+    free(sig); free(blob); EVP_PKEY_free(pkey);
+    rm_dir();
+}
+
 int
 main(void)
 {
@@ -490,5 +629,6 @@ main(void)
     RUN(test_refusal_then_close_does_not_kill_the_client);
     RUN(test_genuine_signature_under_a_wrong_algorithm_is_refused);
     RUN(test_empty_signature_with_a_certificate_blob_is_refused);
+    RUN(test_security_key_signature_is_passed_through_with_its_tail);
     return SUMMARY();
 }

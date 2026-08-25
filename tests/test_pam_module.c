@@ -16,8 +16,8 @@
  * PAM_PROMPT_ECHO_OFF from appdata_ptr (the client "password") and never
  * talks to a terminal.  An empty password models "client sent nothing".
  *
- * Keys and tokens come from ssh-keygen and the built pg_sshkey_challenge /
- * pg_sshkey_sign binaries, so the module only ever sees real client output.
+ * Keys and tokens come from ssh-keygen and the built pg_sshkey_sign binary,
+ * so the module only ever sees real client output.
  *
  * Environment:
  *   PAM_PG_SSHKEY_BUILDDIR   directory holding pam_pg_sshkey.so and the tools
@@ -103,7 +103,6 @@ log_dump(void)
 /* ── global paths ─────────────────────────────────────────────────────── */
 
 static char g_so[PATH_MAX];
-static char g_chal_bin[PATH_MAX];
 static char g_sign_bin[PATH_MAX];
 static char g_test_dir[PATH_MAX];   /* this file's directory, for sk_helper.py */
 
@@ -198,8 +197,8 @@ env_setup(env_t *e)
     snprintf(e->chal,    sizeof(e->chal),    "%s/chal",  e->root);
     mkdir(e->confdir, 0755);
     mkdir(e->keys,    0755);
-    mkdir(e->chal,    01733);
-    chmod(e->chal,    01733);   /* mkdir honours umask; force the real mode */
+    mkdir(e->chal,    0700);
+    chmod(e->chal,    0700);   /* mkdir honours umask; force the real mode */
     e->ca_file[0] = '\0';
     e->revoked_file[0] = '\0';
     e->agent_sock[0] = '\0';
@@ -365,21 +364,6 @@ make_token_agent(const env_t *e, const char *name, const char *extra,
 
 /* ── token helpers ────────────────────────────────────────────────────── */
 
-/* Create a nonce with pg_sshkey_challenge and sign it with pg_sshkey_sign. */
-static int
-make_token(const env_t *e, const char *keyname,
-           char *hex, size_t hex_sz, char *tok, size_t tok_sz)
-{
-    char cmd[PATH_MAX * 2], key[PATH_MAX];
-    key_path(e, keyname, key, sizeof(key));
-
-    snprintf(cmd, sizeof(cmd), "'%s' '%s' 2>/dev/null", g_chal_bin, e->chal);
-    if (run_capture(cmd, hex, hex_sz) != 0 || strlen(hex) != 64) return -1;
-
-    snprintf(cmd, sizeof(cmd), "'%s' %s '%s' 2>/dev/null", g_sign_bin, hex, key);
-    if (run_capture(cmd, tok, tok_sz) != 0 || strncmp(tok, hex, 64) != 0) return -1;
-    return 0;
-}
 
 /*
  * v2: the client issues its own challenge.  `extra` holds optional
@@ -519,8 +503,8 @@ test_valid_ed25519_token_succeeds(void)
     ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
     ASSERT_EQ(install_pubkey(&e, "alice", "id_ed25519", NULL, 0), 0);
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
 
     int acct = -1;
     int rc = authenticate(&e, "alice", tok, &acct);
@@ -533,21 +517,22 @@ test_valid_ed25519_token_succeeds(void)
 }
 
 static void
-test_replayed_token_rejected_and_nonce_gone(void)
+test_replayed_token_rejected_and_nonce_recorded(void)
 {
     env_t e; env_setup(&e);
     gen_ed25519(&e, "id_ed25519");
     install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
-    ASSERT_TRUE(nonce_exists(&e, hex));
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(dir_entry_count(e.chal), 0);      /* nothing recorded yet */
 
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
-    /* nonce consumed on first use ... */
-    ASSERT_FALSE(nonce_exists(&e, hex));
+    /* the nonce is recorded on first use ... */
+    ASSERT_EQ(dir_entry_count(e.chal), 1);
     /* ... so the identical token is refused */
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+    ASSERT_LOGGED("replayed token for 'alice'");
     env_teardown(&e);
 }
 
@@ -559,11 +544,11 @@ test_wrong_key_rejected(void)
     gen_ed25519(&e, "id_wrong");
     install_pubkey(&e, "alice", "id_ed25519", NULL, 0);   /* id_wrong never registered */
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_wrong", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_wrong", NULL, tok, sizeof(tok)), 0);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
-    /* the nonce is consumed even on failure: a failed attempt burns it */
-    ASSERT_FALSE(nonce_exists(&e, hex));
+    /* a refused attempt records nothing: verification comes first */
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
     env_teardown(&e);
 }
 
@@ -574,16 +559,20 @@ test_malformed_and_empty_tokens_rejected(void)
     gen_ed25519(&e, "id_ed25519");
     install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
 
-    char hex_colon[80], hex_bad[96], traversal[128];
-    snprintf(hex_colon, sizeof(hex_colon), "%s:", hex);
-    snprintf(hex_bad,   sizeof(hex_bad),   "%s:!!not-base64!!", hex);
-    snprintf(traversal, sizeof(traversal), "../../etc/passwd:%s", tok + 65);
+    /* the nonce of the good token, and the shapes built around it */
+    char nonce[65], one_colon[160], bad_sig[4096], traversal[160];
+    memcpy(nonce, strchr(tok, ':') + 1, 64);
+    nonce[64] = '\0';
+    snprintf(one_colon, sizeof(one_colon), "%s:AAAA", nonce);   /* the v1 shape */
+    snprintf(bad_sig,  sizeof(bad_sig),  "%.*s:!!not-base64!!",
+             (int)(strrchr(tok, ':') - tok), tok);
+    snprintf(traversal, sizeof(traversal), "1:../../etc/passwd:AAAA");
 
-    /* Rejected before the nonce is even looked up: the nonce survives. */
-    const char *pre[] = { "", "nocolon", ":AAAA", hex_colon, traversal };
+    /* Refused on shape alone, so nothing is recorded. */
+    const char *pre[] = { "", "nocolon", ":AAAA", one_colon, traversal };
     for (size_t i = 0; i < sizeof(pre)/sizeof(pre[0]); i++) {
         int rc = authenticate(&e, "alice", pre[i], NULL);
         if (rc != PAM_AUTH_ERR)
@@ -591,13 +580,12 @@ test_malformed_and_empty_tokens_rejected(void)
         ASSERT_EQ(rc, PAM_AUTH_ERR);
         ASSERT_EQ(g_echo_off_calls, 1);   /* never a second prompt to the client */
     }
-    ASSERT_TRUE(nonce_exists(&e, hex));
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
 
-    /* A real nonce with a garbage signature is refused AND consumed
-       (the module invalidates before verifying, like the wrong-key case). */
-    ASSERT_EQ(authenticate(&e, "alice", hex_bad, NULL), PAM_AUTH_ERR);
+    /* A well-shaped token whose signature is not base64 is refused too */
+    ASSERT_EQ(authenticate(&e, "alice", bad_sig, NULL), PAM_AUTH_ERR);
     ASSERT_EQ(g_echo_off_calls, 1);
-    ASSERT_FALSE(nonce_exists(&e, hex));
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
     env_teardown(&e);
 }
 
@@ -607,8 +595,8 @@ test_missing_authorized_keys_rejected(void)
     env_t e; env_setup(&e);
     gen_ed25519(&e, "id_ed25519");
     /* no keys/alice/ at all */
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
     env_teardown(&e);
 }
@@ -623,8 +611,8 @@ test_empty_authorized_keys_rejected(void)
     authkeys_path(&e, "alice", ak, sizeof(ak));
     write_file(ak, "# no keys here\n\n", 0640);
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
     env_teardown(&e);
 }
@@ -637,68 +625,19 @@ test_group_writable_authorized_keys_refused(void)
     install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
     char ak[PATH_MAX]; authkeys_path(&e, "alice", ak, sizeof(ak));
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
     chmod(ak, 0660);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
 
     /* same key, correct mode, fresh token: proves the refusal was the mode */
     chmod(ak, 0640);
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
     env_teardown(&e);
 }
 
-static void
-test_expired_nonce_rejected(void)
-{
-    env_t e; env_setup(&e);
-    gen_ed25519(&e, "id_ed25519");
-    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
-
-    /* back-date the nonce file past the 60 s TTL (format: "<ts>\n<hex>\n") */
-    char np[PATH_MAX], body[128];
-    snprintf(np, sizeof(np), "%s/%s", e.chal, hex);
-    snprintf(body, sizeof(body), "%ld\n%s\n", (long)time(NULL) - 120, hex);
-    write_file(np, body, 0644);
-
-    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
-    ASSERT_FALSE(nonce_exists(&e, hex));   /* expired nonces are purged */
-    env_teardown(&e);
-}
-
-static void
-test_unremovable_nonce_fails_closed(void)
-{
-    if (geteuid() == 0) { fprintf(stderr, "(skipped as root) "); return; }
-    env_t e; env_setup(&e);
-    gen_ed25519(&e, "id_ed25519");
-    install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
-
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
-
-    /* unlink() needs write permission on the directory; take it away so the
-       module can read the nonce but cannot consume it (the real-world case is
-       a challenge_dir not owned by postgres). */
-    chmod(e.chal, 0555);
-
-    /* If the nonce cannot be invalidated, replay protection is void, so the
-       only safe answer is to refuse. */
-    int rc1 = authenticate(&e, "alice", tok, NULL);
-    int rc2 = authenticate(&e, "alice", tok, NULL);
-    if (rc1 == PAM_SUCCESS)
-        fprintf(stderr, "    first attempt succeeded with an unconsumable nonce; replay -> %s\n",
-                pam_strerror(NULL, rc2));
-    ASSERT_EQ(rc1, PAM_AUTH_ERR);
-    ASSERT_EQ(rc2, PAM_AUTH_ERR);
-
-    chmod(e.chal, 01733);
-    env_teardown(&e);
-}
 
 static void
 test_rsa_ssh_rsa_entry_succeeds(void)
@@ -707,8 +646,8 @@ test_rsa_ssh_rsa_entry_succeeds(void)
     ASSERT_EQ(gen_rsa_pem(&e, "id_rsa"), 0);
     install_pubkey(&e, "alice", "id_rsa", NULL, 0);   /* genuine "ssh-rsa ..." line */
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_rsa", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_rsa", NULL, tok, sizeof(tok)), 0);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
     env_teardown(&e);
 }
@@ -723,8 +662,8 @@ test_rsa_sha2_512_label_succeeds(void)
     ASSERT_EQ(gen_rsa_pem(&e, "id_rsa"), 0);
     install_pubkey(&e, "alice", "id_rsa", "rsa-sha2-512", 0);
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_rsa", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_rsa", NULL, tok, sizeof(tok)), 0);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
     env_teardown(&e);
 }
@@ -781,8 +720,8 @@ test_stale_nonces_swept_on_auth(void)
     write_stale_nonce(&e, live, 5);                 /* another user's pending nonce */
     write_stale_nonce(&e, "README", 3600);          /* not a nonce */
 
-    char hex[65], tok[4096];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[4096];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
 
     ASSERT_FALSE(nonce_exists(&e, stale1));
@@ -923,7 +862,7 @@ test_v2_unrecordable_nonce_fails_closed(void)
     char tok[4096];
     ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
     ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
-    chmod(e.chal, 01733);
+    chmod(e.chal, 0700);
     env_teardown(&e);
 }
 
@@ -973,7 +912,7 @@ forge_cert(const env_t *e, const char *ca, const char *key, const char *name,
  * module cannot tell the difference, because the format is the format.
  */
 static int
-sk_helper(const env_t *e, const char *args, char *out, size_t out_sz)
+sk_helper(const char *args, char *out, size_t out_sz)
 {
     char cmd[PATH_MAX * 3];
     snprintf(cmd, sizeof(cmd), "python3 '%s/sk_helper.py' %s 2>&1",
@@ -986,7 +925,7 @@ sk_keygen(const env_t *e, const char *extra)
 {
     char args[PATH_MAX * 2], out[8192];
     snprintf(args, sizeof(args), "keygen '%s' %s", e->root, extra ? extra : "");
-    return sk_helper(e, args, out, sizeof(out));
+    return sk_helper(args, out, sizeof(out));
 }
 
 /* Install <root>/sk.pub as the user's authorized_keys. */
@@ -1008,7 +947,7 @@ sk_token(const env_t *e, const char *extra, char *tok, size_t tok_sz)
 {
     char args[PATH_MAX * 2];
     snprintf(args, sizeof(args), "token '%s' %s", e->root, extra ? extra : "");
-    return sk_helper(e, args, tok, tok_sz);
+    return sk_helper(args, tok, tok_sz);
 }
 
 /*
@@ -1666,6 +1605,37 @@ test_source_address_malformed_list_refuses(void)
 }
 
 static void
+test_v1_token_is_refused(void)
+{
+    /*
+     * v1 is gone.  A token of the old shape, "<nonce_hex>:<signature>", is
+     * refused as malformed however good its signature, and the nonce file
+     * it would have consumed is left alone.
+     */
+    env_t e; env_setup(&e);
+    ASSERT_EQ(gen_ed25519(&e, "id_ed25519"), 0);
+    ASSERT_EQ(install_pubkey(&e, "alice", "id_ed25519", NULL, 0), 0);
+
+    /* a well-formed v2 token still works, so the key and the file are good */
+    char tok[8192];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_SUCCESS);
+
+    /* the v1 shape: 64 hex characters, a colon, a signature */
+    char v1[8192], cmd[PATH_MAX * 3];
+    snprintf(cmd, sizeof(cmd),
+        "python3 -c \"import sys;t=sys.argv[1].split(':');"
+        "print(t[1]+':'+t[2])\" '%s'", tok);
+    ASSERT_EQ(run_capture(cmd, v1, sizeof(v1)), 0);
+    ASSERT_EQ(count_colons_str(v1), 1);
+
+    int rc = authenticate(&e, "alice", v1, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("malformed token for 'alice'");
+    env_teardown(&e);
+}
+
+static void
 test_security_key_authenticates(void)
 {
     /*
@@ -2134,8 +2104,8 @@ test_v1_and_v2_still_pass_with_trusted_ca_keys_set(void)
     enable_certs(&e, "ca", NULL);
     install_pubkey(&e, "alice", "id_ed25519", NULL, 0);
 
-    char hex[65], tok[8192];
-    ASSERT_EQ(make_token(&e, "id_ed25519", hex, sizeof(hex), tok, sizeof(tok)), 0);
+    char tok[8192];
+    ASSERT_EQ(make_token_v2(&e, "id_ed25519", NULL, tok, sizeof(tok)), 0);
     int rc = authenticate(&e, "alice", tok, NULL);
     ASSERT_EQ(rc, PAM_SUCCESS);
     ASSERT_LOGGED("user 'alice' authenticated with key id_ed25519");
@@ -2175,8 +2145,6 @@ main(void)
         fprintf(stderr, "FAIL: %s not found, build it first (make)\n", tmp);
         return 1;
     }
-    snprintf(tmp, sizeof(tmp), "%s/pg_sshkey_challenge", bd);
-    if (!realpath(tmp, g_chal_bin)) { fprintf(stderr, "FAIL: %s not found\n", tmp); return 1; }
     snprintf(tmp, sizeof(tmp), "%s/pg_sshkey_sign", bd);
     if (!realpath(tmp, g_sign_bin)) { fprintf(stderr, "FAIL: %s not found\n", tmp); return 1; }
     if (system("command -v ssh-keygen >/dev/null 2>&1") != 0) {
@@ -2187,15 +2155,14 @@ main(void)
 
     printf("=== pam module (libpam seam) ===\n");
     printf("  module: %s\n", g_so);
+    RUN(test_v1_token_is_refused);
     RUN(test_valid_ed25519_token_succeeds);
-    RUN(test_replayed_token_rejected_and_nonce_gone);
+    RUN(test_replayed_token_rejected_and_nonce_recorded);
     RUN(test_wrong_key_rejected);
     RUN(test_malformed_and_empty_tokens_rejected);
     RUN(test_missing_authorized_keys_rejected);
     RUN(test_empty_authorized_keys_rejected);
     RUN(test_group_writable_authorized_keys_refused);
-    RUN(test_expired_nonce_rejected);
-    RUN(test_unremovable_nonce_fails_closed);
     RUN(test_rsa_ssh_rsa_entry_succeeds);
     RUN(test_rsa_sha2_512_label_succeeds);
     RUN(test_acct_mgmt_direct);

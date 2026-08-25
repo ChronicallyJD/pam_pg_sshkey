@@ -1,7 +1,9 @@
 /*
  * test_integration.c, end-to-end flow tests
  *
- * Exercises: challenge_create → sign → parse_authorized_keys → verify_signature
+ * Exercises the library flow behind a v2 token: build the signed message,
+ * sign it, parse authorized_keys, verify, and record the nonce so the same
+ * token cannot be used twice.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -12,6 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include <openssl/evp.h>
 #include <openssl/bio.h>
@@ -21,7 +24,7 @@
 #include "../src/key_parser.h"
 #include "../src/sig_verify.h"
 
-static const unsigned char PFX[] = "pg-sshkey-v1";
+static const unsigned char PFX[] = "pg-sshkey-v2";
 static const size_t        PFX_LEN = 13;
 
 static char g_dir[256];
@@ -70,6 +73,15 @@ static void write_authkeys(const char *path, EVP_PKEY *pk) {
     fclose(f); free(b64);
 }
 
+/* "<unix_ts>:<nonce_hex>", what a client signs and what it sends */
+static void make_head(char *head, size_t sz, char *nonce_hex) {
+    unsigned char raw[32];
+    for (size_t i = 0; i < sizeof(raw); i++) raw[i] = (unsigned char)(rand() & 0xff);
+    for (int i = 0; i < 32; i++) sprintf(nonce_hex + 2 * i, "%02x", raw[i]);
+    nonce_hex[64] = '\0';
+    snprintf(head, sz, "%ld:%s", (long)time(NULL), nonce_hex);
+}
+
 static int sign_chal(EVP_PKEY *sk,
                       const unsigned char *chal, size_t clen,
                       unsigned char **sig, size_t *slen) {
@@ -95,18 +107,17 @@ static void test_happy_path(void) {
     char cdir[512]; snprintf(cdir,sizeof(cdir),"%s/c",g_dir);
     mkdir(cdir,0700);
 
-    char hex[65]; ASSERT_EQ(challenge_create(cdir,hex,sizeof(hex)),0);
-
-    unsigned char cbytes[64]; size_t clen=0;
-    ASSERT_EQ(challenge_load(cdir,hex,cbytes,sizeof(cbytes),&clen),0);
-    ASSERT_EQ((int)clen,32);
-    challenge_delete(cdir,hex);
+    char head[128], nonce[65];
+    make_head(head,sizeof(head),nonce);
 
     unsigned char *sig=NULL; size_t slen=0;
-    ASSERT_EQ(sign_chal(sk,cbytes,clen,&sig,&slen),0);
+    ASSERT_EQ(sign_chal(sk,(const unsigned char*)head,strlen(head),&sig,&slen),0);
 
     key_list_t *keys=NULL; ASSERT_EQ(parse_authorized_keys(akpath,&keys),1);
-    ASSERT_EQ(verify_signature(keys,cbytes,clen,sig,slen),0);
+    unsigned char msg[512]; size_t mlen=PFX_LEN+strlen(head);
+    memcpy(msg,PFX,PFX_LEN); memcpy(msg+PFX_LEN,head,strlen(head));
+    ASSERT_EQ(verify_signature_raw(keys,msg,mlen,sig,slen),0);
+    ASSERT_EQ(challenge_mark(cdir,nonce),0);      /* first use records it */
 
     free(sig); free_key_list(keys); EVP_PKEY_free(sk); rm_dir();
 }
@@ -116,14 +127,11 @@ static void test_replay_prevented(void) {
     char cdir[512]; snprintf(cdir,sizeof(cdir),"%s/c",g_dir);
     mkdir(cdir,0700);
 
-    char hex[65]; challenge_create(cdir,hex,sizeof(hex));
-    unsigned char cbytes[64]; size_t clen=0;
-    challenge_load(cdir,hex,cbytes,sizeof(cbytes),&clen);
-    challenge_delete(cdir,hex); /* first auth consumes nonce */
+    char head[128], nonce[65];
+    make_head(head,sizeof(head),nonce);
 
-    /* Second load of same nonce must fail */
-    unsigned char cb2[64]; size_t cl2=0;
-    ASSERT_EQ(challenge_load(cdir,hex,cb2,sizeof(cb2),&cl2),-1);
+    ASSERT_EQ(challenge_mark(cdir,nonce),0);   /* first use */
+    ASSERT_EQ(challenge_mark(cdir,nonce),1);   /* the same nonce again */
     rm_dir();
 }
 
@@ -134,19 +142,16 @@ static void test_wrong_key_rejected(void) {
     char akpath[512]; snprintf(akpath,sizeof(akpath),"%s/ak",g_dir);
     write_authkeys(akpath,legit); /* only legit is authorised */
 
-    char cdir[512]; snprintf(cdir,sizeof(cdir),"%s/c",g_dir);
-    mkdir(cdir,0700);
-
-    char hex[65]; challenge_create(cdir,hex,sizeof(hex));
-    unsigned char cbytes[64]; size_t clen=0;
-    challenge_load(cdir,hex,cbytes,sizeof(cbytes),&clen);
-    challenge_delete(cdir,hex);
+    char head[128], nonce[65];
+    make_head(head,sizeof(head),nonce);
 
     unsigned char *sig=NULL; size_t slen=0;
-    sign_chal(attacker,cbytes,clen,&sig,&slen); /* attacker signs */
+    sign_chal(attacker,(const unsigned char*)head,strlen(head),&sig,&slen);
 
     key_list_t *keys=NULL; parse_authorized_keys(akpath,&keys);
-    ASSERT_NE(verify_signature(keys,cbytes,clen,sig,slen),0);
+    unsigned char msg[512]; size_t mlen=PFX_LEN+strlen(head);
+    memcpy(msg,PFX,PFX_LEN); memcpy(msg+PFX_LEN,head,strlen(head));
+    ASSERT_NE(verify_signature_raw(keys,msg,mlen,sig,slen),0);
 
     free(sig); free_key_list(keys); EVP_PKEY_free(legit); EVP_PKEY_free(attacker); rm_dir();
 }
@@ -167,22 +172,19 @@ static void test_multiple_authorised_keys(void) {
     }
     fclose(f);
 
-    char cdir[512]; snprintf(cdir,sizeof(cdir),"%s/c",g_dir);
-    mkdir(cdir,0700);
-
     for(int k=0;k<2;k++){
-        char hex[65]; challenge_create(cdir,hex,sizeof(hex));
-        unsigned char cbytes[64]; size_t clen=0;
-        challenge_load(cdir,hex,cbytes,sizeof(cbytes),&clen);
-        challenge_delete(cdir,hex);
+        char head[128], nonce[65];
+        make_head(head,sizeof(head),nonce);
 
         unsigned char *sig=NULL; size_t slen=0;
-        sign_chal(kp[k],cbytes,clen,&sig,&slen);
+        sign_chal(kp[k],(const unsigned char*)head,strlen(head),&sig,&slen);
 
         key_list_t *keys=NULL; parse_authorized_keys(akpath,&keys);
+        unsigned char msg[512]; size_t mlen=PFX_LEN+strlen(head);
+        memcpy(msg,PFX,PFX_LEN); memcpy(msg+PFX_LEN,head,strlen(head));
         int found=0;
         for(key_list_t *e=keys;e;e=e->next)
-            if(verify_signature(e,cbytes,clen,sig,slen)==0){found=1;break;}
+            if(verify_signature_raw(e,msg,mlen,sig,slen)==0){found=1;break;}
         ASSERT_TRUE(found);
         free(sig); free_key_list(keys);
     }

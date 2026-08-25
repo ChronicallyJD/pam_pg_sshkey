@@ -3,7 +3,7 @@
  *
  * Verify SSH-style signatures via OpenSSL EVP API.
  *
- * Signed message = "pg-sshkey-v1\0" || challenge_bytes
+ * Signed message = "pg-sshkey-v2\0" || "<unix_ts>:<nonce_hex>"
  * (the NUL is part of the prefix so the domain is unambiguous)
  *
  * Key types and digest used:
@@ -31,40 +31,8 @@
 #include <openssl/err.h>
 
 /* Domain-separation prefix (including the NUL byte) */
-static const unsigned char SIGN_PREFIX[]   = "pg-sshkey-v1";
-static const size_t        SIGN_PREFIX_LEN = 13; /* 12 chars + NUL */
 
-/*
- * Build the message that was signed.
- * msg must be at least SIGN_PREFIX_LEN + challenge_len bytes.
- */
-static void
-build_signed_message(const unsigned char *challenge, size_t challenge_len,
-                     unsigned char *msg, size_t *msg_len)
-{
-    memcpy(msg, SIGN_PREFIX, SIGN_PREFIX_LEN);
-    memcpy(msg + SIGN_PREFIX_LEN, challenge, challenge_len);
-    *msg_len = SIGN_PREFIX_LEN + challenge_len;
-}
 
-int
-verify_signature(const key_list_t  *key,
-                 const unsigned char *challenge, size_t challenge_len,
-                 const unsigned char *sig,       size_t sig_len)
-{
-    if (!key || !key->pkey || !challenge || !sig)
-        return -1;
-
-    /* Build the signed message buffer (max 32 bytes challenge + prefix) */
-    unsigned char msg[512];
-    size_t        msg_len = 0;
-
-    if (SIGN_PREFIX_LEN + challenge_len > sizeof(msg))
-        return -1;
-
-    build_signed_message(challenge, challenge_len, msg, &msg_len);
-    return verify_signature_raw(key, msg, msg_len, sig, sig_len);
-}
 
 /* ── security keys ───────────────────────────────────────────────────── */
 /*

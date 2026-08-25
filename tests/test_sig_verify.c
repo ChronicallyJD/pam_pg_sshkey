@@ -17,7 +17,7 @@
 #include "../src/sig_verify.h"
 
 /* Domain prefix matching sig_verify.c */
-static const unsigned char PFX[] = "pg-sshkey-v1";
+static const unsigned char PFX[] = "pg-sshkey-v2";
 static const size_t        PFX_LEN = 13; /* 12 + NUL */
 
 static const unsigned char CHAL[32] = {
@@ -61,13 +61,24 @@ static key_list_t make_entry(EVP_PKEY *pk, const char *type) {
     key_list_t e={0}; e.key_type=(char*)type; e.pkey=pk; return e;
 }
 
+/* The module verifies a prepared message; build it the way the client does. */
+static int verify_prefixed(const key_list_t *e,
+                           const unsigned char *chal, size_t clen,
+                           const unsigned char *sig, size_t slen) {
+    unsigned char msg[512];
+    if (PFX_LEN + clen > sizeof(msg)) return -1;
+    memcpy(msg, PFX, PFX_LEN);
+    memcpy(msg + PFX_LEN, chal, clen);
+    return verify_signature_raw(e, msg, PFX_LEN + clen, sig, slen);
+}
+
 /* ── Ed25519 ──────────────────────────────────────────────────────────── */
 static void test_ed25519_valid(void) {
     EVP_PKEY *sk=gen_ed25519();
     unsigned char *sig=NULL; size_t slen=0;
     ASSERT_EQ(do_sign(sk,NULL,CHAL,sizeof(CHAL),&sig,&slen),0);
     key_list_t e=make_entry(sk,"ssh-ed25519");
-    ASSERT_EQ(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    ASSERT_EQ(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen),0);
     free(sig); EVP_PKEY_free(sk);
 }
 
@@ -76,7 +87,7 @@ static void test_ed25519_wrong_key(void) {
     unsigned char *sig=NULL; size_t slen=0;
     do_sign(signer,NULL,CHAL,sizeof(CHAL),&sig,&slen);
     key_list_t e=make_entry(other,"ssh-ed25519");
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen),0);
     free(sig); EVP_PKEY_free(signer); EVP_PKEY_free(other);
 }
 
@@ -86,7 +97,7 @@ static void test_ed25519_tampered_sig(void) {
     do_sign(sk,NULL,CHAL,sizeof(CHAL),&sig,&slen);
     sig[0]^=0x01;
     key_list_t e=make_entry(sk,"ssh-ed25519");
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen),0);
     free(sig); EVP_PKEY_free(sk);
 }
 
@@ -96,7 +107,7 @@ static void test_ed25519_wrong_challenge(void) {
     do_sign(sk,NULL,CHAL,sizeof(CHAL),&sig,&slen);
     unsigned char other[32]; memset(other,0xff,sizeof(other));
     key_list_t e=make_entry(sk,"ssh-ed25519");
-    ASSERT_NE(verify_signature(&e,other,sizeof(other),sig,slen),0);
+    ASSERT_NE(verify_prefixed(&e,other,sizeof(other),sig,slen),0);
     free(sig); EVP_PKEY_free(sk);
 }
 
@@ -105,7 +116,7 @@ static void test_ed25519_truncated_sig(void) {
     unsigned char *sig=NULL; size_t slen=0;
     do_sign(sk,NULL,CHAL,sizeof(CHAL),&sig,&slen);
     key_list_t e=make_entry(sk,"ssh-ed25519");
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen/2),0);
+    ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen/2),0);
     free(sig); EVP_PKEY_free(sk);
 }
 
@@ -115,7 +126,7 @@ static void test_rsa_sha256_valid(void) {
     unsigned char *sig=NULL; size_t slen=0;
     ASSERT_EQ(do_sign(sk,EVP_sha256(),CHAL,sizeof(CHAL),&sig,&slen),0);
     key_list_t e=make_entry(sk,"rsa-sha2-256");
-    ASSERT_EQ(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    ASSERT_EQ(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen),0);
     free(sig); EVP_PKEY_free(sk);
 }
 
@@ -126,7 +137,7 @@ static void test_rsa_sha512_label_verifies_sha256_sig(void) {
     unsigned char *sig=NULL; size_t slen=0;
     ASSERT_EQ(do_sign(sk,EVP_sha256(),CHAL,sizeof(CHAL),&sig,&slen),0);
     key_list_t e=make_entry(sk,"rsa-sha2-512");
-    ASSERT_EQ(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    ASSERT_EQ(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen),0);
     free(sig); EVP_PKEY_free(sk);
 }
 
@@ -135,7 +146,7 @@ static void test_ssh_rsa_alias_sha256(void) {
     unsigned char *sig=NULL; size_t slen=0;
     do_sign(sk,EVP_sha256(),CHAL,sizeof(CHAL),&sig,&slen);
     key_list_t e=make_entry(sk,"ssh-rsa");
-    ASSERT_EQ(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    ASSERT_EQ(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen),0);
     free(sig); EVP_PKEY_free(sk);
 }
 
@@ -144,7 +155,7 @@ static void test_rsa_wrong_key(void) {
     unsigned char *sig=NULL; size_t slen=0;
     do_sign(sk,EVP_sha256(),CHAL,sizeof(CHAL),&sig,&slen);
     key_list_t e=make_entry(other,"rsa-sha2-256");
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+    ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen),0);
     free(sig); EVP_PKEY_free(sk); EVP_PKEY_free(other);
 }
 
@@ -156,7 +167,7 @@ static void test_rsa_sha512_sig_rejected_under_any_label(void) {
     const char *labels[]={"rsa-sha2-512","rsa-sha2-256","ssh-rsa"};
     for (size_t i=0;i<3;i++) {
         key_list_t e=make_entry(sk,labels[i]);
-        ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,slen),0);
+        ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,slen),0);
     }
     free(sig); EVP_PKEY_free(sk);
 }
@@ -164,27 +175,28 @@ static void test_rsa_sha512_sig_rejected_under_any_label(void) {
 /* ── NULL / error paths ───────────────────────────────────────────────── */
 static void test_null_entry(void) {
     unsigned char sig[64]={0};
-    ASSERT_NE(verify_signature(NULL,CHAL,sizeof(CHAL),sig,sizeof(sig)),0);
+    ASSERT_NE(verify_signature_raw(NULL,CHAL,sizeof(CHAL),sig,sizeof(sig)),0);
 }
 
 static void test_null_pkey(void) {
     key_list_t e={0}; e.key_type=(char*)"ssh-ed25519"; e.pkey=NULL;
     unsigned char sig[64]={0};
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,sizeof(sig)),0);
+    ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,sizeof(sig)),0);
 }
 
 static void test_null_challenge(void) {
     EVP_PKEY *sk=gen_ed25519();
     key_list_t e=make_entry(sk,"ssh-ed25519");
     unsigned char sig[64]={0};
-    ASSERT_NE(verify_signature(&e,NULL,32,sig,sizeof(sig)),0);
+    /* a NULL message is refused by the function the module calls */
+    ASSERT_NE(verify_signature_raw(&e,NULL,32,sig,sizeof(sig)),0);
     EVP_PKEY_free(sk);
 }
 
 static void test_null_sig(void) {
     EVP_PKEY *sk=gen_ed25519();
     key_list_t e=make_entry(sk,"ssh-ed25519");
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),NULL,64),0);
+    ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),NULL,64),0);
     EVP_PKEY_free(sk);
 }
 
@@ -192,7 +204,7 @@ static void test_unknown_key_type(void) {
     EVP_PKEY *sk=gen_ed25519();
     key_list_t e=make_entry(sk,"ssh-mystery-algo");
     unsigned char sig[64]={0};
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,sizeof(sig)),0);
+    ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,sizeof(sig)),0);
     EVP_PKEY_free(sk);
 }
 
@@ -200,7 +212,7 @@ static void test_empty_sig(void) {
     EVP_PKEY *sk=gen_ed25519();
     key_list_t e=make_entry(sk,"ssh-ed25519");
     unsigned char sig[1]={0};
-    ASSERT_NE(verify_signature(&e,CHAL,sizeof(CHAL),sig,0),0);
+    ASSERT_NE(verify_prefixed(&e,CHAL,sizeof(CHAL),sig,0),0);
     EVP_PKEY_free(sk);
 }
 

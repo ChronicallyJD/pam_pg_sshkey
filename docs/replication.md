@@ -15,10 +15,11 @@ public key.
 A subscription created with `CREATE SUBSCRIPTION ... CONNECTION '...'` does
 not work with pam_pg_sshkey. PostgreSQL stores that connection string and
 reuses it from several worker processes (the apply worker and each tablesync
-worker). A token is single-use and expires after 60 seconds, so the first
-worker consumes it and every later connection fails with
-`challenge not found or expired` or `replayed token`. No TTL setting changes
-this. If you need a server-managed subscription, terminate SSH-key
+worker). A token is single-use and expires 60 seconds after its timestamp, so
+the first worker consumes it and every later connection is refused: the
+journal says `replayed token for 'replicator' (nonce already used)`, or
+`expired or clock skew` once the 60 seconds have passed. No setting changes
+the lifetime. If you need a server-managed subscription, terminate SSH-key
 authentication at a local proxy and point the subscription at the proxy.
 
 ## Publisher setup

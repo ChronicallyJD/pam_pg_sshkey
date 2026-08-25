@@ -121,7 +121,7 @@ the client asks the agent for an `rsa-sha2-256` signature, and an agent older
 than OpenSSH 7.2, which can only answer with SHA-1, is refused. A FIDO
 security key needs `--agent`, and has a section of its own below.
 `sk-ecdsa-sha2-nistp256@openssh.com` is refused: the server has no ECDSA
-verifier. `--agent` does not work with `--v1`.
+verifier.
 
 ## Connecting with a security key
 
@@ -233,13 +233,3 @@ that several connections read, such as a connection pool configuration or a
 `CREATE SUBSCRIPTION` connection string. [Replication](replication.md)
 explains what to do instead.
 
-## Legacy v1 tokens
-
-Releases before 1.1.0 used a token of the form `<nonce_hex>:<signature>` over
-a nonce file that the client first had to create in the server's
-`/var/run/pg_sshkey` with `pg_sshkey_challenge`. The module still accepts
-these tokens. To produce one, pass `--v1` to `pg_sshkey_connect` or
-`pg_sshkey_query`, or `version=1` to the Python module. A v1 client on another
-host must create the nonce on the server, for example
-`--challenge-cmd 'ssh alice@dbserver pg_sshkey_challenge /var/run/pg_sshkey'`.
-v1 support will be removed in a future release.

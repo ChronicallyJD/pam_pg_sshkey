@@ -62,7 +62,7 @@ TEST_BINS := $T/test_challenge_store $T/test_key_parser $T/test_ssh_agent \
 
 .PHONY: all test check install install-conf uninstall clean e2e e2e-clean e2e-shell e2e-rocky e2e-rocky-clean
 
-all: pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge pg_sshkey_connect pg_sshkey_addkey pg_sshkey_query
+all: pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_connect pg_sshkey_addkey pg_sshkey_query
 
 # ── Connect wrapper script ───────────────────────────────────────────────────
 pg_sshkey_connect: $S/pg_sshkey_connect
@@ -90,9 +90,6 @@ pam_pg_sshkey.so: $(PAM_OBJS)
 # ── Standalone binaries (compiled directly from .c, no intermediate .o) ────
 pg_sshkey_sign: $S/pg_sshkey_sign.c $S/ssh_agent.c $S/key_parser.c
 	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -I$S -o $@ $^ $(CRYPTO_LIBS)
-
-pg_sshkey_challenge: $S/pg_sshkey_challenge.c $S/challenge_store.c
-	$(CC) $(CFLAGS) $(CRYPTO_CFLAGS) -o $@ $^ $(CRYPTO_LIBS)
 
 # ── Test binaries ───────────────────────────────────────────────────────────
 TFLAGS := $(CFLAGS) $(CRYPTO_CFLAGS) $(PAM_CFLAGS) \
@@ -126,12 +123,12 @@ $T/test_system: $T/test_system.c
 # dlopen'ed by libpam; instrumenting the harness would only add noise.
 TFLAGS_NOSAN := $(CFLAGS) $(PAM_CFLAGS) -g -I$S -I$T -Wno-format-truncation
 
-$T/test_pam_module: $T/test_pam_module.c pam_pg_sshkey.so pg_sshkey_challenge pg_sshkey_sign
+$T/test_pam_module: $T/test_pam_module.c pam_pg_sshkey.so pg_sshkey_sign
 	$(CC) $(TFLAGS_NOSAN) -rdynamic -o $@ $< -lpam
 
 # ── test / check ─────────────────────────────────────────────────────────────
 # Depends on `all` so every suite exercises freshly built binaries:
-# test_system execs pg_sshkey_challenge/pg_sshkey_sign from the build dir.
+# test_system execs pg_sshkey_sign from the build dir.
 test check: all $(TEST_BINS)
 	@echo ""
 	@echo "=== test_challenge_store ==="; $T/test_challenge_store
@@ -190,19 +187,15 @@ install: all
 	install -m 755 pam_pg_sshkey.so $(DESTDIR)$(PAM_LIB_DIR)/
 	install -d $(DESTDIR)$(BIN_DIR)
 	install -m 755 pg_sshkey_sign      $(DESTDIR)$(BIN_DIR)/
-	install -m 755 pg_sshkey_challenge $(DESTDIR)$(BIN_DIR)/
 	install -m 755 pg_sshkey_connect   $(DESTDIR)$(BIN_DIR)/
 	install -m 755 pg_sshkey_addkey    $(DESTDIR)$(BIN_DIR)/
 	install -m 755 pg_sshkey_query     $(DESTDIR)$(BIN_DIR)/
 	install -d -m 750 -o root -g postgres $(DESTDIR)$(KEY_DIR)
-	# Challenge dir: sticky-bit world-write so any user can create nonces
-	# but only the owner of each file can delete it.
-	# The postgres user (PAM module) is the owner of the directory so it
-	# can read and unlink any file inside regardless of sticky bit.
-	install -d -m 1733 -o postgres -g postgres $(DESTDIR)$(CHAL_DIR)
+	# Nonce records: only the postgres user writes here, so 0700 is enough.
+	install -d -m 0700 -o postgres -g postgres $(DESTDIR)$(CHAL_DIR)
 	# Install tmpfiles.d config so systemd recreates the directory at boot
 	install -d $(DESTDIR)/usr/lib/tmpfiles.d
-	printf 'd /var/run/pg_sshkey 1733 postgres postgres -\n' > /tmp/pg_sshkey_tmpfiles
+	printf 'd /var/run/pg_sshkey 0700 postgres postgres -\n' > /tmp/pg_sshkey_tmpfiles
 	install -m 644 /tmp/pg_sshkey_tmpfiles $(DESTDIR)/usr/lib/tmpfiles.d/pg_sshkey.conf
 
 install-conf:
@@ -219,6 +212,7 @@ install-conf:
 uninstall:
 	rm -f $(DESTDIR)$(PAM_LIB_DIR)/pam_pg_sshkey.so
 	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_sign
+	# removed in 2.0.0; an upgrade must not leave the old tool behind
 	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_challenge
 	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_connect
 	rm -f $(DESTDIR)$(BIN_DIR)/pg_sshkey_addkey
@@ -227,7 +221,7 @@ uninstall:
 # ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
 	rm -f $S/*.o
-	rm -f pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_challenge pg_sshkey_connect pg_sshkey_addkey pg_sshkey_query
+	rm -f pam_pg_sshkey.so pg_sshkey_sign pg_sshkey_connect pg_sshkey_addkey pg_sshkey_query
 	rm -f $(TEST_BINS)
 	rm -rf $S/__pycache__ $T/__pycache__
 

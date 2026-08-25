@@ -1,18 +1,16 @@
 /*
  * pg_sshkey_sign.c
  *
- * Client-side helper: signs a server-issued challenge with the user's
- * SSH private key and outputs the PAM token string.
+ * Client-side helper: signs a challenge this tool issues itself with the
+ * user's SSH private key and outputs the PAM token string.
  *
  * Usage:
  *   pg_sshkey_sign [--at TS] [--nonce HEX] <private_key_path>          (v2)
  *   pg_sshkey_sign --cert <cert.pub> [--at TS] [--nonce HEX] <key>     (v3)
- *   pg_sshkey_sign <challenge_hex> <private_key_path>                  (v1)
  *
  * Prints to stdout:
  *   v2: <unix_ts>:<nonce_hex64>:<base64_signature>
  *   v3: <unix_ts>:<nonce_hex64>:<base64_signature>:<base64_cert>
- *   v1: <challenge_hex>:<base64_signature>
  *
  * Key formats accepted:
  *   - OpenSSH private key  (-----BEGIN OPENSSH PRIVATE KEY-----)
@@ -44,10 +42,6 @@
 
 #include "ssh_agent.h"
 
-/* Domain prefix, must match sig_verify.c */
-static const unsigned char SIGN_PREFIX[]   = "pg-sshkey-v1";
-static const size_t        SIGN_PREFIX_LEN = 13; /* 12 chars + NUL */
-
 /*
  * v2 (default): the client issues its own challenge.
  *   token   = "<unix_ts>:<nonce_hex64>:<base64_sig>"
@@ -71,25 +65,6 @@ static const size_t        SIGN_PREFIX_V3_LEN = 13;
 
 #define OPENSSH_MAGIC "openssh-key-v1"
 #define MAX_CERT_FILE 65536
-
-/* ── hex_to_bytes ─────────────────────────────────────────────────────── */
-static int
-hex_to_bytes(const char *hex, unsigned char *out, size_t out_size,
-             size_t *out_len)
-{
-    size_t hexlen = strlen(hex);
-    if (hexlen % 2 != 0 || hexlen / 2 > out_size)
-        return -1;
-
-    for (size_t i = 0; i < hexlen / 2; i++) {
-        unsigned int byte;
-        if (sscanf(hex + 2 * i, "%02x", &byte) != 1)
-            return -1;
-        out[i] = (unsigned char)byte;
-    }
-    *out_len = hexlen / 2;
-    return 0;
-}
 
 /* ── b64_encode ───────────────────────────────────────────────────────── */
 static char *
@@ -520,28 +495,25 @@ usage(const char *argv0)
         "Usage: %s [--at <unix_ts>] [--nonce <hex64>] <private_key_path>\n"
         "       %s --agent <public_key.pub> [--cert <cert.pub>]\n"
         "       %s --cert <cert.pub> [--at <unix_ts>] [--nonce <hex64>] <private_key_path>\n"
-        "       %s <challenge_hex> <private_key_path>        (v1, legacy)\n"
         "\n"
-        "Default (v2): prints <unix_ts>:<nonce_hex>:<base64_signature>.\n"
+        "Takes exactly one key path.  Prints <unix_ts>:<nonce_hex>:<base64_signature>.\n"
         "  The challenge is issued by this client; nothing is needed on the\n"
         "  server beforehand.  --at and --nonce override the timestamp and\n"
         "  nonce (for tests / clock experiments only).\n"
-        "--cert (v3): prints <unix_ts>:<nonce_hex>:<base64_signature>:<base64_cert>.\n"
+        "--cert: prints <unix_ts>:<nonce_hex>:<base64_signature>:<base64_cert>.\n"
         "  <cert.pub> is an OpenSSH user certificate (ssh-keygen -s) for the\n"
         "  private key; the server checks it against trusted_ca_keys.\n"
         "--agent: signs through the ssh-agent at $SSH_AUTH_SOCK using the\n"
         "  identity whose public key is in <public_key.pub>.  The private key\n"
         "  is never read, so passphrase-protected keys, OpenSSH-format RSA\n"
-        "  keys, and forwarded agents work.  Not available with v1.\n"
-        "v1: prints <challenge_hex>:<base64_signature> for a nonce created\n"
-        "  on the server by pg_sshkey_challenge.\n"
+        "  keys, and forwarded agents work.\n"
         "\n"
         "Accepted key formats:\n"
         "  ~/.ssh/id_ed25519          OpenSSH Ed25519 (unencrypted)\n"
         "  ~/.ssh/id_rsa              OpenSSH RSA, convert first:\n"
         "                               openssl pkey -in ~/.ssh/id_rsa -out key.pem\n"
         "  key.pem                    PKCS#8 or traditional PEM (any type)\n",
-        argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0);
 }
 
 static int
@@ -607,7 +579,7 @@ int main(int argc, char *argv[])
     const char *nonce_opt  = NULL;
     const char *cert_path  = NULL;
     const char *agent_pubkey = NULL;
-    const char *positional[2] = { NULL, NULL };
+    const char *positional = NULL;
     int         npos       = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -625,37 +597,13 @@ int main(int argc, char *argv[])
             usage(argv[0]); return 1;
         } else if (argv[i][0] == '-' && argv[i][1] == '-') {
             fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return 1;
-        } else if (npos < 2) {
-            positional[npos++] = argv[i];
+        } else if (npos == 0) {
+            positional = argv[i]; npos = 1;
         } else {
+            fprintf(stderr,
+                "Too many arguments: %s takes one private key path\n", argv[0]);
             usage(argv[0]); return 1;
         }
-    }
-
-    if (npos == 2) {
-        /* ── v1: sign a server-issued challenge ── */
-        if (at >= 0 || nonce_opt || cert_path) { fprintf(stderr, "--at/--nonce/--cert apply to v2 and v3 only\n"); return 1; }
-        if (agent_pubkey) { fprintf(stderr, "--agent cannot be combined with a v1 challenge\n"); return 1; }
-        const char *challenge_hex = positional[0];
-        const char *privkey_path  = positional[1];
-
-        unsigned char challenge_bytes[64];
-        size_t        challenge_len = 0;
-        if (hex_to_bytes(challenge_hex, challenge_bytes, sizeof(challenge_bytes),
-                         &challenge_len) != 0) {
-            fprintf(stderr, "Invalid challenge hex\n");
-            return 1;
-        }
-        unsigned char msg[512];
-        if (SIGN_PREFIX_LEN + challenge_len > sizeof(msg)) {
-            fprintf(stderr, "Challenge too long\n");
-            return 1;
-        }
-        memcpy(msg, SIGN_PREFIX, SIGN_PREFIX_LEN);
-        memcpy(msg + SIGN_PREFIX_LEN, challenge_bytes, challenge_len);
-        return sign_and_print(privkey_path, NULL, msg,
-                              SIGN_PREFIX_LEN + challenge_len,
-                              challenge_hex, NULL);
     }
 
     if (agent_pubkey) {
@@ -669,7 +617,7 @@ int main(int argc, char *argv[])
     }
 
     /* ── v2 / v3: issue our own challenge ── */
-    const char *privkey_path = positional[0];
+    const char *privkey_path = positional;
     char *cert_b64 = NULL;
     if (cert_path) {
         cert_b64 = read_cert_b64(cert_path);

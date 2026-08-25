@@ -16,13 +16,17 @@ covers it; see [docs/testing.md](docs/testing.md).
   CIDR masks in either family. Every other critical option is still refused.
   The module refuses whenever it cannot decide, so a pinned certificate does
   not work over the unix socket, where PostgreSQL sets no `PAM_RHOST`, nor
-  with `log_hostname = on`, where the item can be a name; a malformed list,
-  including a stray comma, refuses rather than matching what it can.
+  with `pam_use_hostname=1` in `pg_hba.conf`, where PostgreSQL sets the
+  client's reverse-DNS name instead of its address; a malformed list,
+  including a stray comma, an entry with host bits set, or a prefix
+  `ssh-keygen` would refuse, refuses rather than matching what it can.
   Tests: `test_ssh_cert` (`test_address_permitted`, covering prefixes, both
   families, lists, and every malformed form); `test_pam_module`
   (`test_certificate_source_address_is_enforced`,
   `test_source_address_refuses_what_it_cannot_check`,
-  `test_source_address_list_and_ipv6`, and
+  `test_source_address_list_and_ipv6`,
+  `test_source_address_malformed_list_refuses` (which uses the new
+  `tests/cert_helper.py` to sign a list `ssh-keygen` will not), and
   `test_cert_with_critical_option_refused` for the options still refused);
   e2e `cert_source_address_permitted`, `cert_source_address_refused`,
   `cert_source_address_local_socket_refused`, where the address comes from

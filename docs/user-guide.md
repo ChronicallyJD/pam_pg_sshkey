@@ -212,7 +212,10 @@ no critical option other than `-O source-address=` (`-O force-command=` and
 the rest are refused). A certificate signed with
 `-O source-address=10.0.0.0/8,192.168.5.7` is accepted only from those
 addresses, and not over the local socket, where PostgreSQL reports no client
-address; see [Security](security.md#source-address-restrictions). To withdraw a certificate before it expires, name its key, or the
+address. Leave `pam_use_hostname` out of the `pam` line in `pg_hba.conf`: it
+makes PostgreSQL report a reverse-DNS name instead, which the client's own
+DNS supplies. See [Security](security.md#source-address-restrictions). To
+withdraw a certificate before it expires, name its key, or the
 CA's key, in `revoked_keys` (see [Revoking a key](#revoking-a-key)); keep
 validity windows short all the same. RSA user keys and RSA CAs work; a CA signature made with the SHA-1
 `ssh-rsa` algorithm (`ssh-keygen -t ssh-rsa` when signing) is refused. A

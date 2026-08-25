@@ -246,7 +246,8 @@ ssh_cert_parse(const unsigned char *blob, size_t len, ssh_cert_t **out)
                 reader_t dr = { d, d + dn };
                 c->source_address = rd_cstring(&dr);
                 free(name);
-                if (!c->source_address) goto bad;
+                /* the option data is exactly one string, nothing after it */
+                if (!c->source_address || dr.p != dr.end) goto bad;
             } else if (!c->critical_option) {
                 c->critical_option = name;
             } else {
@@ -337,26 +338,51 @@ one_mask_permits(const char *entry, size_t len, const char *addr)
     char *slash = strchr(buf, '/');
     if (slash) {
         *slash = '\0';
-        if (slash[1] == '\0') return -1;
+        /*
+         * Digits only, and no leading zero on a longer number.  strtol
+         * would take " 8", "+8" and "08", which ssh-keygen and sshd
+         * refuse: the same signed list must not mean two things.
+         */
+        const char *d = slash + 1;
+        if (d[0] < '0' || d[0] > '9') return -1;
+        if (d[0] == '0' && d[1] != '\0') return -1;
+        for (const char *q = d; *q; q++)
+            if (*q < '0' || *q > '9') return -1;
         char *end;
-        long v = strtol(slash + 1, &end, 10);
+        long v = strtol(d, &end, 10);
         if (*end || v < 0 || v > 128) return -1;
         bits = (int)v;
     }
 
     unsigned char mask_bytes[16], addr_bytes[16];
-    int family_bits;
+    int family_bits, same_family;
     if (inet_pton(AF_INET, buf, mask_bytes) == 1) {
         family_bits = 32;
-        if (inet_pton(AF_INET, addr, addr_bytes) != 1) return 0;  /* other family */
+        same_family = (inet_pton(AF_INET, addr, addr_bytes) == 1);
     } else if (inet_pton(AF_INET6, buf, mask_bytes) == 1) {
         family_bits = 128;
-        if (inet_pton(AF_INET6, addr, addr_bytes) != 1) return 0;
+        same_family = (inet_pton(AF_INET6, addr, addr_bytes) == 1);
     } else {
         return -1;                       /* not an address at all */
     }
-    if (bits < 0) bits = family_bits;
+    /*
+     * Judge the entry before judging the address, so a list is malformed
+     * or not on its own terms rather than according to who is connecting.
+     */
     if (bits > family_bits) return -1;
+    if (bits < 0) bits = family_bits;
+
+    /*
+     * Host bits must be clear.  ssh-keygen calls a mask with them set an
+     * inconsistent mask and refuses to sign the list; a CA that does not
+     * run that check could otherwise hand out a whole subnet here, from a
+     * certificate sshd would reject outright.
+     */
+    for (int i = bits; i < family_bits; i++)
+        if (mask_bytes[i / 8] & (unsigned char)(0x80 >> (i % 8)))
+            return -1;
+
+    if (!same_family) return 0;
 
     return prefix_equal(mask_bytes, addr_bytes, bits);
 }

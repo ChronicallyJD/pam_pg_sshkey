@@ -266,6 +266,43 @@ test_address_permitted(void)
     ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/33", "10.0.0.1"), -1);
     ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/-1", "10.0.0.1"), -1);
     ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/8x", "10.0.0.1"), -1);
+    /*
+     * A malformed prefix must void the list whoever is asking: judging the
+     * entry only against the client's family would make the same list
+     * usable or not depending on who connects.
+     */
+    ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/33,2001:db8::/64", "2001:db8::1"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/64,2001:db8::/32", "2001:db8::1"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("2001:db8::/129,10.0.0.0/8", "10.0.0.1"), -1);
+
+    /*
+     * Prefix lengths ssh-keygen and sshd reject must not be enforced here
+     * as if they meant something: the same signed list would then mean two
+     * different things to two parsers.
+     */
+    ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/ 8", "10.255.255.255"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/+8", "10.255.255.255"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/08", "10.255.255.255"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/00", "10.255.255.255"), -1);
+    /* ssh-keygen refuses "10.0.0.0/0" for the same reason: host bits set */
+    ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/0", "10.255.255.255"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("0.0.0.0/0", "10.255.255.255"), 1);
+
+    /*
+     * An entry with host bits set is what ssh-keygen calls an inconsistent
+     * mask and refuses to sign.  Widening it to its network here would let
+     * a certificate from another CA grant a whole subnet where sshd grants
+     * nothing: a /24 typed for a /32 must fail, not spread.
+     */
+    ASSERT_EQ(ssh_cert_address_permitted("192.168.1.50/24", "192.168.1.50"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("192.168.1.50/24", "192.168.1.99"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("10.0.0.1/8", "10.0.0.1"), -1);
+    ASSERT_EQ(ssh_cert_address_permitted("2001:db8::1/32", "2001:db8::1"), -1);
+    /* the same entries written correctly are fine */
+    ASSERT_EQ(ssh_cert_address_permitted("192.168.1.0/24", "192.168.1.99"), 1);
+    ASSERT_EQ(ssh_cert_address_permitted("192.168.1.50/32", "192.168.1.50"), 1);
+    ASSERT_EQ(ssh_cert_address_permitted("2001:db8::/32", "2001:db8::1"), 1);
+
     /* one bad entry voids the list, even after a match */
     ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/8,rubbish", "10.0.0.1"), -1);
     ASSERT_EQ(ssh_cert_address_permitted("10.0.0.0/8,", "10.0.0.1"), -1);

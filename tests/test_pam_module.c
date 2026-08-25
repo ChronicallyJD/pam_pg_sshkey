@@ -495,7 +495,8 @@ authenticate(const env_t *e, const char *user, const char *token, int *acct_rc)
     pam_set_item(pamh, PAM_CONV, &conv);
     /*
      * PostgreSQL sets PAM_RHOST to port->remote_host: the client address,
-     * or "[local]" on the unix socket, or a name when log_hostname is on.
+     * for a TCP connection, nothing at all on the unix socket, and the
+     * reverse-DNS name when pg_hba.conf carries pam_use_hostname=1.
      * g_rhost is NULL unless a test sets it, which is the case of a
      * PostgreSQL build that does not set the item at all.
      */
@@ -946,6 +947,23 @@ enable_certs(env_t *e, const char *ca1, const char *ca2)
     if (system(cmd) != 0) { fprintf(stderr, "enable_certs failed\n"); exit(2); }
     chmod(e->ca_file, 0640);
     write_services(e);
+}
+
+/*
+ * tests/cert_helper.py signs a certificate ssh-keygen would refuse to
+ * write, so the module can be held to lists a careless or compromised CA
+ * could produce.  Writes <root>/<name>-cert.pub.
+ */
+static int
+forge_cert(const env_t *e, const char *ca, const char *key, const char *name,
+           const char *args)
+{
+    char cmd[PATH_MAX * 4], out[4096];
+    snprintf(cmd, sizeof(cmd),
+             "python3 '%s/cert_helper.py' '%s/%s' '%s/%s.pub' '%s/%s-cert.pub' "
+             "--key-id alice-key --principal alice %s 2>&1",
+             g_test_dir, e->root, ca, e->root, key, e->root, name, args);
+    return run_capture(cmd, out, sizeof(out));
 }
 
 /* ── security keys ────────────────────────────────────────────────────── */
@@ -1541,8 +1559,9 @@ test_source_address_refuses_what_it_cannot_check(void)
 {
     /*
      * A restriction the module cannot evaluate must refuse, not pass: a
-     * local socket connection ("[local]"), a host name (PostgreSQL with
-     * log_hostname on), and a PostgreSQL that sets no PAM_RHOST at all.
+     * host name (PostgreSQL with pam_use_hostname=1), a value that is not
+     * an address at all, and a PostgreSQL that sets no PAM_RHOST, which is
+     * what it does on the unix socket.
      */
     env_t e; env_setup(&e);
     cert_fixture(&e);
@@ -1551,18 +1570,23 @@ test_source_address_refuses_what_it_cannot_check(void)
         "-I alice-key -n alice -V -1m:+5m -O source-address=127.0.0.1/32"), 0);
 
     char tok[8192];
-    const char *hosts[] = { "[local]", "client.example.com", NULL };
-    for (size_t i = 0; i < 2; i++) {
-        ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
-        g_rhost = hosts[i];
-        int rc = authenticate(&e, "alice", tok, NULL);
-        ASSERT_EQ(rc, PAM_AUTH_ERR);
-        ASSERT_LOGGED("cannot check source-address");
-    }
+    /* a name, which is what pam_use_hostname=1 reports */
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = "client.example.com";
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("cannot check source-address");
+
+    /* an empty item, which is a different branch from a name */
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = "";
+    rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("the client address is not known");
 
     ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
     g_rhost = NULL;                      /* no PAM_RHOST item at all */
-    int rc = authenticate(&e, "alice", tok, NULL);
+    rc = authenticate(&e, "alice", tok, NULL);
     ASSERT_EQ(rc, PAM_AUTH_ERR);
     ASSERT_LOGGED("the client address is not known");
     ASSERT_EQ(dir_entry_count(e.chal), 0);
@@ -1594,12 +1618,49 @@ test_source_address_list_and_ipv6(void)
         if (rc != PAM_SUCCESS) log_dump();
         ASSERT_EQ(rc, PAM_SUCCESS);
     }
+    int nonces = dir_entry_count(e.chal);
     for (size_t i = 0; refused[i]; i++) {
         ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
         g_rhost = refused[i];
-        ASSERT_EQ(authenticate(&e, "alice", tok, NULL), PAM_AUTH_ERR);
+        int rc = authenticate(&e, "alice", tok, NULL);
+        ASSERT_EQ(rc, PAM_AUTH_ERR);
         ASSERT_LOGGED("is not permitted by source-address");
+        ASSERT_EQ(dir_entry_count(e.chal), nonces);   /* refused, so no nonce */
     }
+    g_rhost = NULL;
+    env_teardown(&e);
+}
+
+static void
+test_source_address_malformed_list_refuses(void)
+{
+    /*
+     * ssh-keygen will not sign "192.168.1.50/24" (host bits set), but
+     * another CA might.  The module must refuse the certificate rather than
+     * enforce the entries it does understand, or a typo would hand out a
+     * subnet.  cert_helper.py mints what ssh-keygen will not.
+     */
+    env_t e; env_setup(&e);
+    cert_fixture(&e);
+    enable_certs(&e, "ca", NULL);
+    ASSERT_EQ(forge_cert(&e, "ca", "id_ed25519", "id_ed25519",
+                         "--critical 'source-address=192.168.1.50/24'"), 0);
+
+    char tok[8192];
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    g_rhost = "192.168.1.50";            /* inside the network it names */
+    int rc = authenticate(&e, "alice", tok, NULL);
+    ASSERT_EQ(rc, PAM_AUTH_ERR);
+    ASSERT_LOGGED("cannot check source-address");
+    ASSERT_EQ(dir_entry_count(e.chal), 0);
+
+    /* the same CA and key, with a list ssh-keygen would sign, works */
+    ASSERT_EQ(forge_cert(&e, "ca", "id_ed25519", "id_ed25519",
+                         "--critical 'source-address=192.168.1.0/24'"), 0);
+    ASSERT_EQ(make_token_v3(&e, "id_ed25519", "id_ed25519", NULL, tok, sizeof(tok)), 0);
+    rc = authenticate(&e, "alice", tok, NULL);
+    if (rc != PAM_SUCCESS) log_dump();
+    ASSERT_EQ(rc, PAM_SUCCESS);
     g_rhost = NULL;
     env_teardown(&e);
 }
@@ -2153,6 +2214,7 @@ main(void)
     RUN(test_certificate_source_address_is_enforced);
     RUN(test_source_address_refuses_what_it_cannot_check);
     RUN(test_source_address_list_and_ipv6);
+    RUN(test_source_address_malformed_list_refuses);
     RUN(test_security_key_authenticates);
     RUN(test_security_key_without_user_presence_refused);
     RUN(test_security_key_signature_is_bound_to_its_application);

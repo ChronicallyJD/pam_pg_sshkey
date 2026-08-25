@@ -139,8 +139,10 @@ write it, and logs
 `cannot read trusted_ca_keys PATH (permission denied, file must be owned root:postgres mode 0640, ...)`
 or `trusted_ca_keys PATH is world/group writable, refusing`. Certificates
 signed with the SHA-1 `ssh-rsa` algorithm, host certificates, and
-certificates carrying any critical option are refused; there is no
-revocation list. [Security](security.md#certificates) lists every check.
+certificates carrying any critical option other than `source-address` are
+refused. A certificate is withdrawn before it expires by naming its key, or
+its CA's key, in `revoked_keys`.
+[Security](security.md#certificates) lists every check.
 
 ## Roles
 

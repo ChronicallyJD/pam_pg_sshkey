@@ -37,15 +37,17 @@ it accepts the certificate the module checks, in order, that the blob parses
 chosen by the client cannot put a newline, and with it a forged line, into
 the log), that it is a user certificate (type 1), that the
 current time is inside `valid_after` to `valid_before`, that the principal
-list is non-empty and contains the role name exactly, that there are no
-critical options, that the signing key equals one of the trusted CA keys,
+list is non-empty and contains the role name exactly, that a
+`source-address` option permits the client address, that there is no other
+critical option, that the signing key equals one of the trusted CA keys,
 and that the CA signature verifies over the certificate body with
 `ssh-ed25519`, `rsa-sha2-256`, or `rsa-sha2-512`. Only then does it verify
 the token signature with the certified key and record the nonce. What it
 does not do: revocation is by key, so a leaked certified key must be named
 in `revoked_keys` (see below) and there is no revocation by serial or key id
 and no KRL support; `force-command` and every critical option other than
-`source-address` are refused rather than enforced; host certificates are refused; CA signatures made with the SHA-1
+`source-address` are refused rather than enforced; host certificates are
+refused; CA signatures made with the SHA-1
 `ssh-rsa` algorithm are refused; and there is no principals file, so the
 principal must be the role name itself. The CA file is subject to the same
 ownership and mode rules as `authorized_keys`.
@@ -87,17 +89,27 @@ those addresses. PostgreSQL reports the client address in `PAM_RHOST` and
 the module matches it against the list, which is comma-separated CIDR masks
 in either family, as `ssh-keygen` writes it.
 
+The list must be one `ssh-keygen` would sign: an entry with host bits set,
+such as `192.168.1.50/24`, is refused rather than widened to its network,
+because a CA that skips that check would otherwise hand out a subnet where
+sshd hands out nothing. Address spellings `inet_pton` refuses, such as
+`010.0.0.1` or the short form `127.1`, are refused for the same reason:
+their meaning is not agreed between parsers.
+
 The module refuses whenever it cannot decide. On the unix socket PostgreSQL
 sets no `PAM_RHOST` at all, so a pinned certificate does not work there.
-With `log_hostname = on` the item can be a name rather than an address,
-which no address list can match, so leave it off where pinned certificates
-are used. A malformed list, including a stray comma, refuses rather than
+With the `pg_hba.conf` option `pam_use_hostname=1` PostgreSQL sets the
+reverse-DNS name of the client instead of its address. Leave that option
+off, and not only because a name cannot match an address list: the name
+comes from the client's own DNS, and a PTR record that reads like an
+address, `10.0.0.1`, is a name this module cannot tell from the real thing.
+With `pam_use_hostname=1` a source-address restriction is worth nothing. A malformed list, including a stray comma, refuses rather than
 matching what it can.
 
-What this is worth: the address comes from the server's own view of the
-connection, so it cannot be forged by the client, but it is the address
-PostgreSQL sees. Behind a proxy or a NAT that is the proxy's address, and
-every client behind it looks the same.
+What this is worth: with `pam_use_hostname` off, the address is the
+server's own view of the socket, so a client cannot forge it. It is still
+only the address PostgreSQL sees: behind a proxy or a NAT that is the
+proxy's address, and every client behind it looks the same.
 
 ## What the module does not do
 

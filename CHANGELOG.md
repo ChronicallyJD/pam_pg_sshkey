@@ -9,6 +9,25 @@ covers it; see [docs/testing.md](docs/testing.md).
 
 ### Added
 
+- The `source-address` critical option is enforced instead of refused. A
+  certificate signed with `ssh-keygen -O source-address=<list>` authenticates
+  only from those addresses: PostgreSQL reports the client address in
+  `PAM_RHOST` and the module matches it against the list, comma-separated
+  CIDR masks in either family. Every other critical option is still refused.
+  The module refuses whenever it cannot decide, so a pinned certificate does
+  not work over the unix socket, where PostgreSQL sets no `PAM_RHOST`, nor
+  with `log_hostname = on`, where the item can be a name; a malformed list,
+  including a stray comma, refuses rather than matching what it can.
+  Tests: `test_ssh_cert` (`test_address_permitted`, covering prefixes, both
+  families, lists, and every malformed form); `test_pam_module`
+  (`test_certificate_source_address_is_enforced`,
+  `test_source_address_refuses_what_it_cannot_check`,
+  `test_source_address_list_and_ipv6`, and
+  `test_cert_with_critical_option_refused` for the options still refused);
+  e2e `cert_source_address_permitted`, `cert_source_address_refused`,
+  `cert_source_address_local_socket_refused`, where the address comes from
+  PostgreSQL itself.
+
 - Key revocation. `revoked_keys=<file>` in `/etc/pam.d/postgresql` names
   public keys, in `authorized_keys` format, that may not authenticate. The
   list is checked after the signature verifies and before the login is

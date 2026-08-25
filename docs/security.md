@@ -44,9 +44,8 @@ and that the CA signature verifies over the certificate body with
 the token signature with the certified key and record the nonce. What it
 does not do: revocation is by key, so a leaked certified key must be named
 in `revoked_keys` (see below) and there is no revocation by serial or key id
-and no KRL support; `source-address`,
-`force-command`, and every other critical option are refused rather than
-enforced; host certificates are refused; CA signatures made with the SHA-1
+and no KRL support; `force-command` and every critical option other than
+`source-address` are refused rather than enforced; host certificates are refused; CA signatures made with the SHA-1
 `ssh-rsa` algorithm are refused; and there is no principals file, so the
 principal must be the role name itself. The CA file is subject to the same
 ownership and mode rules as `authorized_keys`.
@@ -80,6 +79,25 @@ reject legitimate logins. `sk-ecdsa-sha2-nistp256@openssh.com` is not
 supported. The private key is on the hardware, so signing goes through an
 agent, and what the tests verify is the signature format rather than any
 particular authenticator.
+
+## Source address restrictions
+
+A certificate signed with `-O source-address=<list>` is accepted only from
+those addresses. PostgreSQL reports the client address in `PAM_RHOST` and
+the module matches it against the list, which is comma-separated CIDR masks
+in either family, as `ssh-keygen` writes it.
+
+The module refuses whenever it cannot decide. On the unix socket PostgreSQL
+sets no `PAM_RHOST` at all, so a pinned certificate does not work there.
+With `log_hostname = on` the item can be a name rather than an address,
+which no address list can match, so leave it off where pinned certificates
+are used. A malformed list, including a stray comma, refuses rather than
+matching what it can.
+
+What this is worth: the address comes from the server's own view of the
+connection, so it cannot be forged by the client, but it is the address
+PostgreSQL sees. Behind a proxy or a NAT that is the proxy's address, and
+every client behind it looks the same.
 
 ## What the module does not do
 

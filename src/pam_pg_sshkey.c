@@ -694,6 +694,49 @@ authenticate_v3(pam_handle_t *pamh, const mod_opts_t *opts,
         goto out;
     }
 
+    /*
+     * source-address: hold the certificate to the addresses it was issued
+     * for.  PostgreSQL puts the client address in PAM_RHOST for a TCP
+     * connection; on the unix socket it sets no item at all, and with
+     * log_hostname on the item can be a name rather than an address.
+     * Anything the module cannot decide refuses the login, so a pinned
+     * certificate does not work over the local socket.
+     */
+    if (cert->source_address) {
+        const void *rhost_item = NULL;
+        const char *rhost = NULL;
+        if (pam_get_item(pamh, PAM_RHOST, &rhost_item) == PAM_SUCCESS)
+            rhost = (const char *)rhost_item;
+        if (!rhost || !*rhost) {
+            pam_syslog(pamh, LOG_WARNING,
+                       "pam_pg_sshkey: certificate for '%s' rejected: it is "
+                       "limited to source-address %s and the client address "
+                       "is not known", username, cert->source_address);
+            goto out;
+        }
+        int ok = ssh_cert_address_permitted(cert->source_address, rhost);
+        if (ok < 0) {
+            pam_syslog(pamh, LOG_WARNING,
+                       "pam_pg_sshkey: certificate for '%s' rejected: cannot "
+                       "check source-address %s against client address '%s' "
+                       "(a local socket connection, a host name with "
+                       "log_hostname on, or a malformed list)",
+                       username, cert->source_address, rhost);
+            goto out;
+        }
+        if (ok == 0) {
+            pam_syslog(pamh, LOG_WARNING,
+                       "pam_pg_sshkey: certificate for '%s' rejected: client "
+                       "address %s is not permitted by source-address %s",
+                       username, rhost, cert->source_address);
+            goto out;
+        }
+        if (opts->debug)
+            pam_syslog(pamh, LOG_DEBUG,
+                       "pam_pg_sshkey: client address %s is permitted by "
+                       "source-address %s", rhost, cert->source_address);
+    }
+
     if (cert->critical_option) {
         pam_syslog(pamh, LOG_WARNING,
                    "pam_pg_sshkey: certificate for '%s' rejected: "

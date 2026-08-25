@@ -208,8 +208,11 @@ pg_sshkey_query --cert ~/.ssh/id_ed25519-cert.pub -h dbserver -U alice -q 'SELEC
 The server log shows `user 'alice' authenticated with certificate
 'alice-laptop' serial 0`. The certificate must list the role name among its
 principals, be within its validity window, be a user certificate, and carry
-no critical options (`-O source-address=...` or `-O force-command=...` are
-refused). To withdraw a certificate before it expires, name its key, or the
+no critical option other than `-O source-address=` (`-O force-command=` and
+the rest are refused). A certificate signed with
+`-O source-address=10.0.0.0/8,192.168.5.7` is accepted only from those
+addresses, and not over the local socket, where PostgreSQL reports no client
+address; see [Security](security.md#source-address-restrictions). To withdraw a certificate before it expires, name its key, or the
 CA's key, in `revoked_keys` (see [Revoking a key](#revoking-a-key)); keep
 validity windows short all the same. RSA user keys and RSA CAs work; a CA signature made with the SHA-1
 `ssh-rsa` algorithm (`ssh-keygen -t ssh-rsa` when signing) is refused. A

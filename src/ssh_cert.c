@@ -30,6 +30,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
 /* ── bounds-checked readers ──────────────────────────────────────────── */
 
 typedef struct {
@@ -164,6 +167,7 @@ ssh_cert_free(ssh_cert_t *c)
     for (size_t i = 0; i < c->nprincipals; i++) free(c->principals[i]);
     free(c->principals);
     free(c->critical_option);
+    free(c->source_address);
     free(c->ca_key_type);
     EVP_PKEY_free(c->ca_pkey);
     free(c->sig_algo);
@@ -232,8 +236,22 @@ ssh_cert_parse(const unsigned char *blob, size_t len, ssh_cert_t **out)
             if (!name) goto bad;
             const unsigned char *d; size_t dn;
             if (rd_string(&cr, &d, &dn) != 0) { free(name); goto bad; }
-            if (!c->critical_option) c->critical_option = name;
-            else free(name);
+            /*
+             * source-address is the one critical option the module can
+             * honour; its data is an SSH string wrapping the list.  Every
+             * other option is remembered so the caller can refuse it by
+             * name.
+             */
+            if (strcmp(name, "source-address") == 0 && !c->source_address) {
+                reader_t dr = { d, d + dn };
+                c->source_address = rd_cstring(&dr);
+                free(name);
+                if (!c->source_address) goto bad;
+            } else if (!c->critical_option) {
+                c->critical_option = name;
+            } else {
+                free(name);
+            }
         }
     }
 
@@ -289,6 +307,84 @@ ssh_cert_ca_is_trusted(const ssh_cert_t *cert, const key_list_t *cas)
 #endif
     }
     return 0;
+}
+
+/* ── source-address ──────────────────────────────────────────────────── */
+
+/* Do the first `bits` bits of a and b agree? */
+static int
+prefix_equal(const unsigned char *a, const unsigned char *b, int bits)
+{
+    int whole = bits / 8, rest = bits % 8;
+    if (whole && memcmp(a, b, (size_t)whole) != 0) return 0;
+    if (rest) {
+        unsigned char mask = (unsigned char)(0xff << (8 - rest));
+        if ((a[whole] & mask) != (b[whole] & mask)) return 0;
+    }
+    return 1;
+}
+
+/* One "address" or "address/prefix" entry against addr.  -1 if malformed. */
+static int
+one_mask_permits(const char *entry, size_t len, const char *addr)
+{
+    char buf[128];
+    if (len == 0 || len >= sizeof(buf)) return -1;
+    memcpy(buf, entry, len);
+    buf[len] = '\0';
+
+    int bits = -1;
+    char *slash = strchr(buf, '/');
+    if (slash) {
+        *slash = '\0';
+        if (slash[1] == '\0') return -1;
+        char *end;
+        long v = strtol(slash + 1, &end, 10);
+        if (*end || v < 0 || v > 128) return -1;
+        bits = (int)v;
+    }
+
+    unsigned char mask_bytes[16], addr_bytes[16];
+    int family_bits;
+    if (inet_pton(AF_INET, buf, mask_bytes) == 1) {
+        family_bits = 32;
+        if (inet_pton(AF_INET, addr, addr_bytes) != 1) return 0;  /* other family */
+    } else if (inet_pton(AF_INET6, buf, mask_bytes) == 1) {
+        family_bits = 128;
+        if (inet_pton(AF_INET6, addr, addr_bytes) != 1) return 0;
+    } else {
+        return -1;                       /* not an address at all */
+    }
+    if (bits < 0) bits = family_bits;
+    if (bits > family_bits) return -1;
+
+    return prefix_equal(mask_bytes, addr_bytes, bits);
+}
+
+int
+ssh_cert_address_permitted(const char *list, const char *addr)
+{
+    if (!list || !addr || !*addr) return -1;
+    /* the client address must itself be numeric, or nothing can be decided */
+    unsigned char probe[16];
+    if (inet_pton(AF_INET, addr, probe) != 1 &&
+        inet_pton(AF_INET6, addr, probe) != 1)
+        return -1;
+
+    int permitted = 0;
+    const char *p = list;
+    for (;;) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        int rc = one_mask_permits(p, len, addr);
+        if (rc < 0) return -1;           /* one bad entry voids the list,
+                                            including an empty one from a
+                                            stray comma */
+        if (rc == 1) permitted = 1;
+        if (!comma) break;
+        p = comma + 1;
+    }
+    return permitted;
 }
 
 int

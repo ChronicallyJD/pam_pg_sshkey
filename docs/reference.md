@@ -156,7 +156,10 @@ hosts read them with `journalctl -t postgres` or
 | warning | `certificate for 'U' rejected: expired` | Server time is at or past `valid_before` |
 | warning | `certificate for 'U' rejected: not yet valid` | Server time is before `valid_after` |
 | warning | `certificate for 'U' rejected: principal 'U' not listed` | The principal list is empty or does not contain the role name |
-| warning | `certificate for 'U' rejected: unsupported critical option NAME` | The certificate carries a critical option such as `source-address` |
+| warning | `certificate for 'U' rejected: unsupported critical option NAME` | The certificate carries a critical option other than `source-address`, such as `force-command` |
+| warning | `certificate for 'U' rejected: client address A is not permitted by source-address L` | The connection comes from outside the list the certificate names |
+| warning | `certificate for 'U' rejected: it is limited to source-address L and the client address is not known` | No `PAM_RHOST`, which is what PostgreSQL does on the unix socket |
+| warning | `certificate for 'U' rejected: cannot check source-address L against client address 'A' ...` | The address is a name (`log_hostname = on`) or the list is malformed |
 | warning | `certificate for 'U' rejected: not signed by a trusted CA` | The signing key is not in `trusted_ca_keys` |
 | warning | `certificate for 'U' rejected: unsupported signature algorithm ALGO` | The CA signed with `ssh-rsa` (SHA-1) or another algorithm the module does not verify |
 | warning | `certificate for 'U' rejected: invalid CA signature` | The certificate body does not verify with the CA key |

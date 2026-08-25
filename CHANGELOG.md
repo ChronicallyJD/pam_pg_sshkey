@@ -3,7 +3,9 @@
 Notable changes to pam_pg_sshkey are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow
 [Semantic Versioning](https://semver.org/). Each entry names the test that
-covers it; see [docs/testing.md](docs/testing.md).
+covers it; see [docs/testing.md](docs/testing.md). Four releases are tagged
+in git: `1.0`, `1.1.0`, `1.2.0`, and `2.0.0`. The 1.0.1 to 1.0.9 entries
+have no tag of their own.
 
 ## [2.0.0] - 2026-08-24
 
@@ -392,3 +394,8 @@ covers it; see [docs/testing.md](docs/testing.md).
 
 Initial release: the PAM module, `pg_sshkey_challenge`, `pg_sshkey_sign`, the
 unit tests, and the Makefile.
+
+[2.0.0]: https://github.com/ChronicallyJD/pam_pg_sshkey/compare/1.2.0...2.0.0
+[1.2.0]: https://github.com/ChronicallyJD/pam_pg_sshkey/compare/1.1.0...1.2.0
+[1.1.0]: https://github.com/ChronicallyJD/pam_pg_sshkey/compare/1.0...1.1.0
+[1.0]: https://github.com/ChronicallyJD/pam_pg_sshkey/releases/tag/1.0
